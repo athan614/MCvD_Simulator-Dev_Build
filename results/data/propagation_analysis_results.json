@@ -1,0 +1,14 @@
+{
+  "calculated_delays_100um": {
+    "GLU": 6.096096096096096,
+    "GABA": 4.024024024024024
+  },
+  "reported_delays_100um": {
+    "GLU": 6.3,
+    "GABA": 4.7
+  },
+  "peak_concentrations_nM": {
+    "GLU": 0.0028718674257587323,
+    "GABA": 0.0029341170636959044
+  }
+}
