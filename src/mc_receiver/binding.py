@@ -101,11 +101,14 @@ def bernoulli_binding(
     damkohler = nt_params.get('damkohler', 0.0)  # Default to 0 if not specified
     
     # System parameters
-    # `N_apt` might arrive from YAML as the *string* "4e8".
-    # Accept int, float, or str and convert safely to integer.
-    N_apt_raw = cfg['N_apt']
+    # Build the correct key name, e.g., 'N_sites_glu', based on the nt type
+    site_key = f'N_sites_{nt.lower()}'
+
+    # Safely get the value from the 'binding' sub-dictionary. Default to 0 if not found.
+    # This correctly handles the CTRL channel (N_sites_ctrl = 0).
+    N_apt_raw = cfg.get('binding', {}).get(site_key, 0)
+
     if isinstance(N_apt_raw, str):
-        # allow underscores or scientific-notation strings like "4e8"
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)      # Total number of aptamer sites
     
@@ -215,7 +218,9 @@ def mean_binding(
     damkohler = nt_params.get('damkohler', 0.0)
     
     # System parameters - handle N_apt properly
-    N_apt_raw = cfg['N_apt']
+    site_key = f'N_sites_{nt.lower()}'
+    N_apt_raw = cfg.get('binding', {}).get(site_key, 0)
+
     if isinstance(N_apt_raw, str):
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)
@@ -303,7 +308,9 @@ def binding_noise_psd(
     damkohler = nt_params.get('damkohler', 0.0)
     
     # Handle N_apt properly
-    N_apt_raw = cfg['N_apt']
+    site_key = f'N_sites_{nt.lower()}'
+    N_apt_raw = cfg.get('binding', {}).get(site_key, 0)
+
     if isinstance(N_apt_raw, str):
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)
@@ -369,7 +376,9 @@ def calculate_equilibrium_metrics(
     damkohler = nt_params.get('damkohler', 0.0)
     
     # Handle N_apt properly
-    N_apt_raw = cfg['N_apt']
+    site_key = f'N_sites_{nt.lower()}'
+    N_apt_raw = cfg.get('binding', {}).get(site_key, 0)
+
     if isinstance(N_apt_raw, str):
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)

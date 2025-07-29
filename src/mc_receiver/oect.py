@@ -52,87 +52,71 @@ def oect_trio(bound_sites_trio: np.ndarray,
               rho: Optional[float] = None) -> Dict[str, np.ndarray]:
     """
     Return correlated drain-current traces for GLU, GABA, CTRL.
-    Correlation matrix: [[1,ρ,ρ],[ρ,1,ρ],[ρ,ρ,1]]
-    
-    Parameters
-    ----------
-    bound_sites_trio : (3,n) int array
-    nts : ("GLU","GABA","CTRL")
-    cfg : nested dict with noise.*, oect.*, sim.*
-    rng : random generator
-    rho : correlation coefficient (default from config)
-    
-    Returns
-    -------
-    dict : {nt: current_array} for each channel
+    CORRECTED to ensure signal is always calculated and added to the noise.
     """
-    
     if rho is None:
         rho = cfg["noise"].get("rho_correlated", 0.9)
-
-    # Now rho is guaranteed to be float, not None
-    assert rho is not None  # Type checker hint
+    assert rho is not None
 
     n = bound_sites_trio.shape[1]
     fs = 1 / cfg["sim"]["dt_s"]
-    freqs = np.fft.rfftfreq(n, 1/fs)
-    freqs[0] = freqs[1]  # avoid zero
-
-    # Get parameters from nested config
-    alpha_H = cfg["noise"]["alpha_H"]
-    K_d = cfg["noise"]["K_d_Hz"]
-    N_c = cfg["noise"]["N_c"]
-    T = cfg["sim"]["temperature_K"]
-    R_ch = cfg["oect"]["R_ch_Ohm"]
+    
+    # --- 1. ALWAYS Calculate the Signal Current ---
     gm = cfg["oect"]["gm_S"]
     C_tot = cfg["oect"]["C_tot_F"]
-    # FIXED: Realistic baseline from bias (literature: 10-100 μA)
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)  # Paper/literature value
-    I_DC = gm * abs(V_g_bias)  # Baseline current (positive for noise calc)
-    I_DC = max(I_DC, 1e-6)  # Floor at 1 μA to avoid zero
-    #I_DC = cfg["oect"].get("I_dc_A", gm * cfg["oect"].get("V_g_bias_V", 1e-3))
-
-    # PSD envelopes
-    N_c = float(cfg["noise"]["N_c"]) if isinstance(cfg["noise"]["N_c"], str) else cfg["noise"]["N_c"]
-    K_f = alpha_H / N_c
-    psd_flick = K_f * I_DC**2 / freqs
-    psd_drift = K_d * I_DC**2 / freqs**2
+    q_eff_tbl = {nt: cfg['neurotransmitters'][nt].get('q_eff_e', 0) for nt in nts}
     
+    signal = np.zeros((3, n))
+    for k, nt in enumerate(nts):
+        # Calculate signal current: I_sig = -gm * q_eff * e * N_b / C_tot
+        # The negative sign is for p-type OECTs.
+        signal[k] = -gm * ELEMENTARY_CHARGE * q_eff_tbl[nt] * bound_sites_trio[k] / C_tot
+
+    # --- 2. Conditionally Generate Noise Components ---
     if cfg.get('deterministic_mode', False):
-        # Deterministic mode: No noise
-        thermal = np.zeros((3, n))
-        flick_corr = np.zeros((3, n))
-        drift_corr = np.zeros((3, n))
+        # In deterministic mode, total current is just the signal.
+        total = signal
     else:
-        # Generate base noise
-        flick_fft = rng.normal(size=freqs.size) + 1j*rng.normal(size=freqs.size)
-        flick_fft *= np.sqrt(psd_flick * fs /2) / np.sqrt(n)  # FIXED: Correct scaling
-        drift_fft = rng.normal(size=freqs.size) + 1j*rng.normal(size=freqs.size)
-        drift_fft *= np.sqrt(psd_drift * fs /2) / np.sqrt(n)  # FIXED: Correct scaling
+        # In stochastic mode, generate and add all noise components.
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        freqs[0] = freqs[1] if len(freqs) > 1 else 1/fs # Avoid zero frequency
+
+        # Get noise parameters
+        alpha_H = cfg["noise"]["alpha_H"]
+        K_d = cfg["noise"]["K_d_Hz"]
+        N_c = float(cfg["noise"]["N_c"])
+        T = cfg["sim"]["temperature_K"]
+        R_ch = cfg["oect"]["R_ch_Ohm"]
+        V_g_bias = cfg["oect"]["V_g_bias_V"]
+        I_DC = gm * abs(V_g_bias)
+        I_DC = max(I_DC, 1e-6) # Floor at 1 µA
+
+        # Generate base noise sources
+        K_f = alpha_H / N_c
+        psd_flick = K_f * I_DC**2 / freqs
+        psd_drift = K_d * I_DC**2 / freqs**2
+
+        flick_fft = rng.normal(size=freqs.size) + 1j * rng.normal(size=freqs.size)
+        flick_fft *= np.sqrt(psd_flick * fs / 2)
+        drift_fft = rng.normal(size=freqs.size) + 1j * rng.normal(size=freqs.size)
+        drift_fft *= np.sqrt(psd_drift * fs / 2)
 
         flick_base = np.fft.irfft(flick_fft, n=n)
         drift_base = np.fft.irfft(drift_fft, n=n)
 
-        # Correlate the noise
+        # Create correlated noise and uncorrelated thermal noise
         flick_corr = _generate_correlated_triplet(flick_base, rho, rng)
         drift_corr = _generate_correlated_triplet(drift_base, rho, rng)
-
-        # Thermal noise (uncorrelated)
-        B_det = cfg.get('detection_bandwidth_Hz', 100)  # Detection bandwidth
+        
         psd_th = 4 * BOLTZMANN * T / R_ch
-        effective_B = min(B_det, fs / 2)  # FIXED: Cap at Nyquist
+        B_det = cfg.get('detection_bandwidth_Hz', 100)
+        effective_B = min(B_det, fs / 2)
         thermal = rng.normal(scale=np.sqrt(psd_th * effective_B), size=(3, n))
 
-    # Signal current - USE RAW q_eff VALUES
-    q_eff_tbl = {nt: cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts}
-    signal = np.empty((3, n))
-    boost_factor = 100.0  # Temp multiplier to boost signal magnitude for testing (adjust or remove later)
-    signal = np.empty((3, n))
-    for k, nt in enumerate(nts):
-        signal[k] = -gm * ELEMENTARY_CHARGE * q_eff_tbl[nt] * bound_sites_trio[k] / C_tot  # Force negative, no boost
-    print(f"Mean signal for GLU: {np.mean(signal[0]):.3e} A")  # Debug, expect negative
+        # Total current is the sum of signal and all noise sources
+        total = signal + thermal + flick_corr + drift_corr
 
-    total = signal + thermal + flick_corr + drift_corr
+    # --- 3. Return the Final Currents ---
     return {nt: total[i] for i, nt in enumerate(nts)}
 
 def oect_current(

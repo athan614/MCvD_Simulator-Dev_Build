@@ -652,7 +652,7 @@ def run_sweep(cfg: Dict[str, Any], seeds: List[int], sweep_param: str,
         
         # Store aggregated results
         row = {
-            sweep_param: value,
+            'nm_value': value,
             'ser': ser,
             'snr_db': snr,
             'num_runs': len(value_results)
@@ -800,8 +800,8 @@ def plot_ser_vs_nm(results_dict: Dict[str, pd.DataFrame], save_path: Path):
     markers = {'MoSK': 'o', 'CSK': 's', 'Hybrid': '^'}
     
     for mode, df in results_dict.items():
-        if 'pipeline_Nm_per_symbol' in df.columns and 'ser' in df.columns:
-            plt.loglog(df['pipeline_Nm_per_symbol'], df['ser'], 
+        if 'nm_value' in df.columns and 'ser' in df.columns:
+            plt.loglog(df['nm_value'], df['ser'],
                       color=colors.get(mode, 'black'),
                       marker=markers.get(mode, 'o'),
                       markersize=8,
@@ -1063,7 +1063,7 @@ def main() -> None:
     print("Summary Statistics")
     print(f"{'='*60}")
     print(f"\nMinimum SER achieved: {df_ser_nm['ser'].min():.2e}")
-    print(f"Nm for minimum SER: {df_ser_nm.loc[df_ser_nm['ser'].idxmin(), 'pipeline_Nm_per_symbol']:.0f}")
+    print(f"Nm for minimum SER: {df_ser_nm.loc[df_ser_nm['ser'].idxmin(), 'nm_value']:.0f}")
     
     if threshold_cache and args.mode in ["CSK", "Hybrid"]:
         print(f"\nThreshold calibrations performed: {len(threshold_cache)}")
