@@ -95,7 +95,7 @@ pipeline:
   sequence_length: 1000         # symbols per Monte-Carlo run
   random_seed: 2025
   modulation: "MoSK"            # Options: "MoSK", "CSK", "Hybrid"
-  enable_isi: False              # Master switch for the Inter-Symbol Interference model
+  enable_isi: True              # Master switch for the Inter-Symbol Interference model
   isi_memory: 2                 # Default memory (will be made dynamic in analysis script)
   guard_factor: 0.2             # 20% guard time (Reduced from 0.3)
   lod_nm_min: 50                # New flexible lower bound for LoD search
