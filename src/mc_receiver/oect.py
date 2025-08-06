@@ -1,49 +1,107 @@
 """
 OECT transduction and noise model for tri-channel biosensor.
 
-This module implements the electrical transduction layer described in Section II-F and II-G
-of the manuscript, converting bound aptamer counts to drain currents with realistic noise
-characteristics including thermal, flicker (1/f), and drift components.
+VECTORIZED VERSION: Optimized noise generation and signal processing
+with batch operations and efficient FFT-based methods.
 """
 
 from __future__ import annotations
 import numpy as np
 from typing import Dict, Optional, Tuple, Any
-from scipy import signal # type: ignore[import]
+from scipy import signal    #type: ignore
 from ..constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
-from typing import Tuple
+
 
 def _cholesky_matrix(rho: float) -> np.ndarray:
-    """Return 3×3 lower-triangular L s.t. L @ L.T = Σ."""
+    """Return 3×3 lower-triangular L s.t. L @ L.T = Σ. (Unchanged)"""
     return np.linalg.cholesky(np.array([[1.0, rho, rho],
                                         [rho, 1.0, rho],
                                         [rho, rho, 1.0]]))
 
+
 def _generate_correlated_triplet(base_vec: np.ndarray,
-                                 rho: float,
-                                 rng: np.random.Generator) -> np.ndarray:
+                                rho: float,
+                                rng: np.random.Generator) -> np.ndarray:
     """
-    Produce (3,n) traces:
-        • each row has the same power-spectral envelope as `base_vec`
-        • pair-wise Pearson correlation ≈ `rho`
-    Strategy
-    --------
-    1.  Generate three iid white-Gaussian sequences.
-    2.  Impose |FFT| of `base_vec` on each row (keeps PSD shape).
-    3.  Apply Cholesky factor of Σ to inject correlation.
+    FULLY VECTORIZED: Produce (3,n) traces with correlation using efficient FFT operations.
+    Process all 3 channels simultaneously for better performance.
     """
     n = base_vec.size
     L = _cholesky_matrix(rho)
 
-    # 1 & 2 – iid Gaussian  →  mould spectrum
-    env_mag = np.abs(np.fft.rfft(base_vec))          # magnitude template
-    X = np.empty((3, n))
-    for k in range(3):
-        fft_white = np.fft.rfft(rng.normal(size=n))
-        X[k] = np.fft.irfft(env_mag * np.exp(1j * np.angle(fft_white)), n=n)
-
-    # 3 – inject correlation
+    # Get magnitude template from base vector
+    env_mag = np.abs(np.fft.rfft(base_vec))
+    
+    # VECTORIZED: Generate all white noise at once
+    white_noise = rng.normal(size=(3, n))
+    
+    # FULLY VECTORIZED: Apply FFT to all channels at once
+    fft_white_all = np.fft.rfft(white_noise, axis=1)
+    
+    # Apply magnitude envelope while preserving phase
+    shaped_fft_all = env_mag[np.newaxis, :] * np.exp(1j * np.angle(fft_white_all))
+    
+    # Transform back to time domain
+    X = np.fft.irfft(shaped_fft_all, n=n, axis=1)
+    
+    # Apply correlation matrix
     return L @ X
+
+
+def _generate_correlated_triplet_batch(base_vecs: np.ndarray,
+                                      rho: float,
+                                      rng: np.random.Generator) -> np.ndarray:
+    """
+    FULLY VECTORIZED: Generate multiple correlated triplets efficiently.
+    Process all batches and channels simultaneously.
+    
+    Parameters
+    ----------
+    base_vecs : np.ndarray
+        Shape (n_batch, n_time) base vectors
+    rho : float
+        Correlation coefficient
+    rng : np.random.Generator
+        Random generator
+        
+    Returns
+    -------
+    np.ndarray
+        Shape (n_batch, 3, n_time) correlated traces
+    """
+    n_batch, n_time = base_vecs.shape
+    L = _cholesky_matrix(rho)
+    
+    # Pre-allocate result
+    result = np.zeros((n_batch, 3, n_time))
+    
+    # FULLY VECTORIZED: Process all batches at once if memory allows
+    if n_batch * n_time < 1e6:  # If total size is reasonable
+        # Get magnitude templates for all batches
+        env_mags = np.abs(np.fft.rfft(base_vecs, axis=1))
+        
+        # Generate all white noise at once
+        white_noise = rng.normal(size=(n_batch, 3, n_time))
+        
+        # FFT all channels and batches
+        fft_white_all = np.fft.rfft(white_noise, axis=2)
+        
+        # Apply magnitude envelopes
+        shaped_fft_all = env_mags[:, np.newaxis, :] * np.exp(1j * np.angle(fft_white_all))
+        
+        # Transform back
+        X_all = np.fft.irfft(shaped_fft_all, n=n_time, axis=2)
+        
+        # Apply correlation matrix to each batch
+        for i in range(n_batch):
+            result[i] = L @ X_all[i]
+    else:
+        # Fall back to batch-wise processing for large arrays
+        for i in range(n_batch):
+            result[i] = _generate_correlated_triplet(base_vecs[i], rho, rng)
+    
+    return result
+
 
 def oect_trio(bound_sites_trio: np.ndarray,
               nts: Tuple[str, str, str],
@@ -52,32 +110,21 @@ def oect_trio(bound_sites_trio: np.ndarray,
               rho: Optional[float] = None) -> Dict[str, np.ndarray]:
     """
     Return correlated drain-current traces for GLU, GABA, CTRL.
-    Correlation matrix: [[1,ρ,ρ],[ρ,1,ρ],[ρ,ρ,1]]
     
-    Parameters
-    ----------
-    bound_sites_trio : (3,n) int array
-    nts : ("GLU","GABA","CTRL")
-    cfg : nested dict with noise.*, oect.*, sim.*
-    rng : random generator
-    rho : correlation coefficient (default from config)
-    
-    Returns
-    -------
-    dict : {nt: current_array} for each channel
+    VECTORIZED: Optimized noise generation using batch FFT operations.
     """
-    
     if rho is None:
         rho = cfg["noise"].get("rho_correlated", 0.9)
 
-    # Now rho is guaranteed to be float, not None
-    assert rho is not None  # Type checker hint
+    assert rho is not None
 
     n = bound_sites_trio.shape[1]
     fs = 1 / cfg["sim"]["dt_s"]
+    
+    # VECTORIZED: Generate frequency vector once
     freqs = np.fft.rfftfreq(n, 1/fs)
     freqs[0] = freqs[1]  # avoid zero
-
+    
     # Get parameters from nested config
     alpha_H = cfg["noise"]["alpha_H"]
     K_d = cfg["noise"]["K_d_Hz"]
@@ -86,13 +133,11 @@ def oect_trio(bound_sites_trio: np.ndarray,
     R_ch = cfg["oect"]["R_ch_Ohm"]
     gm = cfg["oect"]["gm_S"]
     C_tot = cfg["oect"]["C_tot_F"]
-    # FIXED: Realistic baseline from bias (literature: 10-100 μA)
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)  # Paper/literature value
-    I_DC = gm * abs(V_g_bias)  # Baseline current (positive for noise calc)
-    I_DC = max(I_DC, 1e-6)  # Floor at 1 μA to avoid zero
-    #I_DC = cfg["oect"].get("I_dc_A", gm * cfg["oect"].get("V_g_bias_V", 1e-3))
+    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    I_DC = gm * abs(V_g_bias)
+    I_DC = max(I_DC, 1e-6)
 
-    # PSD envelopes
+    # VECTORIZED: Calculate PSD envelopes
     N_c = float(cfg["noise"]["N_c"]) if isinstance(cfg["noise"]["N_c"], str) else cfg["noise"]["N_c"]
     K_f = alpha_H / N_c
     psd_flick = K_f * I_DC**2 / freqs
@@ -104,36 +149,44 @@ def oect_trio(bound_sites_trio: np.ndarray,
         flick_corr = np.zeros((3, n))
         drift_corr = np.zeros((3, n))
     else:
-        # Generate base noise
-        flick_fft = rng.normal(size=freqs.size) + 1j*rng.normal(size=freqs.size)
-        flick_fft *= np.sqrt(psd_flick * fs /2) / np.sqrt(n)  # FIXED: Correct scaling
-        drift_fft = rng.normal(size=freqs.size) + 1j*rng.normal(size=freqs.size)
-        drift_fft *= np.sqrt(psd_drift * fs /2) / np.sqrt(n)  # FIXED: Correct scaling
-
+        # VECTORIZED: Generate base noise spectra
+        # Create complex noise for both flicker and drift at once
+        noise_shape = (2, freqs.size)  # 2 for flicker and drift
+        complex_noise = rng.normal(size=noise_shape) + 1j * rng.normal(size=noise_shape)
+        
+        # Apply PSD scaling
+        flick_fft = complex_noise[0] * np.sqrt(psd_flick * fs / 2) / np.sqrt(n)
+        drift_fft = complex_noise[1] * np.sqrt(psd_drift * fs / 2) / np.sqrt(n)
+        
+        # Transform to time domain
         flick_base = np.fft.irfft(flick_fft, n=n)
         drift_base = np.fft.irfft(drift_fft, n=n)
-
-        # Correlate the noise
+        
+        # Generate correlated versions
         flick_corr = _generate_correlated_triplet(flick_base, rho, rng)
         drift_corr = _generate_correlated_triplet(drift_base, rho, rng)
-
-        # Thermal noise (uncorrelated)
-        B_det = cfg.get('detection_bandwidth_Hz', 100)  # Detection bandwidth
+        
+        # VECTORIZED: Thermal noise generation
+        B_det = cfg.get('detection_bandwidth_Hz', 100)
         psd_th = 4 * BOLTZMANN * T / R_ch
-        effective_B = min(B_det, fs / 2)  # FIXED: Cap at Nyquist
-        thermal = rng.normal(scale=np.sqrt(psd_th * effective_B), size=(3, n))
+        effective_B = min(B_det, fs / 2)
+        thermal_scale = np.sqrt(psd_th * effective_B)
+        thermal = rng.normal(scale=thermal_scale, size=(3, n))
 
-    # Signal current - USE RAW q_eff VALUES
-    q_eff_tbl = {nt: cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts}
-    signal = np.empty((3, n))
-    boost_factor = 100.0  # Temp multiplier to boost signal magnitude for testing (adjust or remove later)
-    signal = np.empty((3, n))
-    for k, nt in enumerate(nts):
-        signal[k] = -gm * ELEMENTARY_CHARGE * q_eff_tbl[nt] * bound_sites_trio[k] / C_tot  # Force negative, no boost
-    #print(f"Mean signal for GLU: {np.mean(signal[0]):.3e} A")  # Debug, expect negative
-
+    # VECTORIZED: Signal current calculation (let q_eff handle sign; no forced -)
+    q_eff_array = np.array([cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts])  # e.g., -1.0 for GLU, +1.0 for GABA
+    signal = gm * q_eff_array[:, np.newaxis] * ELEMENTARY_CHARGE * bound_sites_trio / C_tot  # q_eff dictates sign
+    
+    # Total current
     total = signal + thermal + flick_corr + drift_corr
-    return {nt: total[i] for i, nt in enumerate(nts)}
+    
+    # Pre-allocate result dictionary for better performance
+    result = {}
+    for i, nt in enumerate(nts):
+        result[nt] = total[i]
+    
+    return result
+
 
 def oect_current(
     bound_sites_t: np.ndarray,
@@ -144,32 +197,7 @@ def oect_current(
     """
     Convert bound aptamer trajectory to OECT drain current with noise.
     
-    Implements the complete signal transduction chain including:
-    - Signal current from bound aptamers
-    - Thermal (Johnson-Nyquist) noise
-    - Flicker (1/f) noise
-    - Drift (1/f²) noise
-    
-    Parameters
-    ----------
-    bound_sites_t : np.ndarray
-        Time series of bound aptamer counts (integer)
-    nt : str
-        Neurotransmitter type ('GLU' or 'GABA')
-    cfg : dict
-        Configuration dictionary with device parameters
-    seed : int, optional
-        Random seed for reproducible noise generation
-        
-    Returns
-    -------
-    dict
-        Dictionary containing current components:
-        - 'signal': Clean signal current [A]
-        - 'thermal': Thermal noise component [A]
-        - 'flicker': 1/f noise component [A]
-        - 'drift': 1/f² drift component [A]
-        - 'total': Total current with all noise [A]
+    VECTORIZED: Optimized FFT-based noise generation.
     """
     # Set random seed if provided
     if seed is not None:
@@ -179,16 +207,16 @@ def oect_current(
     
     # Get parameters
     nt_params = get_nt_params(cfg, nt)
-    q_eff = get_nt_params(cfg, nt)["q_eff_e"] if nt != "CTRL" else 0.0  # Effective charge in units of e
+    q_eff = get_nt_params(cfg, nt)["q_eff_e"] if nt != "CTRL" else 0.0
     
     # Device parameters
-    gm = cfg['gm_S']  # Transconductance
-    C_tot = cfg['C_tot_F']  # Total capacitance
-    R_ch = cfg['R_ch_Ohm']  # Channel resistance
-    alpha_H = cfg['alpha_H']  # Hooge parameter
-    N_c = cfg['N_c']  # Number of charge carriers
-    K_d = cfg['K_d_Hz']  # Drift coefficient
-    T = cfg.get('temperature_K', 310)  # Temperature
+    gm = cfg['gm_S']
+    C_tot = cfg['C_tot_F']
+    R_ch = cfg['R_ch_Ohm']
+    alpha_H = cfg['alpha_H']
+    N_c = cfg['N_c']
+    K_d = cfg['K_d_Hz']
+    T = cfg.get('temperature_K', 310)
     
     # Time parameters
     dt = cfg['dt_s']
@@ -196,43 +224,46 @@ def oect_current(
     n_samples = len(bound_sites_t)
     duration = n_samples * dt
     
-    # Calculate signal current: I_sig = gm * q_eff * N_b / C_tot
+    # VECTORIZED: Signal current calculation
     i_signal = gm * q_eff * ELEMENTARY_CHARGE * bound_sites_t / C_tot
     
-    # DC current for noise calculations (use mean of signal)
-    #I_DC = np.mean(i_signal)
-    # FIXED: Realistic baseline from bias (literature: 10-100 μA)
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)  # Paper/literature value
-    I_DC = gm * abs(V_g_bias)  # Baseline current (positive for noise calc)
-    I_DC = max(I_DC, 1e-6)  # Floor at 1 μA to avoid zero
+    # DC current for noise calculations
+    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    I_DC = gm * abs(V_g_bias)
+    I_DC = max(I_DC, 1e-6)
     
-    # Generate noise components using FFT method
-    # Frequency vector for single-sided spectrum (positive frequencies only)
+    # VECTORIZED: Frequency vector generation
     freqs = np.fft.rfftfreq(n_samples, dt)
-    freqs[0] = 1 / duration   # guard against f=0 in 1/f terms
+    freqs[0] = 1 / duration
     n_freqs = len(freqs)
     
-    # 1. Thermal noise (white)
-    B_det = cfg.get('detection_bandwidth_Hz', 100)
-    psd_thermal = 4 * BOLTZMANN * T / R_ch
-    noise_thermal_fft = rng.normal(0, 1, n_freqs) + 1j * rng.normal(0, 1, n_freqs)
-    effective_B = min(B_det, fs / 2)  # FIXED: Cap at Nyquist to prevent overestimation
-    noise_thermal_fft *= np.sqrt(psd_thermal * effective_B /2)
-    i_thermal = np.fft.irfft(noise_thermal_fft, n=n_samples)
-
-    
-    # 2. Flicker (1/f) noise
-    K_f = alpha_H / N_c  # Flicker coefficient
-    psd_flicker = K_f * I_DC**2 / freqs  # 1/f spectrum
-    noise_flicker_fft = rng.normal(0, 1, n_freqs) + 1j * rng.normal(0, 1, n_freqs)
-    noise_flicker_fft *= np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_samples)  # FIXED: Correct scaling for PSD generation (prevents var overestimation by ~n)
-    i_flicker = np.fft.irfft(noise_flicker_fft, n=n_samples)
-    
-    # 3. Drift (1/f²) noise
-    psd_drift = K_d * I_DC**2 / (freqs**2)  # 1/f² spectrum
-    noise_drift_fft = rng.normal(0, 1, n_freqs) + 1j * rng.normal(0, 1, n_freqs)
-    noise_drift_fft *= np.sqrt(psd_drift * fs /2) / np.sqrt(n_samples)  # FIXED: Same correction
-    i_drift = np.fft.irfft(noise_drift_fft, n=n_samples)
+    # VECTORIZED: Generate all noise components at once
+    if cfg.get('deterministic_mode', False):
+        # No noise in deterministic mode
+        i_thermal = np.zeros(n_samples)
+        i_flicker = np.zeros(n_samples)
+        i_drift = np.zeros(n_samples)
+    else:
+        # Generate complex noise for all components
+        complex_noise = rng.normal(size=(3, n_freqs)) + 1j * rng.normal(size=(3, n_freqs))
+        
+        # 1. Thermal noise
+        B_det = cfg.get('detection_bandwidth_Hz', 100)
+        psd_thermal = 4 * BOLTZMANN * T / R_ch
+        effective_B = min(B_det, fs / 2)
+        thermal_scale = np.sqrt(psd_thermal * effective_B / 2)
+        i_thermal = np.fft.irfft(complex_noise[0] * thermal_scale, n=n_samples)
+        
+        # 2. Flicker noise
+        K_f = alpha_H / N_c
+        psd_flicker = K_f * I_DC**2 / freqs
+        flicker_scale = np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_samples)
+        i_flicker = np.fft.irfft(complex_noise[1] * flicker_scale, n=n_samples)
+        
+        # 3. Drift noise
+        psd_drift = K_d * I_DC**2 / (freqs**2)
+        drift_scale = np.sqrt(psd_drift * fs / 2) / np.sqrt(n_samples)
+        i_drift = np.fft.irfft(complex_noise[2] * drift_scale, n=n_samples)
     
     # Total current
     i_total = i_signal + i_thermal + i_flicker + i_drift
@@ -245,41 +276,136 @@ def oect_current(
         'total': i_total
     }
 
-def oect_static_gain(N_b: float, nt: str, cfg: Dict[str, Any]) -> float:
+
+def oect_current_batch(
+    bound_sites_batch: np.ndarray,
+    nt: str,
+    cfg: Dict[str, Any],
+    seed: Optional[int] = None
+) -> Dict[str, np.ndarray]:
     """
-    Calculate drain current change (ΔI_D) for deterministic bound sites.
-    
-    Pure static gain calculation without noise or dynamics, implementing Eq. 24:
-    ΔI_D = (g_m · q_eff · e / C_tot) · N_b
+    FULLY VECTORIZED: Process multiple bound site trajectories in batch.
+    All noise generation and signal processing done in parallel.
     
     Parameters
     ----------
-    N_b : float
-        Number of bound aptamer sites
+    bound_sites_batch : np.ndarray
+        Shape (n_batch, n_time) bound aptamer counts
     nt : str
-        Neurotransmitter type ('GLU' or 'GABA')
+        Neurotransmitter type
     cfg : dict
-        Configuration dictionary
+        Configuration
+    seed : int, optional
+        Random seed
         
     Returns
     -------
-    float
-        Drain current change in amperes [A]
+    dict
+        Dictionary with arrays of shape (n_batch, n_time)
     """
-    # --- parameter lookup --------------------------------------------
-    #   cfg structure mirrors baseline.yaml
-    #   cfg['neurotransmitters'][nt]['q_eff_e']   -> effective charge (e)
-    #   cfg['oect']['gm_S']                       -> transconductance [S]
-    #   cfg['oect']['C_tot_F']                    -> total capacitance [F]
-    nt_params = cfg['neurotransmitters'][nt]
-    q_eff = nt_params['q_eff_e']            # dimensionless, in units of e
-    gm    = cfg['oect']['gm_S']             # [S]
-    C_tot = cfg['oect']['C_tot_F']          # [F]
+    n_batch, n_time = bound_sites_batch.shape
     
-    # Calculate current: I = gm * q_eff * e * N_b / C_tot
-    delta_I = gm * q_eff * ELEMENTARY_CHARGE * N_b / C_tot * -1.0  # negative for p-type OECTs
+    # Set random seed if provided
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+    else:
+        rng = np.random.default_rng()
+    
+    # Get parameters once for all batches
+    nt_params = get_nt_params(cfg, nt)
+    q_eff = nt_params["q_eff_e"] if nt != "CTRL" else 0.0
+    
+    # Device parameters
+    gm = cfg['gm_S']
+    C_tot = cfg['C_tot_F']
+    R_ch = cfg['R_ch_Ohm']
+    alpha_H = cfg['alpha_H']
+    N_c = cfg['N_c']
+    K_d = cfg['K_d_Hz']
+    T = cfg.get('temperature_K', 310)
+    
+    # Time parameters
+    dt = cfg['dt_s']
+    fs = 1 / dt
+    duration = n_time * dt
+    
+    # FULLY VECTORIZED: Signal current for all batches at once
+    i_signal_batch = gm * q_eff * ELEMENTARY_CHARGE * bound_sites_batch / C_tot
+    
+    # Check for deterministic mode
+    if cfg.get('deterministic_mode', False):
+        return {
+            'signal': i_signal_batch,
+            'thermal': np.zeros_like(i_signal_batch),
+            'flicker': np.zeros_like(i_signal_batch),
+            'drift': np.zeros_like(i_signal_batch),
+            'total': i_signal_batch
+        }
+    
+    # DC current for noise calculations (use mean of each batch)
+    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    I_DC = gm * abs(V_g_bias)
+    I_DC = max(I_DC, 1e-6)
+    
+    # Frequency vector for single-sided spectrum
+    freqs = np.fft.rfftfreq(n_time, dt)
+    freqs[0] = 1 / duration
+    n_freqs = len(freqs)
+    
+    # FULLY VECTORIZED: Generate noise for all batches at once
+    # Shape: (n_batch, 3 noise types, n_freqs)
+    complex_noise_all = rng.normal(size=(n_batch, 3, n_freqs)) + 1j * rng.normal(size=(n_batch, 3, n_freqs))
+    
+    # 1. Thermal noise (white) - same PSD for all batches
+    B_det = cfg.get('detection_bandwidth_Hz', 100)
+    psd_thermal = 4 * BOLTZMANN * T / R_ch
+    effective_B = min(B_det, fs / 2)
+    thermal_scale = np.sqrt(psd_thermal * effective_B / 2)
+    
+    # Apply thermal scaling and transform for all batches
+    thermal_fft_batch = complex_noise_all[:, 0, :] * thermal_scale
+    i_thermal_batch = np.fft.irfft(thermal_fft_batch, n=n_time, axis=1)
+    
+    # 2. Flicker (1/f) noise - same PSD shape for all batches
+    K_f = alpha_H / N_c
+    psd_flicker = K_f * I_DC**2 / freqs
+    flicker_scale = np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_time)
+    
+    # Apply flicker scaling and transform for all batches
+    flicker_fft_batch = complex_noise_all[:, 1, :] * flicker_scale[np.newaxis, :]
+    i_flicker_batch = np.fft.irfft(flicker_fft_batch, n=n_time, axis=1)
+    
+    # 3. Drift (1/f²) noise - same PSD shape for all batches
+    psd_drift = K_d * I_DC**2 / (freqs**2)
+    drift_scale = np.sqrt(psd_drift * fs / 2) / np.sqrt(n_time)
+    
+    # Apply drift scaling and transform for all batches
+    drift_fft_batch = complex_noise_all[:, 2, :] * drift_scale[np.newaxis, :]
+    i_drift_batch = np.fft.irfft(drift_fft_batch, n=n_time, axis=1)
+    
+    # Total current for all batches
+    i_total_batch = i_signal_batch + i_thermal_batch + i_flicker_batch + i_drift_batch
+    
+    return {
+        'signal': i_signal_batch,
+        'thermal': i_thermal_batch,
+        'flicker': i_flicker_batch,
+        'drift': i_drift_batch,
+        'total': i_total_batch
+    }
+
+
+def oect_static_gain(N_b: float, nt: str, cfg: Dict[str, Any]) -> float:
+    """Calculate drain current change for deterministic bound sites. (Unchanged)"""
+    nt_params = cfg['neurotransmitters'][nt]
+    q_eff = nt_params['q_eff_e']
+    gm = cfg['oect']['gm_S']
+    C_tot = cfg['oect']['C_tot_F']
+    
+    delta_I = gm * q_eff * ELEMENTARY_CHARGE * N_b / C_tot * -1.0
     
     return delta_I
+
 
 def oect_impulse_response(
     dt_s: float,
@@ -287,32 +413,14 @@ def oect_impulse_response(
     cfg: Dict[str, Any],
 ) -> np.ndarray:
     """
-    Discrete-time impulse response h_OECT of the single-pole transducer.
-
-    The analogue model is a first-order low-pass with
-        h(t) = (1/τ) · exp(-t/τ)   for  t ≥ 0
-    where τ = cfg['oect']['tau_OECT_s'].
-
-    We return the response sampled every `dt_s`, length = `n_samples`.
-    The discrete sequence is h[k] = (1/τ) · exp(-k · dt_s / τ).
-
-    Parameters
-    ----------
-    dt_s : float
-        Time step in seconds
-    n_samples : int
-        Number of samples to generate
-    cfg : dict
-        Configuration dictionary with cfg['oect']['tau_OECT_s']
-
-    Returns
-    -------
-    np.ndarray, shape (n_samples,)
-        Impulse response in A/A (dimensionless gain).
+    Discrete-time impulse response of the OECT.
+    
+    VECTORIZED: Already uses numpy operations efficiently.
     """
     tau = cfg['oect']['tau_OECT_s']
     t = np.arange(n_samples) * dt_s
     return (1.0 / tau) * np.exp(-t / tau)
+
 
 def differential_channels(
     i_glu: np.ndarray,
@@ -321,42 +429,17 @@ def differential_channels(
     rho: float
 ) -> Dict[str, Any]:
     """
-    Compute differential currents for tri-channel architecture with correlated noise.
+    Compute differential currents for tri-channel architecture.
     
-    The control channel shares common-mode noise (temperature, pH, ionic strength
-    variations) with the sensing channels, enabling noise cancellation through
-    differential measurement.
-    
-    Parameters
-    ----------
-    i_glu : np.ndarray
-        Total current from glutamate channel [A]
-    i_gaba : np.ndarray
-        Total current from GABA channel [A]
-    i_ctrl : np.ndarray
-        Total current from control channel [A]
-    rho : float
-        (Currently informational.) Correlation coefficient you aimed for when
-        generating the pixel currents. The function simply subtracts CTRL from
-        each sensing pixel; it does not alter correlation.
-        
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - 'diff_glu': Differential current GLU - CTRL [A]
-        - 'diff_gaba': Differential current GABA - CTRL [A]
-        - 'rho_achieved': Actual correlation coefficient achieved
+    VECTORIZED: Already uses numpy operations efficiently.
     """
-    # Simple differential measurement
-    # In reality, the noise correlation is already built into the individual
-    # channel currents through shared environmental factors
+    # Vectorized differential calculation
     diff_glu = i_glu - i_ctrl
     diff_gaba = i_gaba - i_ctrl
     
-    # Calculate achieved correlation between channels
-    # This is for validation/debugging purposes
-    corr_matrix = np.corrcoef([i_glu, i_gaba, i_ctrl])
+    # Vectorized correlation calculation
+    current_matrix = np.vstack([i_glu, i_gaba, i_ctrl])
+    corr_matrix = np.corrcoef(current_matrix)
     rho_glu_ctrl = corr_matrix[0, 2]
     rho_gaba_ctrl = corr_matrix[1, 2]
     rho_achieved = np.mean([rho_glu_ctrl, rho_gaba_ctrl])
@@ -377,36 +460,20 @@ def generate_correlated_noise(
     """
     Generate correlated Gaussian noise for multiple channels.
     
-    Used to simulate common-mode environmental noise that affects
-    all channels similarly (temperature, pH, ionic strength).
-    
-    Parameters
-    ----------
-    n_samples : int
-        Number of time samples
-    rho : float
-        Correlation coefficient (0 to 1)
-    n_channels : int
-        Number of channels (default 3 for tri-channel)
-    seed : int, optional
-        Random seed
-        
-    Returns
-    -------
-    np.ndarray
-        Shape (n_channels, n_samples) of correlated noise
+    VECTORIZED: Optimized matrix operations.
     """
     if seed is not None:
         rng = np.random.default_rng(seed)
     else:
         rng = np.random.default_rng()
     
-    # Generate common-mode and independent components
+    # VECTORIZED: Generate all random numbers at once
+    # Common mode component
     n_common = rng.normal(0, 1, n_samples)
+    # Independent components
     n_independent = rng.normal(0, 1, (n_channels, n_samples))
     
-    # Mix according to correlation coefficient
-    # n_i = sqrt(rho) * n_common + sqrt(1-rho) * n_independent_i
+    # Mix using broadcasting
     correlated_noise = np.sqrt(rho) * n_common + np.sqrt(1 - rho) * n_independent
     
     return correlated_noise
@@ -419,25 +486,19 @@ def calculate_noise_metrics(
     """
     Calculate noise metrics from current components.
     
-    Parameters
-    ----------
-    current_dict : dict
-        Dictionary from oect_current() with noise components
-    cfg : dict
-        Configuration dictionary
-        
-    Returns
-    -------
-    dict
-        Noise metrics including RMS values and SNR
+    VECTORIZED: Already uses numpy operations efficiently.
     """
+    # Vectorized RMS calculations
     signal_rms = np.sqrt(np.mean(current_dict['signal']**2))
     thermal_rms = np.std(current_dict['thermal'])
     flicker_rms = np.std(current_dict['flicker'])
     drift_rms = np.std(current_dict['drift'])
-    total_noise_rms = np.std(current_dict['total'] - current_dict['signal'])
     
-    # SNR in dB
+    # Total noise (vectorized)
+    noise_total = current_dict['total'] - current_dict['signal']
+    total_noise_rms = np.std(noise_total)
+    
+    # SNR calculation
     snr_db = 20 * np.log10(signal_rms / total_noise_rms) if total_noise_rms > 0 else np.inf
     
     return {
@@ -448,23 +509,72 @@ def calculate_noise_metrics(
         'total_noise_rms_A': float(total_noise_rms),
         'snr_db': float(snr_db)
     }
+
+
+def calculate_noise_metrics_batch(
+    current_dict_batch: Dict[str, np.ndarray],
+    cfg: Dict[str, Any]
+) -> Dict[str, np.ndarray]:
+    """
+    VECTORIZED: Calculate noise metrics for multiple trajectories.
     
+    Parameters
+    ----------
+    current_dict_batch : dict
+        Dictionary with arrays of shape (n_batch, n_time)
+    cfg : dict
+        Configuration
+        
+    Returns
+    -------
+    dict
+        Dictionary with arrays of shape (n_batch,) for each metric
+    """
+    n_batch = current_dict_batch['signal'].shape[0]
+    
+    # Pre-allocate results
+    results = {
+        'signal_rms_A': np.zeros(n_batch),
+        'thermal_rms_A': np.zeros(n_batch),
+        'flicker_rms_A': np.zeros(n_batch),
+        'drift_rms_A': np.zeros(n_batch),
+        'total_noise_rms_A': np.zeros(n_batch),
+        'snr_db': np.zeros(n_batch)
+    }
+    
+    # Vectorized calculations across batch dimension
+    results['signal_rms_A'] = np.sqrt(np.mean(current_dict_batch['signal']**2, axis=1))
+    results['thermal_rms_A'] = np.std(current_dict_batch['thermal'], axis=1)
+    results['flicker_rms_A'] = np.std(current_dict_batch['flicker'], axis=1)
+    results['drift_rms_A'] = np.std(current_dict_batch['drift'], axis=1)
+    
+    # Total noise
+    noise_total = current_dict_batch['total'] - current_dict_batch['signal']
+    results['total_noise_rms_A'] = np.std(noise_total, axis=1)
+    
+    # SNR (handle division by zero)
+    with np.errstate(divide='ignore'):
+        results['snr_db'] = 20 * np.log10(
+            results['signal_rms_A'] / results['total_noise_rms_A']
+        )
+    results['snr_db'][results['total_noise_rms_A'] == 0] = np.inf
+    
+    return results
+
+
 def rms_in_band(x: np.ndarray, fs: float, f_cut: float = 5.0) -> float:
-    """RMS after 4-th-order Bessel LP (zero-phase)."""
-    from scipy.signal import bessel, sosfiltfilt # type: ignore[import]
+    """RMS after 4th-order Bessel LP. (Unchanged - already efficient)"""
+    from scipy.signal import bessel, sosfiltfilt    #type: ignore
     sos = bessel(4, f_cut/(fs/2), btype="low", output="sos")
     x_filt = sosfiltfilt(sos, x)
     return np.sqrt(np.mean(x_filt**2))
 
-# In src/mc_receiver/oect.py
-
-# --- ADD THIS FUNCTION AT THE BOTTOM OF THE FILE ---
 
 def default_params():
-    """Returns a dictionary of the default OECT electrical and noise parameters."""
+    """Returns default OECT parameters. (Unchanged)"""
     return {
         'gm_S': 0.002,
-        'C_tot_F': 18e-9,  # CORRECTED: 18 nF (200 μm × 200 μm × 12 nm film)
+        'C_tot_F': 18e-9,
         'R_ch_Ohm': 200,
         'alpha_H': 3.0e-3,
         'N_c': 3.0e14,

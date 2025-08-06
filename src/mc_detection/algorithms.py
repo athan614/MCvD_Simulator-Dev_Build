@@ -82,9 +82,8 @@ def detect_mosk(i_glu: np.ndarray,
     sigma_glu = np.sqrt(noise_var_glu)
     sigma_gaba = np.sqrt(noise_var_gaba)
     
-    # Improved decision statistic with noise normalization
-    test_stat = q_glu/sigma_glu - q_gaba/sigma_gaba
-    
+    # Improved decision statistic with noise normalization (signed, no abs—handles depletion/enhancement)
+    test_stat = q_glu / sigma_glu - q_gaba / sigma_gaba  # Negative q_glu large → positive test_stat for GLU
     # Return 0 for GLU (test_stat > 0), 1 for GABA (test_stat < 0)
     return int(test_stat < 0)
 
@@ -174,7 +173,7 @@ def detect_csk_binary(i_ch: np.ndarray,
     # Average current over decision window
     q_avg = integrate_current(i_diff, dt, win) / win
     
-    return int(q_avg > threshold)
+    return int(q_avg < threshold)   # Flip to < if negative signals mean higher levels (depletion mode)
 
 
 # ------------------------------------------------------------------
@@ -211,13 +210,13 @@ def detect_csk_mary(i_ch: np.ndarray,
     # Differential measurement
     i_diff = i_ch - i_ctrl
     
-    # Average current over decision window
-    q_avg = integrate_current(i_diff, dt, win) / win
+    # Average current over decision window (signed—no abs; handles negative depletion currents)
+    q_avg = integrate_current(i_diff, dt, win) / win    # Signed value (e.g., more negative = higher level if depletion)
     
-    # Find symbol by comparing to thresholds
+    # Find symbol by comparing to thresholds (calibrated on signed stats)
     symbol = 0
     for threshold in thresholds:
-        if q_avg > threshold:
+        if q_avg < threshold:   # Flip to < if negative signals mean higher levels (depletion mode)
             symbol += 1
         else:
             break

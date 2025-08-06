@@ -11,7 +11,7 @@ neurotransmitters:
     D_m2_s: 7.6e-10
     lambda: 1.6                  # CORRECTED: Consistent with literature (was 1.7)
     k_on_M_s: 1e5               # High on-rate for strong binding (was 1e5)
-    k_off_s: 0.1              # Low off for K_d=0.1 nM (was 0.5)
+    k_off_s: 0.01              # Low off for K_d=0.1 nM (was 0.5)
     q_eff_e: 1.0                # Higher effective charge (was 1.5)
   GABA: #DOPAMINE, GABA IS PLACEHOLDER NAME FOR CODE FUNCTIONALITY, n-type OECT
     D_m2_s: 6.0e-10             # CORRECTED: Same as GLU for consistency
@@ -48,7 +48,7 @@ binding:
 # -------- OECT device --------
 oect:
   gm_S: 0.005                    # 10mS for better signal (was 0.005)
-  C_tot_F: 1.8e-8               # Optimized capacitance (was 4e-7)
+  C_tot_F: 5e-8               # Optimized capacitance (was 4e-7)
   R_ch_Ohm: 500                 # Channel resistance for Johnson noise
   I_dc_A: 1.0e-4                # 1 µA baseline current for proper noise scaling
   V_g_bias_V: -0.2             # -20 mV gate bias (was -0.2)
@@ -83,19 +83,19 @@ detection:
   sequence_length: 1000         # symbols per Monte-Carlo run
   monte_carlo_trials: 10000
   snr_dB_range: [-10, 20]       # analytic BER curves
-  mu0_glu: 2.442e-05           # Mean charge for GLU class
-  mu1_gaba: -2.620e-05         # Mean charge for GABA class
+  #mu0_glu: 2.442e-05           # Mean charge for GLU class
+  #mu1_gaba: -2.620e-05         # Mean charge for GABA class
   show_progress: true          # Show progress bars
 
 # -------- End-to-end pipeline --------
 pipeline:
   symbol_period_s: 20.0         # Ts from manuscript
   distance_um: 50               # Changed from 100 to 50 as in code
-  Nm_per_symbol: 2.0e6          # molecules per burst (was 5.0e4)
+  Nm_per_symbol: 1e7          # molecules per burst (was 5.0e4)
   sequence_length: 1000         # symbols per Monte-Carlo run
   random_seed: 2025
   modulation: "MoSK"            # Options: "MoSK", "CSK", "Hybrid"
-  enable_isi: True              # Master switch for the Inter-Symbol Interference model
+  enable_isi: False              # Master switch for the Inter-Symbol Interference model
   isi_memory: 2                 # Default memory (will be made dynamic in analysis script)
   guard_factor: 0.2             # 20% guard time (Reduced from 0.3)
   lod_nm_min: 50                # New flexible lower bound for LoD search
@@ -129,3 +129,4 @@ pipeline:
     CTRL: 100.0                  # µm from organoid
   monte_carlo_trials: 10         # monte-carlo trials for analysis
   show_progress: true            # Show progress bars
+  verbose: true                # Enable verbose output
