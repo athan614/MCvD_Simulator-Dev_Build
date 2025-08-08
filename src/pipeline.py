@@ -1,13 +1,10 @@
-# src/pipeline.py - VECTORIZED VERSION
+# src/pipeline.py - BOTH FIXES APPLIED
 """
 End-to-end simulator for the tri-channel OECT receiver.
 
-VECTORIZED VERSION: Optimized ISI calculations and batch processing
-while maintaining all original fixes and functionality.
-
-ALL CRITICAL FIXES APPLIED:
-- Fix 1-4: Previous fixes maintained.
-- EXPERT FIX: Corrected MoSK/Hybrid/CSK detection logic for antipodal signaling and polarity awareness.
+COMPLETE FIX VERSION:
+1. Uniform CSK level mapping to avoid zero molecules
+2. Correct Poisson noise application at the level, not scaling factor
 """
 
 from typing import Dict, Any, List, Tuple, Optional
@@ -23,7 +20,7 @@ from functools import partial
 from .mc_channel.transport import finite_burst_concentration, finite_burst_concentration_batch, finite_burst_concentration_batch_time
 from .mc_receiver.binding import bernoulli_binding
 from .mc_receiver.oect import oect_trio
-from .constants import get_nt_params # EXPERT ADDITION: Needed for polarity check
+from .constants import get_nt_params
 
 
 def to_int(value):
@@ -70,7 +67,6 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     johnson_charge_var = psd_johnson * T_int
     
     K_f = alpha_H / N_c
-    # Using the approximation provided in the original code
     flicker_charge_var = K_f * I_dc**2 * np.log(2 * np.pi * T_int) * T_int if f_max > f_min else 0
     
     drift_charge_var = 0
@@ -95,13 +91,13 @@ def _calculate_isi_vectorized(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     FULLY VECTORIZED: Calculate ISI contributions from transmission history.
-    (This function remains unchanged as it was correct)
     """
     if not tx_history:
         return np.zeros_like(t_vec), np.zeros_like(t_vec), np.zeros_like(t_vec)
     
     mod = cfg['pipeline']['modulation']
     Ts = cfg['pipeline']['symbol_period_s']
+    level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     
     # Convert history to arrays for vectorization
     past_symbols = np.array([h[0] for h in tx_history], dtype=np.int32)
@@ -122,40 +118,32 @@ def _calculate_isi_vectorized(
         glu_mask = (past_symbols == 0)
         gaba_mask = ~glu_mask
         
-        # FULLY VECTORIZED: Process GLU contributions in batch
+        # Process GLU contributions in batch
         if np.any(glu_mask):
             glu_Nm = Nm_history[glu_mask]
             glu_offsets = time_offsets[glu_mask]
-            # True batch processing
             glu_residuals = finite_burst_concentration_batch_time(
                 glu_Nm, distance_glu_m, t_vec, glu_offsets, cfg, 'GLU'
             )
             conc_at_glu_ch = np.sum(glu_residuals, axis=0)
         
-        # FULLY VECTORIZED: Process GABA contributions in batch
+        # Process GABA contributions in batch
         if np.any(gaba_mask):
             gaba_Nm = Nm_history[gaba_mask]
             gaba_offsets = time_offsets[gaba_mask]
-            # True batch processing
             gaba_residuals = finite_burst_concentration_batch_time(
                 gaba_Nm, distance_gaba_m, t_vec, gaba_offsets, cfg, 'GABA'
             )
             conc_at_gaba_ch = np.sum(gaba_residuals, axis=0)
                 
     elif mod.startswith("CSK"):
-        M = cfg['pipeline']['csk_levels']
+        # ISI uses actual transmitted Nm values from history
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
         
-        # Calculate all Nm levels
-        if M > 1:
-            Nm_levels = Nm_history * (past_symbols / (M - 1))
-        else:
-            Nm_levels = np.where(past_symbols == 0, Nm_history, 0)
-        
         # Process non-zero contributions
-        nonzero_mask = Nm_levels > 0
+        nonzero_mask = Nm_history > 0
         if np.any(nonzero_mask):
-            active_Nm = Nm_levels[nonzero_mask]
+            active_Nm = Nm_history[nonzero_mask]
             active_offsets = time_offsets[nonzero_mask]
             
             if target_channel == 'GLU':
@@ -170,15 +158,13 @@ def _calculate_isi_vectorized(
                 conc_at_gaba_ch = np.sum(residuals, axis=0)
                     
     elif mod == "Hybrid":
-        # Extract molecule type and amplitude bits
+        # Extract molecule type from history
         mol_type_bits = past_symbols >> 1
-        amp_bits = past_symbols & 1
-        amp_levels = np.where(amp_bits == 1, Nm_history, Nm_history * 0.5)
         
         # Process GLU contributions
-        glu_mask = (mol_type_bits == 0)
+        glu_mask = (mol_type_bits == 0) & (Nm_history > 0)
         if np.any(glu_mask):
-            glu_amps = amp_levels[glu_mask]
+            glu_amps = Nm_history[glu_mask]
             glu_offsets = time_offsets[glu_mask]
             glu_residuals = finite_burst_concentration_batch_time(
                 glu_amps, distance_glu_m, t_vec, glu_offsets, cfg, 'GLU'
@@ -186,9 +172,9 @@ def _calculate_isi_vectorized(
             conc_at_glu_ch = np.sum(glu_residuals, axis=0)
         
         # Process GABA contributions
-        gaba_mask = (mol_type_bits == 1)
+        gaba_mask = (mol_type_bits == 1) & (Nm_history > 0)
         if np.any(gaba_mask):
-            gaba_amps = amp_levels[gaba_mask]
+            gaba_amps = Nm_history[gaba_mask]
             gaba_offsets = time_offsets[gaba_mask]
             gaba_residuals = finite_burst_concentration_batch_time(
                 gaba_amps, distance_gaba_m, t_vec, gaba_offsets, cfg, 'GABA'
@@ -201,7 +187,9 @@ def _calculate_isi_vectorized(
 def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg: Dict[str, Any], rng) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Generate GLU, GABA, CTRL drain-current traces for one symbol interval.
-    (This function remains unchanged as it was correct)
+    COMPLETE FIX: 
+    1. Uniform CSK level mapping to avoid zero molecules
+    2. Correct Poisson noise application at the level, not scaling factor
     """
     # Initialization
     dt = cfg['sim']['dt_s']
@@ -226,31 +214,65 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         distance_ctrl_m = distance_m
     
     mod = cfg['pipeline']['modulation']
+    level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     non_specific_factor = cfg['pipeline'].get('non_specific_binding_factor', 0.0)
     
-    # Energy Fairness Calculation
+    # ========== CRITICAL FIX: Correct Energy Fairness and Noise Application ==========
+    
+    # Step 1: Calculate DETERMINISTIC Nm_peak (scaling factor for energy fairness)
     if mod == "Hybrid":
         levels = [0.5, 1.0]
-        mean_amp = np.mean(levels)
+        mean_amp = float(np.mean(levels))
         Nm_peak = cfg['pipeline']['Nm_per_symbol'] / mean_amp
     elif mod.startswith("CSK"):
         M = cfg['pipeline']['csk_levels']
-        if M > 1:
-            mean_amp = np.mean(np.arange(M) / (M - 1))
-            Nm_peak = cfg['pipeline']['Nm_per_symbol'] / mean_amp
-        else:
-            Nm_peak = cfg['pipeline']['Nm_per_symbol']
+        if level_scheme == 'uniform':
+            # Average of [1/M, 2/M, ..., M/M]
+            mean_amp = float((M + 1) / (2 * M))
+        else:  # zero-based
+            if M > 1:
+                mean_amp = float(np.mean(np.arange(M) / (M - 1)))
+            else:
+                mean_amp = 0.5
+        Nm_peak = cfg['pipeline']['Nm_per_symbol'] / mean_amp
     else:  # MoSK
         Nm_peak = cfg['pipeline']['Nm_per_symbol']
     
-    # Ensure Nm_peak is a Python float for consistency
-    Nm_peak = float(Nm_peak)
+    Nm_peak = float(Nm_peak)  # Keep deterministic - NO NOISE YET!
     
-    # Apply Poisson noise
-    if cfg['pipeline'].get('enable_molecular_noise', True):
-        Nm_peak = rng.poisson(Nm_peak)
+    # Step 2: Calculate DETERMINISTIC Nm_level based on transmitted symbol
+    if mod == "MoSK":
+        # MoSK always uses full Nm_peak
+        Nm_level = Nm_peak
+        
+    elif mod.startswith("CSK"):
+        M = cfg['pipeline']['csk_levels']
+        if level_scheme == 'uniform':
+            # FIX 1: Map symbols 0,1,2,3 to fractions 1/M, 2/M, 3/M, M/M
+            # This ensures no zero molecules for symbol 0
+            Nm_level = Nm_peak * ((s_tx + 1) / M)
+        else:  # zero-based (original problematic scheme)
+            if M > 1:
+                Nm_level = Nm_peak * (s_tx / (M - 1))
+            else:
+                Nm_level = Nm_peak if s_tx == 0 else 0
+                
+    elif mod == "Hybrid":
+        mol_type_bit = s_tx >> 1
+        amp_bit = s_tx & 1
+        Nm_level = Nm_peak if amp_bit == 1 else Nm_peak * 0.5
+        
+    else:
+        Nm_level = Nm_peak
     
-    Nm_actual = rng.poisson(Nm_peak) if cfg['pipeline'].get('enable_molecular_noise', True) else Nm_peak
+    # Step 3: Apply Poisson noise to the SPECIFIC LEVEL (not the scaling factor!)
+    # FIX 2: This is the critical fix - noise applied at the correct stage
+    if cfg['pipeline'].get('enable_molecular_noise', True) and Nm_level > 0:
+        Nm_actual = float(rng.poisson(Nm_level))
+    else:
+        Nm_actual = float(Nm_level)
+    
+    # ========== END OF CRITICAL FIX ==========
     
     # VECTORIZED ISI Calculation
     if cfg['pipeline'].get('enable_isi', False):
@@ -278,45 +300,39 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             conc_at_gaba_ch += isi_gaba
             # isi_ctrl is always zero (no contamination)
     
-    # Current Symbol Generation (unchanged logic, same as original)
+    # Current Symbol Generation using Nm_actual (the noisy realization)
     if mod == "MoSK":
         if s_tx == 0:  # GLU
-            conc_glu = finite_burst_concentration(Nm_peak, distance_glu_m, t_vec, cfg, 'GLU')
+            conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
             conc_at_glu_ch += conc_glu
         else:  # GABA
-            conc_gaba = finite_burst_concentration(Nm_peak, distance_gaba_m, t_vec, cfg, 'GABA')
+            conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
             conc_at_gaba_ch += conc_gaba
             
     elif mod.startswith("CSK"):
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
-        M = cfg['pipeline']['csk_levels']
         
-        if M > 1:
-            Nm_level = Nm_peak * (s_tx / (M - 1))
-        else:
-            Nm_level = Nm_peak if s_tx == 0 else 0
-        
-        if Nm_level > 0:
+        # Use Nm_actual directly (already has noise and correct level)
+        if Nm_actual > 0:
             if target_channel == 'GLU':
-                conc_glu = finite_burst_concentration(Nm_level, distance_glu_m, t_vec, cfg, 'GLU')
+                conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
                 conc_at_glu_ch += conc_glu
             else:  # GABA
-                conc_gaba = finite_burst_concentration(Nm_level, distance_gaba_m, t_vec, cfg, 'GABA')
+                conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
                 conc_at_gaba_ch += conc_gaba
             
     elif mod == "Hybrid":
         mol_type_bit = s_tx >> 1
-        amp_bit = s_tx & 1
-        amp_level = Nm_peak if amp_bit == 1 else Nm_peak * 0.5
         
+        # Use Nm_actual directly (already has noise and correct level)
         if mol_type_bit == 0:  # GLU
-            conc_glu = finite_burst_concentration(amp_level, distance_glu_m, t_vec, cfg, 'GLU')
+            conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
             conc_at_glu_ch += conc_glu
         else:  # GABA
-            conc_gaba = finite_burst_concentration(amp_level, distance_gaba_m, t_vec, cfg, 'GABA')
+            conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
             conc_at_gaba_ch += conc_gaba
     
-    # INDEPENDENT Binding simulation for each channel (unchanged)
+    # INDEPENDENT Binding simulation for each channel
     cfg_glu = cfg.copy()
     cfg_glu['N_apt'] = cfg.get('binding', {}).get('N_sites_glu', cfg.get('N_apt'))
     bound_glu_ch, _, _ = bernoulli_binding(conc_at_glu_ch, 'GLU', cfg_glu, rng)
@@ -329,8 +345,8 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     cfg_ctrl['N_apt'] = 0  # No aptamer sites
     bound_ctrl_ch, _, _ = bernoulli_binding(conc_at_ctrl_ch, 'CTRL', cfg_ctrl, rng)
     
-    # Saturation checks (unchanged)
-    N_apt_default = to_int(cfg.get('N_apt', 4e8)) # Handle missing N_apt
+    # Saturation checks
+    N_apt_default = to_int(cfg.get('N_apt', 4e8))
     cap_glu = cfg.get('binding', {}).get('N_sites_glu', N_apt_default)
     cap_gaba = cfg.get('binding', {}).get('N_sites_gaba', N_apt_default)
     
@@ -345,13 +361,11 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     
     max_occupancy_glu = np.max(bound_glu_ch) / cap_glu if cap_glu > 0 else 0
     if max_occupancy_glu > 0.9:
-        # print(f"WARNING: GLU channel saturation detected! Occupancy: {max_occupancy_glu:.2%}")
-        pass
+        pass  # Suppress warning for now
     
     max_occupancy_gaba = np.max(bound_gaba_ch) / cap_gaba if cap_gaba > 0 else 0
     if max_occupancy_gaba > 0.9:
-        # print(f"WARNING: GABA channel saturation detected! Occupancy: {max_occupancy_gaba:.2%}")
-        pass
+        pass  # Suppress warning for now
     
     # OECT current generation
     bound_sites_trio = np.vstack([bound_glu_ch, bound_gaba_ch, bound_ctrl_ch])
@@ -368,8 +382,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
 def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Simulate <sequence_length> symbols and compute BER/SEP.
-    
-    EXPERT PATCH APPLIED: Corrected detection logic for all modes.
+    Detection logic unchanged - the fixes are in signal generation.
     """
     # Import locally to avoid circular dependencies if detection imports pipeline
     try:
@@ -400,13 +413,13 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     stats_glu = []
     stats_gaba = []
     
-    # Get polarities (EXPERT ADDITION)
+    # Get polarities
     q_eff_glu = get_nt_params(cfg, 'GLU')['q_eff_e']
     q_eff_gaba = get_nt_params(cfg, 'GABA')['q_eff_e']
 
     # Process symbols
     for i, s_tx in enumerate(tqdm(tx_symbols, desc=f"Simulating {mod}", disable=cfg.get('disable_progress', False))):
-        # Generate currents with ISI
+        # Generate currents with ISI (NOW WITH BOTH FIXES!)
         ig, ia, ic, Nm_realised = _single_symbol_currents(s_tx, tx_history, cfg, rng)
         tx_history.append((s_tx, Nm_realised))
         
@@ -431,11 +444,9 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         # Get physics-based noise estimation
         sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, detection_window_s, i)
 
-        # --- EXPERT PATCH: Unified Detection Logic ---
-        
+        # Unified Detection Logic (unchanged - fixes are in signal generation)
         if mod == 'MoSK':
-            # CRITICAL FIX: ML detector for antipodal signals (GLU+, GABA-) is SUMMATION
-            # D = (q_glu/sigma) + (q_gaba/sigma). Positive D -> GLU, Negative D -> GABA.
+            # ML detector for antipodal signals (GLU+, GABA-) is SUMMATION
             decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
             
             # Use calibrated threshold (ideally near 0) or fallback to 0
@@ -456,7 +467,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
             M = cfg['pipeline']['csk_levels']
             
-            # CRITICAL FIX: Use signed charge Q
+            # Use signed charge Q
             if target_channel == 'GLU':
                 Q = q_glu
                 q_eff = q_eff_glu
@@ -469,7 +480,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
             s_rx = 0
             for thresh in thresholds:
-                # CRITICAL FIX: Polarity awareness
+                # Polarity awareness
                 if q_eff > 0:
                     # Positive q_eff: Higher level means more positive Q. (Thresholds sorted ascending)
                     if Q > thresh:
@@ -485,7 +496,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
             rx_symbols[i] = s_rx
           
-            # Store signed Q for statistics (Generalized tracking)
+            # Store signed Q for statistics
             if s_tx < M/2:
                 stats_glu.append(Q)
             else:
@@ -493,7 +504,6 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
               
         elif mod == 'Hybrid':
             # Stage 1: MoSK decision (Antipodal ML detector - SUMMATION)
-            # CRITICAL FIX: Use summation
             decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
             
             threshold_mosk = cfg['pipeline'].get('mosk_threshold', 0.0)
@@ -511,17 +521,17 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             
             thresholds_used = {'GLU': threshold_glu, 'GABA': threshold_gaba}
             
-            # CRITICAL FIX: Handle polarity correctly for Stage 2
+            # Handle polarity correctly for Stage 2
             if b_hat == 0:  # GLU detected (Positive polarity)
                 q_target = q_glu
                 # Higher level (1) means MORE positive.
                 l_hat = 1 if q_target > threshold_glu else 0
-                stats_glu.append(q_target) # Track signed charge Q
+                stats_glu.append(q_target)
             else:  # GABA detected (Negative polarity)
                 q_target = q_gaba
                 # Higher level (1) means MORE negative.
                 l_hat = 1 if q_target < threshold_gaba else 0
-                stats_gaba.append(q_target) # Track signed charge Q
+                stats_gaba.append(q_target)
             
             s_rx = (b_hat << 1) | l_hat
             rx_symbols[i] = s_rx

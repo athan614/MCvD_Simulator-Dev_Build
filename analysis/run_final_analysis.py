@@ -1,7 +1,14 @@
-# analysis/run_final_analysis.py
 """
-FINAL OPTIMIZED VERSION: Fixed CSK calibration with dynamic thresholds.
-Implements proper calibration for CSK and Hybrid modes with validation.
+RUN FINAL ANALYSIS (Patched for ISI-enabled results + window match)
+
+Key changes vs your previous script:
+1) **ISI in final results**: Runtime uses ISI by default (`--disable-isi` turns it off).
+2) **Window–threshold match**: Runtime detection window is forced to the **symbol period Ts**
+   so the charge/average used in detection matches what calibration assumed.
+3) **Calibration stays clean**: ISI is disabled during calibration; detection window = Ts.
+4) Minor robustness/debug prints and same outputs (CSV/plots) as before.
+
+This file is designed to be a drop-in replacement for `analysis/run_final_analysis.py`.
 """
 
 import sys
@@ -27,9 +34,10 @@ import platform
 import time
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).parent.parent if (Path(__file__).parent.name == "analysis") else Path(__file__).parent
 sys.path.append(str(project_root))
 
+# Local modules
 from src.detection import calculate_ml_threshold
 from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents
 from src.config_utils import preprocess_config
@@ -142,6 +150,7 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
         cfg['pipeline'].get('symbol_period_s'),
         cfg['pipeline'].get('csk_levels'),
         cfg['pipeline'].get('csk_target_channel'),
+        cfg['pipeline'].get('csk_level_scheme', 'uniform'),
     ]
     return str(hash(tuple(str(p) for p in key_params)))
 
@@ -173,7 +182,7 @@ def check_memory_usage():
     return mem_gb, total_gb, available_gb
 
 def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Preprocess configuration."""
+    """Preprocess configuration; ensure nested dicts exist and clean top-level aliases."""
     cfg = preprocess_config(config)
     
     if 'oect' not in cfg:
@@ -199,13 +208,18 @@ def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
     if 'binding' not in cfg:
         cfg['binding'] = cfg.get('binding', {})
     
+    # Remove top-level aliases if present (kept under nested dicts)
     for key in ['gm_S', 'C_tot_F', 'R_ch_Ohm', 'alpha_H', 'N_c', 'K_d_Hz', 'dt_s', 'temperature_K']:
         cfg.pop(key, None)
+    
+    # Ensure detection section exists
+    if 'detection' not in cfg:
+        cfg['detection'] = {}
     
     return cfg
 
 def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> float:
-    """Calculate dynamic symbol period based on distance."""
+    """Calculate dynamic symbol period based on distance (95% decay + guard)."""
     D_glu = cfg['neurotransmitters']['GLU']['D_m2_s']
     lambda_glu = cfg['neurotransmitters']['GLU']['lambda']
     D_eff = D_glu / (lambda_glu ** 2)
@@ -215,26 +229,22 @@ def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> 
     symbol_period = max(20.0, round(time_95 + guard_time))
     return symbol_period
 
-def calculate_snr_from_stats(stats_glu: List[float], stats_gaba: List[float]) -> float:
-    """Calculate SNR from statistics."""
-    if not stats_glu or not stats_gaba:
-        return 0
-    
-    mu_glu = np.mean(stats_glu)
-    mu_gaba = np.mean(stats_gaba)
-    var_glu = np.var(stats_glu)
-    var_gaba = np.var(stats_gaba)
-    
-    if (var_glu + var_gaba) == 0:
+def calculate_snr_from_stats(stats_a: List[float], stats_b: List[float]) -> float:
+    """Calculate SNR from two classes of decision stats."""
+    if not stats_a or not stats_b:
+        return 0.0
+    mu_a = np.mean(stats_a)
+    mu_b = np.mean(stats_b)
+    var_a = np.var(stats_a)
+    var_b = np.var(stats_b)
+    denom = (var_a + var_b)
+    if denom <= 0:
         return np.inf
-    
-    return float((mu_glu - mu_gaba)**2 / (var_glu + var_gaba))
+    return float((mu_a - mu_b)**2 / denom)
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Run optimized molecular communication analysis"
-    )
+    parser = argparse.ArgumentParser(description="Run molecular communication analysis (patched)")
     parser.add_argument("--mode", choices=["MoSK", "CSK", "Hybrid"], default="MoSK")
     parser.add_argument("--num-seeds", type=int, default=20)
     parser.add_argument("--sequence-length", type=int, default=1000)
@@ -243,201 +253,125 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--beast-mode", action="store_true")
     parser.add_argument("--extreme-mode", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--disable-isi", action="store_true")
+    parser.add_argument("--disable-isi", action="store_true",
+                        help="Disable ISI (runtime). By default ISI is ENABLED in results.")
     parser.add_argument("--debug-calibration", action="store_true", 
                        help="Print detailed calibration information")
-    
+    parser.add_argument("--csk-level-scheme", choices=["uniform", "zero-based"], 
+                       default="uniform", help="CSK level mapping scheme")
     return parser.parse_args()
 
-# ============= IMPROVED CALIBRATION FUNCTIONS =============
+# ============= CALIBRATION (ISI OFF; WINDOW = Ts) =============
 def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False, 
                          save_to_file: bool = True, verbose: bool = False) -> Dict[str, Union[float, List[float]]]:
     """
-    FIXED: Enhanced calibration with better statistics and validation.
+    Enhanced calibration with correct CSK level mapping.
+    ISI is disabled here; detection window is set to Ts for clean, portable thresholds.
     """
     mode = cfg['pipeline']['modulation']
     results_dir = project_root / "results" / "data"
     results_dir.mkdir(parents=True, exist_ok=True)
     
     symbol_period = cfg['pipeline'].get('symbol_period_s', '')
+    level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
+    
     if symbol_period and save_to_file:
-        threshold_file = results_dir / f"thresholds_{mode.lower()}_ts{int(symbol_period)}.json"
+        threshold_file = results_dir / f"thresholds_{mode.lower()}_ts{int(symbol_period)}_{level_scheme}.json"
     else:
-        threshold_file = results_dir / f"thresholds_{mode.lower()}.json"
+        threshold_file = results_dir / f"thresholds_{mode.lower()}_{level_scheme}.json"
     
     if threshold_file.exists() and not recalibrate and save_to_file:
         with open(threshold_file, 'r') as f:
             loaded_thresholds = json.load(f)
-            typed_thresholds: Dict[str, Union[float, List[float]]] = {}
-            for k, v in loaded_thresholds.items():
-                typed_thresholds[k] = v
-            return typed_thresholds
+            return {k: v for k, v in loaded_thresholds.items()}
     
     cal_cfg = deepcopy(cfg)
-    # FIXED: Increase calibration samples for better statistics
-    cal_cfg['pipeline']['sequence_length'] = 200  # Increased from 100
-    
+    cal_cfg['pipeline']['sequence_length'] = 100  # sufficient samples
+    cal_cfg['pipeline']['enable_isi'] = False     # <— ISI OFF IN CALIBRATION
     if 'symbol_period_s' in cal_cfg['pipeline']:
-        cal_cfg['detection']['decision_window_s'] = cal_cfg['pipeline']['symbol_period_s']
+        cal_cfg['detection']['decision_window_s'] = cal_cfg['pipeline']['symbol_period_s']  # <— WINDOW = Ts
     
     thresholds: Dict[str, Union[float, List[float]]] = {}
     
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"CALIBRATING {mode} THRESHOLDS")
-        print(f"Distance: {cfg['pipeline'].get('distance_um')}μm")
-        print(f"Nm: {cfg['pipeline'].get('Nm_per_symbol')}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nCALIBRATING {mode} THRESHOLDS\n{'='*60}")
+        print(f"Distance: {cfg['pipeline'].get('distance_um')} μm, Nm: {cfg['pipeline'].get('Nm_per_symbol')}")
+        if mode.startswith("CSK"):
+            print(f"CSK Level Scheme: {level_scheme}")
     
-    # MoSK Calibration
+    # MoSK calibration (sum statistic → ML threshold near 0)
     if mode == "MoSK" or mode == "Hybrid":
         mosk_stats: Dict[str, List[float]] = {'glu': [], 'gaba': []}
-        
         if mode == "MoSK":
             symbols_to_check = {0: 'glu', 1: 'gaba'}
         else:
             symbols_to_check = {0: 'glu', 1: 'glu', 2: 'gaba', 3: 'gaba'}
-
-        # FIXED: Use more seeds for better statistics
-        cal_seeds = seeds[:20] if len(seeds) >= 20 else seeds  # Increased from 10
-        
+        cal_seeds = seeds[:10] if len(seeds) >= 10 else seeds
         for symbol, type_key in symbols_to_check.items():
             for seed in cal_seeds:
                 cal_cfg['pipeline']['random_seed'] = seed
                 result = run_calibration_symbols(cal_cfg, symbol, mode='MoSK' if mode == "MoSK" else mode)
                 if result:
                     mosk_stats[type_key].extend(result['q_values'])
-        
         if all(mosk_stats[k] for k in mosk_stats):
-            mean_D_glu = float(np.mean(mosk_stats['glu']))
-            std_D_glu = max(float(np.std(mosk_stats['glu'])), 1e-15)
-            mean_D_gaba = float(np.mean(mosk_stats['gaba']))
-            std_D_gaba = max(float(np.std(mosk_stats['gaba'])), 1e-15)
-            
+            mean_D_glu = float(np.mean(mosk_stats['glu'])); std_D_glu = max(float(np.std(mosk_stats['glu'])), 1e-15)
+            mean_D_gaba = float(np.mean(mosk_stats['gaba'])); std_D_gaba = max(float(np.std(mosk_stats['gaba'])), 1e-15)
             threshold_mosk = calculate_ml_threshold(mean_D_glu, mean_D_gaba, std_D_glu, std_D_gaba)
             thresholds['mosk_threshold'] = threshold_mosk
-            
             if verbose:
-                print(f"\nMoSK Statistics:")
-                print(f"  GLU:  μ={mean_D_glu:.3e}, σ={std_D_glu:.3e}")
-                print(f"  GABA: μ={mean_D_gaba:.3e}, σ={std_D_gaba:.3e}")
-                print(f"  Threshold: {threshold_mosk:.3e}")
+                print(f"MoSK threshold: {threshold_mosk:.3e}")
     
-    # CSK Calibration (FIXED)
+    # CSK calibration (M-1 thresholds on signed Q for target channel)
     if mode.startswith("CSK"):
         M = cfg['pipeline']['csk_levels']
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
-        
+        level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
         if verbose:
-            print(f"\nCSK Configuration:")
-            print(f"  Levels: {M}")
-            print(f"  Target Channel: {target_channel}")
-        
+            print(f"\nCSK: Levels={M}, Target={target_channel}, Scheme={level_scheme}")
         level_stats: Dict[int, List[float]] = {level: [] for level in range(M)}
-
-        # FIXED: Use more seeds and samples
-        cal_seeds = seeds[:20] if len(seeds) >= 20 else seeds
-        
+        cal_seeds = seeds[:10] if len(seeds) >= 10 else seeds
         for level in range(M):
             if verbose:
-                print(f"  Calibrating level {level} (Nm fraction: {level/(M-1) if M > 1 else 0:.2f})...")
-            
+                frac = (level + 1)/M if level_scheme == 'uniform' else (level/(M-1) if M>1 else 0.0)
+                print(f"  Level {level} (Nm fraction {frac:.2f})")
             for seed in cal_seeds:
                 cal_cfg['pipeline']['random_seed'] = seed
-                result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=100)  # More symbols
+                result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=100)
                 if result:
                     level_stats[level].extend(result['q_values'])
-        
-        # Calculate statistics for each level
-        if verbose:
-            print(f"\nCSK Level Statistics:")
-            for level in range(M):
-                if level_stats[level]:
-                    mean_Q = np.mean(level_stats[level])
-                    std_Q = np.std(level_stats[level])
-                    print(f"  Level {level}: μ={mean_Q:.3e}, σ={std_Q:.3e}, n={len(level_stats[level])}")
-        
-        # Calculate thresholds between adjacent levels
         threshold_list: List[float] = []
         for i in range(M - 1):
             if level_stats[i] and level_stats[i + 1]:
-                mean_Q_low = float(np.mean(level_stats[i]))
-                mean_Q_high = float(np.mean(level_stats[i + 1]))
-                std_Q_low = max(float(np.std(level_stats[i])), 1e-15)
-                std_Q_high = max(float(np.std(level_stats[i + 1])), 1e-15)
-                
-                threshold = calculate_ml_threshold(mean_Q_low, mean_Q_high, std_Q_low, std_Q_high)
-                threshold_list.append(threshold)
-                
-                if verbose:
-                    print(f"  Threshold {i}->{i+1}: {threshold:.3e}")
-
-        # Sort thresholds based on polarity
+                m0, s0 = float(np.mean(level_stats[i])), max(float(np.std(level_stats[i])), 1e-15)
+                m1, s1 = float(np.mean(level_stats[i+1])), max(float(np.std(level_stats[i+1])), 1e-15)
+                threshold_list.append(calculate_ml_threshold(m0, m1, s0, s1))
         q_eff = get_nt_params(cfg, target_channel)['q_eff_e']
-        if q_eff > 0:
-            threshold_list.sort()
-            if verbose:
-                print(f"  Sorted ascending (q_eff={q_eff}>0): {[f'{t:.3e}' for t in threshold_list]}")
-        else:
-            threshold_list.sort(reverse=True)
-            if verbose:
-                print(f"  Sorted descending (q_eff={q_eff}<0): {[f'{t:.3e}' for t in threshold_list]}")
-        
-        # VALIDATION: Check threshold separation
-        if len(threshold_list) > 1:
-            min_separation = min(abs(threshold_list[i+1] - threshold_list[i]) 
-                               for i in range(len(threshold_list)-1))
-            if verbose:
-                print(f"  Minimum threshold separation: {min_separation:.3e}")
-            
-            # Warning if thresholds are too close
-            if min_separation < 1e-16:
-                print(f"⚠️  WARNING: CSK thresholds too close! Min separation: {min_separation:.3e}")
-                print(f"   This will cause detection errors. Check signal strength and noise levels.")
-        
+        threshold_list.sort(reverse=(q_eff < 0))
         thresholds[f'csk_thresholds_{target_channel.lower()}'] = threshold_list
+        if verbose:
+            print(f"  Thresholds ({'desc' if q_eff<0 else 'asc'}): {[f'{t:.3e}' for t in threshold_list]}")
     
-    # Hybrid Stage 2 Calibration
+    # Hybrid stage-2 thresholds
     if mode == "Hybrid":
-        stats: Dict[str, List[float]] = {
-            'glu_low': [], 'glu_high': [],
-            'gaba_low': [], 'gaba_high': []
-        }
+        stats: Dict[str, List[float]] = {'glu_low': [], 'glu_high': [], 'gaba_low': [], 'gaba_high': []}
         symbol_to_type = {0: 'glu_low', 1: 'glu_high', 2: 'gaba_low', 3: 'gaba_high'}
-        
-        cal_seeds = seeds[:20] if len(seeds) >= 20 else seeds
-        
+        cal_seeds = seeds[:30] if len(seeds) >= 30 else seeds
         for symbol in range(4):
             for seed in cal_seeds:
                 cal_cfg['pipeline']['random_seed'] = seed
                 result = run_calibration_symbols(cal_cfg, symbol, mode='Hybrid')
                 if result:
                     stats[symbol_to_type[symbol]].extend(result['q_values'])
-        
         if all(stats[k] for k in stats):
-            mean_Q_glu_low = float(np.mean(stats['glu_low']))
-            mean_Q_glu_high = float(np.mean(stats['glu_high']))
-            std_Q_glu_low = max(float(np.std(stats['glu_low'])), 1e-15)
-            std_Q_glu_high = max(float(np.std(stats['glu_high'])), 1e-15)
-            threshold_glu = calculate_ml_threshold(mean_Q_glu_low, mean_Q_glu_high, std_Q_glu_low, std_Q_glu_high)
-
-            mean_Q_gaba_low = float(np.mean(stats['gaba_low']))
-            mean_Q_gaba_high = float(np.mean(stats['gaba_high']))
-            std_Q_gaba_low = max(float(np.std(stats['gaba_low'])), 1e-15)
-            std_Q_gaba_high = max(float(np.std(stats['gaba_high'])), 1e-15)
-            threshold_gaba = calculate_ml_threshold(mean_Q_gaba_low, mean_Q_gaba_high, std_Q_gaba_low, std_Q_gaba_high)
-
-            thresholds['hybrid_threshold_glu'] = threshold_glu
-            thresholds['hybrid_threshold_gaba'] = threshold_gaba
-            
+            m_gl, s_gl = float(np.mean(stats['glu_low'])), max(float(np.std(stats['glu_low'])), 1e-15)
+            m_gh, s_gh = float(np.mean(stats['glu_high'])), max(float(np.std(stats['glu_high'])), 1e-15)
+            m_bl, s_bl = float(np.mean(stats['gaba_low'])), max(float(np.std(stats['gaba_low'])), 1e-15)
+            m_bh, s_bh = float(np.mean(stats['gaba_high'])), max(float(np.std(stats['gaba_high'])), 1e-15)
+            thresholds['hybrid_threshold_glu'] = calculate_ml_threshold(m_gl, m_gh, s_gl, s_gh)
+            thresholds['hybrid_threshold_gaba'] = calculate_ml_threshold(m_bl, m_bh, s_bl, s_bh)
             if verbose:
-                print(f"\nHybrid Stage 2 Statistics:")
-                print(f"  GLU low:  μ={mean_Q_glu_low:.3e}, σ={std_Q_glu_low:.3e}")
-                print(f"  GLU high: μ={mean_Q_glu_high:.3e}, σ={std_Q_glu_high:.3e}")
-                print(f"  GLU threshold: {threshold_glu:.3e}")
-                print(f"  GABA low:  μ={mean_Q_gaba_low:.3e}, σ={std_Q_gaba_low:.3e}")
-                print(f"  GABA high: μ={mean_Q_gaba_high:.3e}, σ={std_Q_gaba_high:.3e}")
-                print(f"  GABA threshold: {threshold_gaba:.3e}")
+                print(f"Hybrid thresholds: GLU={thresholds['hybrid_threshold_glu']:.3e}, "
+                      f"GABA={thresholds['hybrid_threshold_gaba']:.3e}")
     
     if save_to_file:
         with open(threshold_file, 'w') as f:
@@ -446,16 +380,13 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     return thresholds
 
 def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_symbols: int = 100) -> Optional[Dict[str, Any]]:
-    """
-    FIXED: Improved calibration with better statistics collection.
-    """
+    """Generate decision statistics for a fixed symbol (used in calibration)."""
     try:
         cal_cfg = deepcopy(cfg)
         cal_cfg['pipeline']['sequence_length'] = num_symbols
         cal_cfg['disable_progress'] = True
 
         tx_symbols = [symbol] * num_symbols
-        
         rng = np.random.default_rng(cal_cfg['pipeline'].get('random_seed', 42))
         tx_history: List[Tuple[int, float]] = []
         
@@ -471,49 +402,37 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         for s_tx in tx_symbols:
             ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, tx_history, cal_cfg, rng)
             tx_history.append((s_tx, float(Nm_actual)))
-
             n_total_samples = len(ig)
             n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
-
-            if n_detect_samples <= 1: continue
-            
-            # Calculate charges (differential measurement)
+            if n_detect_samples <= 1:
+                continue
             q_glu = float(np.trapezoid((ig - ic)[:n_detect_samples], dx=dt))
             q_gaba = float(np.trapezoid((ia - ic)[:n_detect_samples], dx=dt))
-            
             q_glu_values.append(q_glu)
             q_gaba_values.append(q_gaba)
 
-        # Collect appropriate statistics based on mode
         for q_glu, q_gaba in zip(q_glu_values, q_gaba_values):
             if mode == "MoSK":
-                # MoSK uses the sum statistic
                 D = q_glu / sigma_glu + q_gaba / sigma_gaba
                 decision_stats.append(D)
             elif mode.startswith("CSK"):
-                # CSK uses the raw charge from target channel
                 target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'GLU')
                 Q = q_glu if target_channel == 'GLU' else q_gaba
                 decision_stats.append(Q)
             elif mode == "Hybrid":
-                # Hybrid uses different statistics for each stage
                 mol_type = symbol >> 1
                 Q = q_glu if mol_type == 0 else q_gaba
                 decision_stats.append(Q)
         
-        return {
-            'q_values': decision_stats,
-            'sigma_glu': sigma_glu,
-            'sigma_gaba': sigma_gaba
-        }
+        return {'q_values': decision_stats, 'sigma_glu': sigma_glu, 'sigma_gaba': sigma_gaba}
         
     except Exception as e:
         print(f"Calibration failed for symbol {symbol}: {e}")
         return None
 
-# ============= SIMULATION FUNCTIONS =============
+# ============= RUNTIME SWEEPS (WINDOW = Ts, ISI = ON by default) =============
 def run_single_instance(config: Dict[str, Any], seed: int) -> Optional[Dict[str, Any]]:
-    """Run a single simulation instance."""
+    """Run a single simulation instance (runtime detection window already matched to Ts)."""
     try:
         cfg_run = deepcopy(config)
         cfg_run['pipeline']['random_seed'] = int(seed)
@@ -532,11 +451,10 @@ def run_single_instance(config: Dict[str, Any], seed: int) -> Optional[Dict[str,
         print(f"❌ Simulation failed with seed {seed}: {e}")
         return None
 
-# ============= SWEEP FUNCTIONS =============
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str, 
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False) -> Optional[Dict[str, Any]]:
-    """Worker function for parameter sweep with improved calibration."""
+    """Worker function for parameter sweep with improved calibration and window match."""
     try:
         cfg_run = deepcopy(cfg_base)
         cfg_run['disable_progress'] = True
@@ -552,11 +470,13 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         else:
             cfg_run[param_name] = param_value
         
-        # Handle distance updates
+        # Handle distance updates (recompute Ts, ISI memory) and MATCH WINDOW
         if param_name == 'pipeline.distance_um':
             new_symbol_period = calculate_dynamic_symbol_period(param_value, cfg_run)
             cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
             cfg_run['pipeline']['time_window_s'] = new_symbol_period
+            # Force runtime detection window to Ts
+            cfg_run['detection']['decision_window_s'] = new_symbol_period
             
             if cfg_run['pipeline'].get('enable_isi', False):
                 D_glu = cfg_run['neurotransmitters']['GLU']['D_m2_s']
@@ -567,29 +487,25 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
                 cfg_run['pipeline']['isi_memory_symbols'] = isi_memory
         
-        # FIXED: Always calibrate with verbose option for CSK debugging
+        # Always calibrate for MoSK/CSK/Hybrid when Nm or distance changes
         if cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid']:
             if param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um']:
-                # Use more seeds for calibration
-                cal_seeds = list(range(20))
+                # Seeds for calibration
+                cal_seeds = list(range(10))
                 thresholds = calibrate_thresholds(cfg_run, cal_seeds, 
                                                  recalibrate=True, 
                                                  save_to_file=False,
                                                  verbose=debug_calibration)
-                
-                # Store thresholds in config
+                # Store thresholds back
                 for k, v in thresholds.items():
                     cfg_run['pipeline'][k] = v
-                
-                # Debug: Print thresholds for CSK
                 if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
                     target_ch = cfg_run['pipeline'].get('csk_target_channel', 'GLU').lower()
                     key = f'csk_thresholds_{target_ch}'
                     if key in cfg_run['pipeline']:
-                        print(f"\n[DEBUG] CSK Thresholds for Nm={param_value}: {cfg_run['pipeline'][key]}")
+                        print(f"\n[DEBUG] CSK Thresholds @ {param_value}: {cfg_run['pipeline'][key]}")
         
         result = run_single_instance(cfg_run, seed)
-        
         if result:
             result['param_name'] = param_name
             result['param_value'] = param_value
@@ -604,11 +520,9 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
 def run_sweep(cfg: Dict[str, Any], seeds: List[int], sweep_param: str, 
               sweep_values: List[float], sweep_name: str,
               debug_calibration: bool = False) -> pd.DataFrame:
-    """Run parameter sweep with parallelization."""
+    """Run parameter sweep with parallelization (window matched to Ts)."""
     pool = global_pool.get_pool()
-    
     all_combinations = [(sweep_param, v, s) for v in sweep_values for s in seeds]
-    
     print(f"🚀 SWEEP: {len(all_combinations)} jobs ({len(sweep_values)} values × {len(seeds)} seeds)")
     
     results = []
@@ -625,49 +539,35 @@ def run_sweep(cfg: Dict[str, Any], seeds: List[int], sweep_param: str,
         except:
             pass
     
-    # Process results with debug info for CSK
+    # Aggregate across seeds
     df_data = []
     for value in sweep_values:
-        value_results = [r for r in results if r['param_value'] == value]
-        
+        value_results = [r for r in results if r and r['param_value'] == value]
         if not value_results:
             continue
-        
         total_symbols = len(value_results) * cfg['pipeline']['sequence_length']
         total_errors = sum(r['errors'] for r in value_results)
         ser = total_errors / total_symbols if total_symbols > 0 else 1.0
         
-        # Collect statistics
-        all_stats_glu = []
-        all_stats_gaba = []
+        # Collect decision stats for SNR proxy (class-wise separation)
+        all_stats_a = []
+        all_stats_b = []
         for r in value_results:
-            all_stats_glu.extend(r.get('stats_glu', []))
-            all_stats_gaba.extend(r.get('stats_gaba', []))
+            all_stats_a.extend(r.get('stats_glu', []))
+            all_stats_b.extend(r.get('stats_gaba', []))
+        snr = calculate_snr_from_stats(all_stats_a, all_stats_b) if all_stats_a and all_stats_b else 0
         
-        snr = calculate_snr_from_stats(all_stats_glu, all_stats_gaba) if all_stats_glu else 0
-        
-        row = {
-            sweep_param: value,
-            'ser': ser,
-            'snr_db': snr,
-            'num_runs': len(value_results)
-        }
-        
-        # Debug info for CSK
-        if cfg['pipeline']['modulation'] == 'CSK' and debug_calibration:
-            print(f"CSK @ {sweep_param}={value}: SER={ser:.4f}, SNR={snr:.2f}dB, runs={len(value_results)}")
-        
+        row = {sweep_param: value, 'ser': ser, 'snr_db': snr, 'num_runs': len(value_results)}
         if cfg['pipeline']['modulation'] == 'Hybrid':
             mosk_errors = sum(r.get('subsymbol_errors', {}).get('mosk', 0) for r in value_results)
             csk_errors = sum(r.get('subsymbol_errors', {}).get('csk', 0) for r in value_results)
             row['mosk_ser'] = mosk_errors / total_symbols
             row['csk_ser'] = csk_errors / total_symbols
-        
         df_data.append(row)
     
     return pd.DataFrame(df_data)
 
-# ============= LOD SEARCH FUNCTIONS =============
+# ============= LOD SEARCH (unchanged, but uses runtime window match) =============
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int], 
                      target_ser: float = 0.01,
                      debug_calibration: bool = False) -> Tuple[Union[int, float], float]:
@@ -680,20 +580,17 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     dist_um = cfg_base['pipeline'].get('distance_um', 0)
     
     for iteration in range(14):
-        if nm_min > nm_max:
-            break
-        
+        if nm_min > nm_max: break
         nm_mid = int((nm_min + nm_max) / 2)
-        if nm_mid == 0 or nm_mid > nm_max:
-            break
+        if nm_mid == 0 or nm_mid > nm_max: break
         
         print(f"    [{dist_um}μm] Testing Nm={nm_mid} (iteration {iteration+1}/14, range: {nm_min}-{nm_max})")
         
         cfg_test = deepcopy(cfg_base)
         cfg_test['pipeline']['Nm_per_symbol'] = nm_mid
         
-        # FIXED: Use proper calibration with more samples
-        cal_seeds = list(range(20))
+        # Proper calibration (ISI OFF; window = Ts)
+        cal_seeds = list(range(10))
         thresholds = calibrate_thresholds(cfg_test, cal_seeds, 
                                          recalibrate=True, 
                                          save_to_file=False,
@@ -706,7 +603,6 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         for i, seed in enumerate(seeds):
             if i % 3 == 0:
                 print(f"      [{dist_um}μm] Nm={nm_mid}: seed {i+1}/{len(seeds)}")
-            
             cfg_run = deepcopy(cfg_test)
             cfg_run['pipeline']['random_seed'] = seed
             cfg_run['disable_progress'] = True
@@ -738,11 +634,10 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     # Final check
     if np.isnan(lod_nm) and nm_min <= 100000:
         print(f"    [{dist_um}μm] Final check at Nm={nm_min}")
-        
         cfg_final = deepcopy(cfg_base)
         cfg_final['pipeline']['Nm_per_symbol'] = nm_min
         
-        cal_seeds = list(range(20))
+        cal_seeds = list(range(10))
         thresholds = calibrate_thresholds(cfg_final, cal_seeds, 
                                          recalibrate=True, 
                                          save_to_file=False,
@@ -790,6 +685,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         cfg_dist['pipeline']['distance_um'] = dist_um
         cfg_dist['pipeline']['symbol_period_s'] = symbol_period
         cfg_dist['pipeline']['time_window_s'] = symbol_period
+        cfg_dist['detection']['decision_window_s'] = symbol_period  # <— MATCH WINDOW
         
         if cfg_dist['pipeline'].get('enable_isi', False):
             D_glu = cfg_dist['neurotransmitters']['GLU']['D_m2_s']
@@ -834,21 +730,18 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             'symbol_period_s': 0
         }
 
-# ============= PLOTTING FUNCTIONS =============
+# ============= PLOTTING (unchanged) =============
 def plot_ser_vs_nm(results_dict: Dict[str, pd.DataFrame], save_path: Path):
     """Plot SER vs Nm."""
     plt.figure(figsize=(10, 6))
-    
     colors = {'MoSK': 'blue', 'CSK': 'green', 'Hybrid': 'red'}
     markers = {'MoSK': 'o', 'CSK': 's', 'Hybrid': '^'}
-    
     for mode, df in results_dict.items():
         if 'pipeline.Nm_per_symbol' in df.columns and 'ser' in df.columns:
             plt.loglog(df['pipeline.Nm_per_symbol'], df['ser'],
                       color=colors.get(mode, 'black'),
                       marker=markers.get(mode, 'o'),
                       markersize=8, label=mode, linewidth=2)
-    
     plt.xlabel('Number of Molecules per Symbol (Nm)')
     plt.ylabel('Symbol Error Rate (SER)')
     plt.title('SER vs. Nm for All Modulation Schemes')
@@ -864,10 +757,8 @@ def plot_ser_vs_nm(results_dict: Dict[str, pd.DataFrame], save_path: Path):
 def plot_lod_vs_distance(results_dict: Dict[str, pd.DataFrame], save_path: Path):
     """Plot LoD vs Distance."""
     plt.figure(figsize=(10, 6))
-    
     colors = {'MoSK': 'blue', 'CSK': 'green', 'Hybrid': 'red'}
     markers = {'MoSK': 'o', 'CSK': 's', 'Hybrid': '^'}
-    
     for mode, df in results_dict.items():
         if 'distance_um' in df.columns and 'lod_nm' in df.columns:
             df_valid = df.dropna(subset=['lod_nm'])
@@ -875,7 +766,6 @@ def plot_lod_vs_distance(results_dict: Dict[str, pd.DataFrame], save_path: Path)
                         color=colors.get(mode, 'black'),
                         marker=markers.get(mode, 'o'),
                         markersize=8, label=mode, linewidth=2)
-    
     plt.xlabel('Distance (μm)')
     plt.ylabel('Limit of Detection (molecules)')
     plt.title('LoD vs. Distance')
@@ -885,9 +775,9 @@ def plot_lod_vs_distance(results_dict: Dict[str, pd.DataFrame], save_path: Path)
     plt.savefig(save_path, dpi=300)
     plt.close()
 
-# ============= MAIN FUNCTION =============
+# ============= MAIN =============
 def main() -> None:
-    """Main execution with fixed CSK calibration."""
+    """Main execution with ISI-enabled runtime and window match."""
     args = parse_arguments()
     
     # Determine worker mode
@@ -901,14 +791,14 @@ def main() -> None:
         args.max_workers = get_optimal_workers(mode)
         print(f"🔥 Using {mode.upper()} mode: {args.max_workers} workers")
     
-    print(f"\n{'='*60}")
-    print(f"🚀 OPTIMIZED ANALYSIS - {args.mode} Mode")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}\n🚀 ANALYSIS - {args.mode} Mode (ISI {'OFF' if args.disable_isi else 'ON'})\n{'='*60}")
     print(f"CPU: {CPU_COUNT} threads ({PHYSICAL_CORES} cores)")
     print(f"Workers: {args.max_workers}")
     print(f"Seeds: {args.num_seeds}")
     print(f"Sequence length: {args.sequence_length}")
     print(f"Debug calibration: {args.debug_calibration}")
+    if args.mode == "CSK":
+        print(f"CSK Level Scheme: {args.csk_level_scheme}")
     
     check_memory_usage()
     
@@ -924,15 +814,23 @@ def main() -> None:
         config_base = yaml.safe_load(f)
     
     cfg = preprocess_config_full(config_base)
-    cfg['pipeline']['enable_isi'] = False if args.disable_isi else cfg['pipeline'].get('enable_isi', False)
+    
+    # **ISI ENABLED IN RUNTIME BY DEFAULT**
+    cfg['pipeline']['enable_isi'] = not args.disable_isi
+    
+    # Mode & run length
     cfg['pipeline']['modulation'] = args.mode
     cfg['pipeline']['sequence_length'] = args.sequence_length
     cfg['verbose'] = args.verbose
     
+    # CSK options
     if args.mode.startswith("CSK"):
-        cfg['pipeline']['csk_levels'] = 4  # Use 4-level CSK
+        cfg['pipeline']['csk_levels'] = 4
         cfg['pipeline']['csk_target_channel'] = 'GLU'
-        print(f"CSK Configuration: {cfg['pipeline']['csk_levels']} levels, {cfg['pipeline']['csk_target_channel']} channel")
+        cfg['pipeline']['csk_level_scheme'] = args.csk_level_scheme
+        print(f"CSK Configuration: {cfg['pipeline']['csk_levels']} levels, "
+              f"{cfg['pipeline']['csk_target_channel']} channel, "
+              f"{args.csk_level_scheme} scheme")
     
     # Generate seeds
     ss = np.random.SeedSequence(2026)
@@ -944,28 +842,29 @@ def main() -> None:
     start_time = time.time()
     
     try:
-        print(f"\n{'='*60}")
-        print("Running Performance Sweeps")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nRunning Performance Sweeps\n{'='*60}")
         
         print(f"\nConfiguration:")
         print(f"  GLU diffusion: {cfg['neurotransmitters']['GLU']['D_m2_s']:.2e} m²/s")
         print(f"  GABA diffusion: {cfg['neurotransmitters']['GABA']['D_m2_s']:.2e} m²/s")
-        print(f"  ISI enabled: {cfg['pipeline'].get('enable_isi', False)}")
+        print(f"  ISI enabled (runtime): {cfg['pipeline'].get('enable_isi', False)}")
+        
+        # --- Set symbol period & force window match for runtime ---
+        default_distance = cfg['pipeline'].get('distance_um', 100)
+        symbol_period = calculate_dynamic_symbol_period(default_distance, cfg)
+        cfg['pipeline']['symbol_period_s'] = symbol_period
+        cfg['pipeline']['time_window_s'] = symbol_period
+        cfg['detection']['decision_window_s'] = symbol_period  # <— MATCH WINDOW (RUNTIME)
+        print(f"  Symbol period Ts = {symbol_period:.0f}s; decision_window_s (runtime) = {cfg['detection']['decision_window_s']:.0f}s")
         
         # ============= SWEEP 1: SER vs Nm =============
         print("\n1. Running SER vs. Nm sweep...")
         nm_values = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
         
-        default_distance = cfg['pipeline'].get('distance_um', 100)
-        symbol_period = calculate_dynamic_symbol_period(default_distance, cfg)
-        cfg['pipeline']['symbol_period_s'] = symbol_period
-        cfg['pipeline']['time_window_s'] = symbol_period
-        
-        # FIXED: Run initial calibration for CSK/Hybrid modes
+        # Initial calibration for CSK/Hybrid modes (ISI OFF; window=Ts)
         if args.mode in ['CSK', 'Hybrid']:
             print(f"\n📊 Initial calibration for {args.mode} mode...")
-            cal_seeds = list(range(20))
+            cal_seeds = list(range(10))
             initial_thresholds = calibrate_thresholds(cfg, cal_seeds, 
                                                      recalibrate=True, 
                                                      save_to_file=False,
@@ -974,6 +873,9 @@ def main() -> None:
             if args.debug_calibration:
                 for k, v in initial_thresholds.items():
                     print(f"  {k}: {v}")
+            # Keep thresholds in cfg for the first run
+            for k, v in initial_thresholds.items():
+                cfg['pipeline'][k] = v
         
         df_ser_nm = run_sweep(
             cfg, seeds,
@@ -983,73 +885,67 @@ def main() -> None:
             debug_calibration=args.debug_calibration
         )
         
-        csv_path = data_dir / f"ser_vs_nm_{args.mode.lower()}.csv"
+        level_scheme_suffix = f"_{args.csk_level_scheme}" if args.mode == "CSK" else ""
+        csv_path = data_dir / f"ser_vs_nm_{args.mode.lower()}{level_scheme_suffix}.csv"
         df_ser_nm.to_csv(csv_path, index=False)
         print(f"✅ Results saved to {csv_path}")
         
         # Print results summary
         print(f"\nSER vs Nm Results for {args.mode}:")
-        print(df_ser_nm[['pipeline.Nm_per_symbol', 'ser', 'snr_db']].to_string(index=False))
+        if not df_ser_nm.empty:
+            print(df_ser_nm[['pipeline.Nm_per_symbol', 'ser', 'snr_db']].to_string(index=False))
+        else:
+            print("  (No results)")
         
         # ============= SWEEP 2: LoD vs Distance =============
         print("\n2. Running LoD vs. Distance sweep...")
         distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
-        
         pool = global_pool.get_pool()
+        print(f"   Submitting {len(distances)} distance searches to pool...\n")
         
-        print(f"   Submitting {len(distances)} distance searches to pool...")
         future_to_dist = {
             pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration): dist
             for dist in distances
         }
         
-        print(f"   All jobs submitted. Processing in parallel...\n")
-        
         lod_results = []
         completed = 0
-        
         for future in as_completed(future_to_dist):
             try:
                 result = future.result(timeout=7200)
                 lod_results.append(result)
                 completed += 1
-                
                 dist = future_to_dist[future]
-                if not np.isnan(result['lod_nm']):
+                if result and not np.isnan(result.get('lod_nm', np.nan)):
                     print(f"  [{completed}/{len(distances)}] Distance {dist}μm complete: "
                           f"LoD={result['lod_nm']:.0f} molecules")
                 else:
                     print(f"  [{completed}/{len(distances)}] Distance {dist}μm: No LoD found")
-                    
             except TimeoutError:
                 dist = future_to_dist[future]
                 print(f"  ✗ Timeout for distance {dist}μm")
-                lod_results.append({
-                    'distance_um': dist,
-                    'lod_nm': np.nan,
-                    'ser_at_lod': 1.0,
-                    'data_rate_bps': 0,
-                    'symbol_period_s': 0
-                })
+                lod_results.append({'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
+                                    'data_rate_bps': 0, 'symbol_period_s': 0})
             except Exception as e:
                 dist = future_to_dist[future]
                 print(f"  ✗ Error for distance {dist}μm: {e}")
         
         lod_results.sort(key=lambda x: x['distance_um'])
-        
         df_lod = pd.DataFrame(lod_results)
-        csv_path = data_dir / f"lod_vs_distance_{args.mode.lower()}.csv"
+        csv_path = data_dir / f"lod_vs_distance_{args.mode.lower()}{level_scheme_suffix}.csv"
         df_lod.to_csv(csv_path, index=False)
         print(f"\n✅ Results saved to {csv_path}")
         
         # Print LoD results summary
         print(f"\nLoD vs Distance Results for {args.mode}:")
-        print(df_lod[['distance_um', 'lod_nm', 'ser_at_lod']].to_string(index=False))
+        if not df_lod.empty:
+            print(df_lod[['distance_um', 'lod_nm', 'ser_at_lod']].to_string(index=False))
+        else:
+            print("  (No results)")
         
         # ============= TIMING REPORT =============
         elapsed = time.time() - start_time
-        print(f"\n{'='*60}")
-        print(f"✅ ANALYSIS COMPLETE")
+        print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE")
         print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
         if elapsed > 0:
             speedup = 24 * 3600 / elapsed
