@@ -1,123 +1,106 @@
 #!/usr/bin/env python3
 """
-Setup script to create the tri_channel_OECT_MC project structure
-Run this to initialize the project directory
+Project bootstrapper for the Tri‑Channel OECT MC simulator.
+
+What it does
+------------
+- Verifies Python and core dependencies
+- Creates the expected results/ tree (data/, figures/, tables/, cache/)
+- (Optional) Resets results with --reset {cache|all}
+
+Usage
+-----
+    python setup_project.py              # check environment & create folders
+    python setup_project.py --reset all  # wipe results/ completely (careful)
+    python setup_project.py --reset cache  # just clear caches/state
+
+This script is safe to run multiple times.
 """
 
-import os
+from __future__ import annotations
+
+import argparse
+import importlib
+import sys
 from pathlib import Path
 
-def create_project_structure():
-    """Create the complete folder structure for tri_channel_OECT_MC"""
-    
-    # Define the directory structure
-    base_dir = Path("tri_channel_OECT_MC")
-    
-    directories = [
-        base_dir / "config",
-        base_dir / "src",
-        base_dir / "notebooks",
-        base_dir / "tests",
-        base_dir / "results" / "data",
-        base_dir / "results" / "figures",
-    ]
-    
-    # Create all directories
-    for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
-        print(f"Created: {directory}")
-    
-    # Create __init__.py files
-    init_files = [
-        base_dir / "src" / "__init__.py",
-        base_dir / "tests" / "__init__.py",
-    ]
-    
-    for init_file in init_files:
-        init_file.touch(exist_ok=True)
-        print(f"Created: {init_file}")
-    
-    # Create README.md
-    readme_content = """# Tri-Channel OECT Molecular Communication Simulator
-
-This repository implements a simulation framework for a tri-channel Organic Electrochemical 
-Transistor (OECT) based molecular communication receiver designed to detect neurotransmitter 
-signals from brain organoids.
-
-## Overview
-
-The system models:
-- Molecular diffusion in brain tissue (with tortuosity and clearance)
-- Stochastic aptamer binding kinetics
-- OECT transduction with realistic noise models
-- Differential measurement for noise cancellation
-- Detection algorithms for MoSK, CSK, and PPM modulation schemes
-
-## Installation
-
-```bash
-pip install -e .
-```
-
-## Usage
-
-Run parameter sweeps:
-```bash
-python -m src.runner run_parameter_sweep --cfg config/default.yaml --sweep base_distance_sweep
-```
-
-## Project Structure
-
-- `src/`: Core simulation modules
-- `config/`: Configuration files
-- `tests/`: Unit tests for all modules
-- `notebooks/`: Jupyter notebooks for analysis
-- `results/`: Output data and figures
-"""
-    
-    readme_file = base_dir / "README.md"
-    readme_file.write_text(readme_content)
-    print(f"Created: {readme_file}")
-    
-    # Create pyproject.toml
-    pyproject_content = """[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "tri-channel-oect-mc"
-version = "0.1.0"
-description = "Tri-channel OECT molecular communication simulator"
-requires-python = ">=3.10"
-dependencies = [
-    "numpy==1.26.4",
-    "scipy==1.13.0",
-    "pandas==2.2.1",
-    "matplotlib==3.8.3",
-    "tqdm==4.66.2",
-    "pyyaml==6.0.1",
-    "pyarrow==15.0.1",
-    "pytest==8.1.1",
-    "jupyter==1.0.0",
+REQUIRED = [
+    ("numpy", None),
+    ("scipy", None),
+    ("pandas", None),
+    ("matplotlib", None),
+    ("yaml", "PyYAML"),
+    ("tqdm", None),
+    ("rich", None),
+    ("psutil", None),
 ]
 
-[project.optional-dependencies]
-dev = [
-    "black==24.2.0",
-    "mypy==1.9.0",
-    "pytest-cov==4.1.0",
-]
+def _check_python() -> None:
+    if sys.version_info < (3, 11):
+        raise SystemExit("Python 3.11+ is required (SciPy>=1.16 & NumPy>=2.x). "
+                         f"Found {sys.version.split()[0]}")
 
-[tool.hatch.build.targets.wheel]
-packages = ["src"]
-"""
-    
-    pyproject_file = base_dir / "pyproject.toml"
-    pyproject_file.write_text(pyproject_content)
-    print(f"Created: {pyproject_file}")
-    
-    print("\nProject structure created successfully!")
-    print(f"Navigate to {base_dir} and run: pip install -e .")
+def _check_packages() -> None:
+    missing = []
+    versions = {}
+    for mod, pip_name in REQUIRED:
+        try:
+            m = importlib.import_module(mod)
+            ver = getattr(m, "__version__", "unknown")
+            versions[mod] = ver
+        except Exception:
+            missing.append(pip_name or mod)
+    if missing:
+        print("✗ Missing packages:", ", ".join(missing))
+        print("   Install with:  pip install -e .[viz,dev]")
+        raise SystemExit(1)
+    print("✓ Package versions:")
+    for k, v in versions.items():
+        print(f"   {k:>10s} : {v}")
+
+def _mkdirs(root: Path) -> None:
+    for sub in ("results/data", "results/figures", "results/tables", "results/cache"):
+        p = root / sub
+        p.mkdir(parents=True, exist_ok=True)
+    print(f"✓ Created/verified results/ tree under {root.resolve()}")
+
+def _safe_rmtree(path: Path) -> None:
+    import shutil, os, stat
+    root = (Path(__file__).parent / "results").resolve()
+    target = path.resolve()
+    if not str(target).startswith(str(root)):
+        raise RuntimeError(f"Refusing to delete outside results/: {target}")
+    if target.exists():
+        def _on_rm_error(func, p, exc_info):
+            try:
+                os.chmod(p, stat.S_IWUSR)
+                func(p)
+            except Exception:
+                pass
+        shutil.rmtree(target, onerror=_on_rm_error)
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Bootstrap environment and folders")
+    p.add_argument("--reset", choices=["cache", "all"], help="Delete results cache or full results/*")
+    args = p.parse_args()
+
+    _check_python()
+    _check_packages()
+
+    root = Path(__file__).parent
+    results = root / "results"
+    results.mkdir(exist_ok=True)
+
+    if args.reset:
+        if args.reset == "all":
+            _safe_rmtree(results)
+        else:
+            _safe_rmtree(results / "cache")
+        print(f"✓ Reset completed: {args.reset}")
+
+    _mkdirs(root)
+    print("All good. Try a quick sanity run, e.g.:")
+    print("  python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm")
 
 if __name__ == "__main__":
-    create_project_structure()
+    main()

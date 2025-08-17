@@ -1,16 +1,18 @@
-# src/pipeline.py - BOTH FIXES APPLIED
+# src/pipeline.py - BOTH FIXES APPLIED + ISI metrics plumbing
 """
 End-to-end simulator for the tri-channel OECT receiver.
 
 COMPLETE FIX VERSION:
 1. Uniform CSK level mapping to avoid zero molecules
 2. Correct Poisson noise application at the level, not scaling factor
+3. (New) ISI metric collection hook (no physics changes)
 """
 
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 from numpy.random import default_rng
 import math
+import logging
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
@@ -22,6 +24,7 @@ from .mc_receiver.binding import bernoulli_binding
 from .mc_receiver.oect import oect_trio
 from .constants import get_nt_params
 
+logger = logging.getLogger(__name__)
 
 def to_int(value):
     """Convert value to int, handling scientific notation strings"""
@@ -37,7 +40,7 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     """Calculate physics-based noise sigma (robust implementation)"""
     k_B = 1.38e-23
     
-    # Robustly access configuration parameters
+    # Robustly access configuration parameters with config override support
     T = cfg.get('sim', {}).get('temperature_K', 310)
     
     oect_cfg = cfg.get('oect', {})
@@ -56,7 +59,8 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
 
     dt = cfg['sim']['dt_s']
     f_samp = 1.0 / dt
-    B_det = cfg.get('detection_bandwidth_Hz', 100)
+    # Enhanced: Allow config override of detection bandwidth
+    B_det = cfg.get('detection_bandwidth_Hz', noise_cfg.get('detection_bandwidth_Hz', 100))
     T_int = detection_window_s
     f_min = 1.0 / T_int
     f_max = min(B_det, f_samp/2)
@@ -72,13 +76,23 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     drift_charge_var = 0
     
     total_single_var = johnson_charge_var + flicker_charge_var + drift_charge_var
-    differential_var = 2 * total_single_var * (1 - rho_corr)
-    sigma_differential = np.sqrt(differential_var)
+    
+    # Enhanced: Expose correlation coefficient via config
+    use_ctrl = bool(cfg.get('pipeline', {}).get('use_control_channel', True))
+    effective_rho = noise_cfg.get('effective_correlation', rho_corr)  # Allow override
+    
+    if use_ctrl:
+        # Differential measurement: benefits from common-mode rejection
+        differential_var = 2 * total_single_var * (1 - effective_rho)
+        sigma = np.sqrt(differential_var)
+    else:
+        # Single-ended measurement: no common-mode rejection
+        sigma = np.sqrt(total_single_var)
     
     # Increased floor slightly for robustness
-    sigma_differential = max(sigma_differential, 1e-15)
+    sigma = max(sigma, 1e-15)
     
-    return sigma_differential, sigma_differential
+    return sigma, sigma
 
 
 def _calculate_isi_vectorized(
@@ -190,6 +204,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     COMPLETE FIX: 
     1. Uniform CSK level mapping to avoid zero molecules
     2. Correct Poisson noise application at the level, not scaling factor
+    3. (New) If cfg['collect_isi_metrics'] is True, collect ISI-to-signal ratio proxy
     """
     # Initialization
     dt = cfg['sim']['dt_s']
@@ -201,6 +216,12 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     conc_at_glu_ch = np.zeros(n_samples)
     conc_at_gaba_ch = np.zeros(n_samples)
     conc_at_ctrl_ch = np.zeros(n_samples)  # Pure noise reference
+    
+    # Keep separate holders for metrics
+    isi_glu = np.zeros(n_samples)
+    isi_gaba = np.zeros(n_samples)
+    sym_glu = np.zeros(n_samples)
+    sym_gaba = np.zeros(n_samples)
     
     # Get channel-specific distances
     if 'channel_distances' in cfg:
@@ -249,9 +270,8 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         M = cfg['pipeline']['csk_levels']
         if level_scheme == 'uniform':
             # FIX 1: Map symbols 0,1,2,3 to fractions 1/M, 2/M, 3/M, M/M
-            # This ensures no zero molecules for symbol 0
             Nm_level = Nm_peak * ((s_tx + 1) / M)
-        else:  # zero-based (original problematic scheme)
+        else:  # zero-based
             if M > 1:
                 Nm_level = Nm_peak * (s_tx / (M - 1))
             else:
@@ -266,13 +286,10 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         Nm_level = Nm_peak
     
     # Step 3: Apply Poisson noise to the SPECIFIC LEVEL (not the scaling factor!)
-    # FIX 2: This is the critical fix - noise applied at the correct stage
     if cfg['pipeline'].get('enable_molecular_noise', True) and Nm_level > 0:
         Nm_actual = float(rng.poisson(Nm_level))
     else:
         Nm_actual = float(Nm_level)
-    
-    # ========== END OF CRITICAL FIX ==========
     
     # VECTORIZED ISI Calculation
     if cfg['pipeline'].get('enable_isi', False):
@@ -292,45 +309,46 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         
         # Use vectorized ISI calculation
         if relevant_history:
-            isi_glu, isi_gaba, isi_ctrl = _calculate_isi_vectorized(
+            isi_glu, isi_gaba, _ = _calculate_isi_vectorized(
                 relevant_history, t_vec, cfg, 
                 distance_glu_m, distance_gaba_m, distance_ctrl_m
             )
             conc_at_glu_ch += isi_glu
             conc_at_gaba_ch += isi_gaba
-            # isi_ctrl is always zero (no contamination)
     
     # Current Symbol Generation using Nm_actual (the noisy realization)
     if mod == "MoSK":
         if s_tx == 0:  # GLU
             conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
             conc_at_glu_ch += conc_glu
+            sym_glu += conc_glu
         else:  # GABA
             conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
             conc_at_gaba_ch += conc_gaba
+            sym_gaba += conc_gaba
             
     elif mod.startswith("CSK"):
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
-        
-        # Use Nm_actual directly (already has noise and correct level)
         if Nm_actual > 0:
             if target_channel == 'GLU':
                 conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
                 conc_at_glu_ch += conc_glu
+                sym_glu += conc_glu
             else:  # GABA
                 conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
                 conc_at_gaba_ch += conc_gaba
+                sym_gaba += conc_gaba
             
     elif mod == "Hybrid":
         mol_type_bit = s_tx >> 1
-        
-        # Use Nm_actual directly (already has noise and correct level)
         if mol_type_bit == 0:  # GLU
             conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
             conc_at_glu_ch += conc_glu
+            sym_glu += conc_glu
         else:  # GABA
             conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
             conc_at_gaba_ch += conc_gaba
+            sym_gaba += conc_gaba
     
     # INDEPENDENT Binding simulation for each channel
     cfg_glu = cfg.copy()
@@ -345,28 +363,6 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     cfg_ctrl['N_apt'] = 0  # No aptamer sites
     bound_ctrl_ch, _, _ = bernoulli_binding(conc_at_ctrl_ch, 'CTRL', cfg_ctrl, rng)
     
-    # Saturation checks
-    N_apt_default = to_int(cfg.get('N_apt', 4e8))
-    cap_glu = cfg.get('binding', {}).get('N_sites_glu', N_apt_default)
-    cap_gaba = cfg.get('binding', {}).get('N_sites_gaba', N_apt_default)
-    
-    cap_glu = to_int(cap_glu)
-    cap_gaba = to_int(cap_gaba)
-    
-    cap_ctrl = to_int(cfg.get('binding', {}).get('N_sites_ctrl', 0))
-    if cap_ctrl > 0:
-        max_occupancy_ctrl = np.max(bound_ctrl_ch) / cap_ctrl if cap_ctrl > 0 else 0
-        if max_occupancy_ctrl > 0.9:
-            print(f"WARNING: CTRL channel saturation detected! Occupancy: {max_occupancy_ctrl:.2%} (should be 0)")
-    
-    max_occupancy_glu = np.max(bound_glu_ch) / cap_glu if cap_glu > 0 else 0
-    if max_occupancy_glu > 0.9:
-        pass  # Suppress warning for now
-    
-    max_occupancy_gaba = np.max(bound_gaba_ch) / cap_gaba if cap_gaba > 0 else 0
-    if max_occupancy_gaba > 0.9:
-        pass  # Suppress warning for now
-    
     # OECT current generation
     bound_sites_trio = np.vstack([bound_glu_ch, bound_gaba_ch, bound_ctrl_ch])
     currents = oect_trio(
@@ -375,7 +371,27 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         cfg=cfg,
         rng=rng
     )
-    
+
+    # === ISI METRIC (proxy) ==========================================
+    # If requested, push an ISI-to-signal "energy" ratio proxy into cfg['_metrics'].
+    # We compute it in concentration domain (integration over decision window);
+    # this avoids any physics change and is sufficient for reporting/gating.
+    if cfg.get('collect_isi_metrics', False):
+        try:
+            dt = cfg['sim']['dt_s']
+            win_s = cfg['detection'].get('decision_window_s', cfg['pipeline']['symbol_period_s'])
+            n_int = min(int(win_s / dt), n_samples)
+            isi_mass = float(np.trapezoid(isi_glu[:n_int], dx=dt) + np.trapezoid(isi_gaba[:n_int], dx=dt))
+            sym_mass = float(np.trapezoid(sym_glu[:n_int], dx=dt) + np.trapezoid(sym_gaba[:n_int], dx=dt))
+            denom = max(sym_mass, 1e-30)
+            ratio = isi_mass / denom
+            metrics = cfg.setdefault('_metrics', {})
+            lst = metrics.setdefault('isi_ratio_values', [])
+            lst.append(ratio)
+        except Exception:
+            pass
+    # ================================================================
+
     return currents["GLU"], currents["GABA"], currents["CTRL"], Nm_actual
 
 
@@ -384,7 +400,6 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Simulate <sequence_length> symbols and compute BER/SEP.
     Detection logic unchanged - the fixes are in signal generation.
     """
-    # Import locally to avoid circular dependencies if detection imports pipeline
     try:
         from src.detection import calculate_ml_threshold
     except ImportError:
@@ -412,20 +427,47 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     rx_symbols = np.zeros(L, dtype=int)
     stats_glu = []
     stats_gaba = []
+
+    # enable metric collection for this run
+    cfg['collect_isi_metrics'] = True
+    metrics_ref = cfg.setdefault('_metrics', {})
+    metrics_ref.setdefault('isi_ratio_values', [])
     
     # Get polarities
     q_eff_glu = get_nt_params(cfg, 'GLU')['q_eff_e']
     q_eff_gaba = get_nt_params(cfg, 'GABA')['q_eff_e']
 
+    # Stage 14: Compute noise sigma ONCE before the loop
+    detection_window_s = cfg['detection'].get('decision_window_s',
+                                              cfg['pipeline']['symbol_period_s'])
+    sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, detection_window_s)
+    
+    # Enhanced: Allow residual cross-channel correlation after CTRL subtraction
+    noise_cfg = cfg.get('noise', {})
+    rho_cc = float(noise_cfg.get('rho_between_channels_after_ctrl', 0.0))
+    # Hardening: enforce a valid correlation range (prevents bad config values)
+    rho_cc = max(-1.0, min(1.0, rho_cc))  # NEW: clamp at source
+    
+    # Compute variance of the difference
+    var_diff = (sigma_glu * sigma_glu +
+                sigma_gaba * sigma_gaba -
+                2.0 * rho_cc * sigma_glu * sigma_gaba)
+    
+    if var_diff < -1e-12:  # generous tolerance for FP noise
+        logger.warning("Computed var_diff < 0 (%.3e). Check rho_cc and sigmas; clipping to 0.", var_diff)
+    
+    sigma_diff = float(math.sqrt(var_diff)) if var_diff > 0.0 else 0.0
+
     # Process symbols
     for i, s_tx in enumerate(tqdm(tx_symbols, desc=f"Simulating {mod}", disable=cfg.get('disable_progress', False))):
-        # Generate currents with ISI (NOW WITH BOTH FIXES!)
         ig, ia, ic, Nm_realised = _single_symbol_currents(s_tx, tx_history, cfg, rng)
         tx_history.append((s_tx, Nm_realised))
         
         # Detection and decision statistics
         dt = cfg['sim']['dt_s']
-        detection_window_s = cfg['detection'].get('decision_window_s', cfg['pipeline']['symbol_period_s'])
+        # detection_window_s already computed above
+    
+        # NOTE: sigma_glu, sigma_gaba, sigma_diff already computed once above
         
         n_total_samples = len(ig)
         n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
@@ -434,112 +476,69 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
              if i == 0: print("Warning: Insufficient detection samples. Check dt_s and symbol_period_s.")
              continue
         
+        use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+        
         # Calculate differential charges (Signal - Control)
-        q_glu = np.trapezoid((ig - ic)[:n_detect_samples], dx=dt)
-        q_gaba = np.trapezoid((ia - ic)[:n_detect_samples], dx=dt)
+        sig_glu = (ig - ic) if use_ctrl else ig
+        sig_gaba = (ia - ic) if use_ctrl else ia
+        q_glu = np.trapezoid(sig_glu[:n_detect_samples], dx=dt)
+        q_gaba = np.trapezoid(sig_gaba[:n_detect_samples], dx=dt)
         
-        if i % 100 == 0 and cfg.get('verbose', False):
-            print(f"Raw diff q_glu={q_glu:.3e}, q_gaba={q_gaba:.3e}")
-        
-        # Get physics-based noise estimation
-        sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, detection_window_s, i)
+        # sigma_glu, sigma_gaba already available from above
 
-        # Unified Detection Logic (unchanged - fixes are in signal generation)
         if mod == 'MoSK':
-            # ML detector for antipodal signals (GLU+, GABA-) is SUMMATION
             decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
-            
-            # Use calibrated threshold (ideally near 0) or fallback to 0
             threshold = cfg['pipeline'].get('mosk_threshold', 0.0)
-            
             s_rx = 0 if decision_stat > threshold else 1
             rx_symbols[i] = s_rx
-
             if s_tx == 0:
                 stats_glu.append(decision_stat)
             else:
                 stats_gaba.append(decision_stat)
-    
-            if i % 100 == 0 and cfg.get('verbose', False):
-                print(f"Symbol {i} (s_tx={s_tx}): D={decision_stat:.3e}, thresh={threshold:.3e}, s_rx={s_rx}")
           
         elif mod == 'CSK':
             target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
             M = cfg['pipeline']['csk_levels']
-            
-            # Use signed charge Q
             if target_channel == 'GLU':
                 Q = q_glu
                 q_eff = q_eff_glu
             else:
                 Q = q_gaba
                 q_eff = q_eff_gaba
-
-            # Use calibrated thresholds (must be sorted correctly by calibration routine)
             thresholds = cfg['pipeline'].get(f'csk_thresholds_{target_channel.lower()}', [])
-
             s_rx = 0
             for thresh in thresholds:
-                # Polarity awareness
                 if q_eff > 0:
-                    # Positive q_eff: Higher level means more positive Q. (Thresholds sorted ascending)
-                    if Q > thresh:
-                        s_rx += 1
-                    else:
-                        break
+                    if Q > thresh: s_rx += 1
+                    else: break
                 else:
-                    # Negative q_eff: Higher level means more negative Q. (Thresholds sorted descending)
-                    if Q < thresh:
-                         s_rx += 1
-                    else:
-                        break
-
+                    if Q < thresh: s_rx += 1
+                    else: break
             rx_symbols[i] = s_rx
-          
-            # Store signed Q for statistics
             if s_tx < M/2:
                 stats_glu.append(Q)
             else:
                 stats_gaba.append(Q)
               
         elif mod == 'Hybrid':
-            # Stage 1: MoSK decision (Antipodal ML detector - SUMMATION)
             decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
-            
             threshold_mosk = cfg['pipeline'].get('mosk_threshold', 0.0)
-
             b_hat = 0 if decision_stat > threshold_mosk else 1  # GLU if positive
-
-            # Stage 2: CSK decision (Signed Q, Polarity Aware)
-            threshold_glu = cfg['pipeline'].get('hybrid_threshold_glu')
-            threshold_gaba = cfg['pipeline'].get('hybrid_threshold_gaba')
-            
-            if threshold_glu is None or threshold_gaba is None:
-                if i == 0: print("Warning: Hybrid thresholds missing. Using defaults.")
-                threshold_glu = 0.0
-                threshold_gaba = 0.0
-            
+            threshold_glu = cfg['pipeline'].get('hybrid_threshold_glu', 0.0)
+            threshold_gaba = cfg['pipeline'].get('hybrid_threshold_gaba', 0.0)
             thresholds_used = {'GLU': threshold_glu, 'GABA': threshold_gaba}
-            
-            # Handle polarity correctly for Stage 2
-            if b_hat == 0:  # GLU detected (Positive polarity)
+            if b_hat == 0:
                 q_target = q_glu
-                # Higher level (1) means MORE positive.
                 l_hat = 1 if q_target > threshold_glu else 0
                 stats_glu.append(q_target)
-            else:  # GABA detected (Negative polarity)
+            else:
                 q_target = q_gaba
-                # Higher level (1) means MORE negative.
                 l_hat = 1 if q_target < threshold_gaba else 0
                 stats_gaba.append(q_target)
-            
             s_rx = (b_hat << 1) | l_hat
             rx_symbols[i] = s_rx
-            
-            # Error bookkeeping
             true_mol_bit = s_tx >> 1
             true_amp_bit = s_tx & 1
-            
             if b_hat != true_mol_bit:
                 subsymbol_errors['mosk'] += 1
             elif l_hat != true_amp_bit:
@@ -547,6 +546,11 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 
     # Calculate errors
     errors = np.sum(tx_symbols != rx_symbols)
+
+    # summarize isi metric for this run
+    isi_vals = metrics_ref.get('isi_ratio_values', [])
+    isi_ratio_mean = float(np.mean(isi_vals)) if len(isi_vals) else float('nan')
+    isi_ratio_median = float(np.median(isi_vals)) if len(isi_vals) else float('nan')
     
     return {
         "modulation": mod,
@@ -557,20 +561,21 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "stats_glu": stats_glu,
         "stats_gaba": stats_gaba,
         "subsymbol_errors": subsymbol_errors,
-        "thresholds_used": thresholds_used
+        "thresholds_used": thresholds_used,
+        "isi_ratio_mean": isi_ratio_mean,
+        "isi_ratio_median": isi_ratio_median,
+        # Stage 14: reproducibility knobs
+        'noise_sigma_glu': float(sigma_glu),
+        'noise_sigma_gaba': float(sigma_gaba),
+        'noise_sigma_I_diff': float(sigma_diff),
     }
 
 
 def run_sequence_batch(cfg: Dict[str, Any], batch_size: int = 50) -> Dict[str, Any]:
-    """
-    VECTORIZED: Process multiple symbols in parallel batches.
-    """
-    # For now, fall back to regular sequential processing
     return run_sequence(cfg)
 
 
 def run_sequence_batch_cpu(cfg_list: List[Dict[str, Any]], max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Run multiple sequence simulations in parallel using CPU multiprocessing."""
     if max_workers is None:
         max_workers = mp.cpu_count()
     

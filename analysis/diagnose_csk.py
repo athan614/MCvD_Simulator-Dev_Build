@@ -9,6 +9,8 @@ import numpy as np
 import yaml
 from copy import deepcopy
 import matplotlib.pyplot as plt
+import csv
+from pathlib import Path
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -140,10 +142,9 @@ def diagnose_csk_levels():
     plot_path.parent.mkdir(exist_ok=True, parents=True)
     plt.savefig(plot_path, dpi=150)
     print(f"Plot saved to: {plot_path}")
-    # plt.show()  # Comment out to prevent blocking
     plt.close()  # Close figure to free memory
     
-    # Calculate expected thresholds
+    # Calculate expected thresholds FIRST
     print("\n" + "="*40)
     print("SUGGESTED THRESHOLDS:")
     print("-"*40)
@@ -174,8 +175,40 @@ def diagnose_csk_levels():
             threshold = (mean_low + mean_high) / 2
             thresholds.append(threshold)
             print(f"Threshold {i}→{i+1} (fallback): {threshold:.3e}")
-        
-        print(f"Threshold {i}→{i+1}: {threshold:.3e}")
+    
+    # Stage 14: Save threshold and overlap tables (AFTER thresholds are calculated)
+    out_dir = project_root / "results"
+    (out_dir / "tables").mkdir(parents=True, exist_ok=True)
+    (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+    
+    # 1) Thresholds CSV
+    with open(out_dir / "tables" / "csk_thresholds_ml.csv", "w", newline='', encoding='utf-8') as f:  # Add encoding='utf-8'
+        writer = csv.writer(f)
+        writer.writerow(["pair", "threshold"])
+        for i, thr in enumerate(thresholds, start=1):
+            writer.writerow([f"{i-1}-{i}", f"{thr:.6e}"])
+    
+    # 2) Overlap CSV (adjacent levels; Gaussian approx from samples)
+    overlaps = []
+    for i in range(3):  # 4 levels = 3 pairs
+        q_low = results_per_symbol[i]['q_values']
+        q_high = results_per_symbol[i+1]['q_values']
+        mu0, s0 = np.mean(q_low), max(float(np.std(q_low)), 1e-15)
+        mu1, s1 = np.mean(q_high), max(float(np.std(q_high)), 1e-15)
+        # Bhattacharyya overlap proxy
+        bc = 0.25*np.log(0.25*((s0/s1)+(s1/s0)+2)) + 0.25*((mu0-mu1)**2)/(s0+s1)
+        overlap = float(np.exp(-bc))
+        overlaps.append((i, i+1, overlap))
+    
+    with open(out_dir / "tables" / "csk_overlap.csv", "w", newline='', encoding='utf-8') as f:  # Add encoding='utf-8'
+        writer = csv.writer(f)
+        writer.writerow(["pair", "overlap_proxy"])
+        for i, j, ov in overlaps:
+            writer.writerow([f"{i}-{j}", f"{ov:.6f}"])
+    
+    print(f"Tables saved:")
+    print(f"  - {out_dir / 'tables' / 'csk_thresholds_ml.csv'}")
+    print(f"  - {out_dir / 'tables' / 'csk_overlap.csv'}")
     
     # Check polarity
     print("\n" + "="*40)

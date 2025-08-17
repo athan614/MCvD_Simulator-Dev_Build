@@ -1,0 +1,11 @@
+# Direct runtime dependencies (unpinned) — will install the LATEST available at install time
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+PyYAML
+tqdm
+rich
+psutil
+cycler

@@ -88,8 +88,8 @@ if __name__ == "__main__":
     print("--- LaTeX Code for Table I ---")
     print(latex_output)
 
-    # Optional: Save to a file
+    # Stage 15: Ensure consistent output path and status reporting
     output_path = project_root / "results" / "tables"
-    output_path.mkdir(exist_ok=True)
-    (output_path / "table1.tex").write_text(latex_output)
-    print(f"\\nTable saved to: {output_path / 'table1.tex'}")
+    output_path.mkdir(parents=True, exist_ok=True)
+    (output_path / "table1.tex").write_text(latex_output, encoding='utf-8')  # Add encoding='utf-8'
+    print(f"✓ Wrote Table I to {output_path / 'table1.tex'}")
