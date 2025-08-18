@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tri-channel-oect-mc"
-version = "0.2.0"
-description = "Tri-channel OECT molecular communication simulator (MoSK/CSK/Hybrid) with crash-safe resume, IEEE-quality plotting, and benchmarking"
+version = "0.3.0"
+description = "Tri-channel OECT molecular communication simulator (MoSK/CSK/Hybrid) with crash-safe resume, parallel execution, real-time logging, IEEE-quality plotting, and benchmarking"
 readme = "README.md"
 requires-python = ">=3.11"  # SciPy>=1.16 requires Python >=3.11
 license = { text = "MIT" }
@@ -41,3 +41,7 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[project.scripts]
+mcvd-simulate = "analysis.run_final_analysis:main"
+mcvd-master = "analysis.run_master:main"

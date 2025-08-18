@@ -32,6 +32,7 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from analysis.ui_progress import ProgressManager
+from analysis.log_utils import setup_tee_logging
 
 STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +125,8 @@ def main() -> None:
     p.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default="all")
     p.add_argument("--realistic-onsi", action="store_true", 
                    help="Use cached simulation noise for ONSI calculation")
+    p.add_argument("--parallel-modes", type=int, default=1,
+                   help="Run modes concurrently (e.g., 3 for all 3 modes simultaneously)")
     p.add_argument(
         "--reset",
         nargs="?",
@@ -131,15 +134,26 @@ def main() -> None:
         const="all",
         help="Reset simulator state. 'cache' removes caches/state only; 'all' (default) removes results/*"
     )
+    # Add the new logging arguments
+    p.add_argument("--logdir", default=str(project_root / "results" / "logs"),
+                   help="Directory for log files")
+    p.add_argument("--no-log", action="store_true",
+                   help="Disable file logging")
+    p.add_argument("--fsync-logs", action="store_true",
+                   help="Force fsync on each write")
     p.set_defaults(use_ctrl=True)
     args = p.parse_args()
+
+    # Initialize master-level logging
+    if not args.no_log:
+        setup_tee_logging(Path(args.logdir), prefix="run_master", fsync=args.fsync_logs)
 
     # Handle reset before any state is read or steps run
     if args.reset:
         print(f"⚠  Reset requested: {args.reset}. Deleting saved data under {RESULTS_DIR} ...")
         _reset_state(args.reset)
 
-    steps: List[str] = ["simulate", "plots", "isi", "hybrid", "tables"]
+    steps: List[str] = ["simulate", "plots", "isi", "hybrid", "nb_replicas", "tables"]
     if args.supplementary:
         steps.extend(["supplementary", "appendix"])
 
@@ -152,6 +166,7 @@ def main() -> None:
 
     try:
         # 1) Simulation
+        # 1) Simulation
         if not (args.resume and state.get("simulate", {}).get("done")):
             cmd = [
                 sys.executable, "-u", "analysis/run_final_analysis.py",
@@ -159,8 +174,11 @@ def main() -> None:
                 "--num-seeds", str(args.num_seeds),
                 "--sequence-length", str(args.sequence_length),
                 "--progress", "rich" if args.progress == "gui" else args.progress,
-                "--target-ci", "0.005",  # Add this line for Stage 13 adaptive seeds
+                "--target-ci", "0.005",
             ]
+            # Pass through parallel modes option
+            if args.parallel_modes > 1:
+                cmd.extend(["--parallel-modes", str(args.parallel_modes)])
             # Append '--resume' only if we didn't just reset and the user asked to resume
             if args.resume and not args.reset:
                 cmd.append("--resume")
@@ -170,6 +188,7 @@ def main() -> None:
                 cmd.extend(["--no-ctrl"])
             if args.nt_pairs:
                 cmd.extend(["--nt-pairs", args.nt_pairs])
+            
             rc = _run(cmd)
             if rc != 0:
                 sub["simulate"].close(); overall.close(); pm.stop(); sys.exit(rc)
@@ -210,6 +229,21 @@ def main() -> None:
                 sub["hybrid"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "hybrid")
         sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
+
+        # 4.5) Notebook-replica mechanism panels (OECT, Binding, Transport, Pipeline)
+        if not (args.resume and state.get("nb_replicas", {}).get("done")):
+            for script in [
+                "analysis/rebuild_oect_figs.py",
+                "analysis/rebuild_binding_figs.py",
+                "analysis/rebuild_transport_figs.py",
+                "analysis/rebuild_pipeline_figs.py",
+            ]:
+                rc = _run([sys.executable, "-u", script])
+                if rc != 0:
+                    print(f"✗ {script} failed with rc={rc}")
+                    sub["nb_replicas"].close(); overall.close(); pm.stop(); sys.exit(rc)
+            _mark_done(state, "nb_replicas")
+        sub["nb_replicas"].update(1); sub["nb_replicas"].close(); overall.update(1)
 
         # 5) Tables
         if not (args.resume and state.get("tables", {}).get("done")):

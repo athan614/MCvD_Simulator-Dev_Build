@@ -5,7 +5,7 @@ Project bootstrapper for the Tri‑Channel OECT MC simulator.
 What it does
 ------------
 - Verifies Python and core dependencies
-- Creates the expected results/ tree (data/, figures/, tables/, cache/)
+- Creates the expected results/ tree (data/, figures/, tables/, cache/, logs/, notebook_replicas/)
 - (Optional) Resets results with --reset {cache|all}
 
 Usage
@@ -52,14 +52,15 @@ def _check_packages() -> None:
             missing.append(pip_name or mod)
     if missing:
         print("✗ Missing packages:", ", ".join(missing))
-        print("   Install with:  pip install -e .[viz,dev]")
+        print("   Install with:  pip install -e .[dev]")
         raise SystemExit(1)
     print("✓ Package versions:")
     for k, v in versions.items():
         print(f"   {k:>10s} : {v}")
 
 def _mkdirs(root: Path) -> None:
-    for sub in ("results/data", "results/figures", "results/tables", "results/cache"):
+    for sub in ("results/data", "results/figures", "results/figures/notebook_replicas", 
+                "results/tables", "results/cache", "results/logs"):
         p = root / sub
         p.mkdir(parents=True, exist_ok=True)
     print(f"✓ Created/verified results/ tree under {root.resolve()}")
@@ -101,6 +102,8 @@ def main() -> None:
     _mkdirs(root)
     print("All good. Try a quick sanity run, e.g.:")
     print("  python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm")
+    print("\nOr test parallel execution:")
+    print("  python analysis/run_master.py --modes all --parallel-modes 3 --num-seeds 5")
 
 if __name__ == "__main__":
     main()

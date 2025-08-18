@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from html import parser
 import sys
 import json
 import argparse
@@ -40,7 +41,8 @@ from src.config_utils import preprocess_config
 from src.constants import get_nt_params
 
 # Progress UI
-from analysis.ui_progress import ProgressManager  # type: ignore
+from analysis.ui_progress import ProgressManager
+from analysis.log_utils import setup_tee_logging
 
 # ============= TYPE DEFINITIONS =============
 class CPUConfig(TypedDict):
@@ -546,6 +548,14 @@ def parse_arguments() -> argparse.Namespace:
                         help="Minimum seeds required before adaptive CI stopping can trigger.")
     parser.add_argument("--lod-screen-delta", type=float, default=1e-4,
                         help="Hoeffding screening significance (delta) for early-stop LoD tests.")
+    parser.add_argument("--parallel-modes", type=int, default=1,
+                        help=">1 to run MoSK/CSK/Hybrid concurrently (e.g., 3).")
+    parser.add_argument("--logdir", default=str((project_root / "results" / "logs")),
+                        help="Directory for log files")
+    parser.add_argument("--no-log", action="store_true", 
+                        help="Disable file logging")
+    parser.add_argument("--fsync-logs", action="store_true", 
+                        help="Force fsync on each write")
     parser.set_defaults(use_ctrl=True)
     args = parser.parse_args()
     # Normalize: prefer --modes if provided
@@ -1494,285 +1504,301 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     global_pool.get_pool(maxw)
     start_time = time.time()
 
-    try:
-        print(f"\n{'='*60}\nRunning Performance Sweeps\n{'='*60}")
+    print(f"\n{'='*60}\nRunning Performance Sweeps\n{'='*60}")
 
-        default_distance = cfg['pipeline'].get('distance_um', 100)
-        symbol_period = calculate_dynamic_symbol_period(default_distance, cfg)
-        cfg['pipeline']['symbol_period_s'] = symbol_period
-        cfg['pipeline']['time_window_s'] = symbol_period
-        cfg['detection']['decision_window_s'] = symbol_period
-        print(f"  Symbol period Ts = {symbol_period:.0f}s; decision_window_s (runtime) = {cfg['detection']['decision_window_s']:.0f}s")
+    default_distance = cfg['pipeline'].get('distance_um', 100)
+    symbol_period = calculate_dynamic_symbol_period(default_distance, cfg)
+    cfg['pipeline']['symbol_period_s'] = symbol_period
+    cfg['pipeline']['time_window_s'] = symbol_period
+    cfg['detection']['decision_window_s'] = symbol_period
+    print(f"  Symbol period Ts = {symbol_period:.0f}s; decision_window_s (runtime) = {cfg['detection']['decision_window_s']:.0f}s")
 
-        # ---------- 1) SER vs Nm ----------
-        print("\n1. Running SER vs. Nm sweep...")
-        nm_values: List[Union[float, int]] = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
+    # ---------- 1) SER vs Nm ----------
+    print("\n1. Running SER vs. Nm sweep...")
+    nm_values: List[Union[float, int]] = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
 
-        # initial calibration (kept; thresholds hoisted per Nm in run_sweep)
-        if mode in ['CSK', 'Hybrid']:
-            print(f"\n📊 Initial calibration for {mode} mode...")
-            cal_seeds = list(range(10))
-            # store to disk so subsequent processes reuse quickly
-            initial_thresholds = calibrate_thresholds(cfg, cal_seeds, recalibrate=False, save_to_file=True, verbose=args.debug_calibration)
-            print("✅ Calibration complete")
-            for k, v in initial_thresholds.items():
-                cfg['pipeline'][k] = v
+    # initial calibration (kept; thresholds hoisted per Nm in run_sweep)
+    if mode in ['CSK', 'Hybrid']:
+        print(f"\n📊 Initial calibration for {mode} mode...")
+        cal_seeds = list(range(10))
+        # store to disk so subsequent processes reuse quickly
+        initial_thresholds = calibrate_thresholds(cfg, cal_seeds, recalibrate=False, save_to_file=True, verbose=args.debug_calibration)
+        print("✅ Calibration complete")
+        for k, v in initial_thresholds.items():
+            cfg['pipeline'][k] = v
 
-        ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"  # canonical name expected by comparative plots
-        df_ser_nm = run_sweep(
-            cfg, seeds,
-            'pipeline.Nm_per_symbol',
-            nm_values,
-            f"SER vs Nm ({mode})",
-            progress_mode=args.progress,
-            persist_csv=ser_csv,  # Always persist for crash safety,
-            resume=args.resume,
-            debug_calibration=args.debug_calibration
-        )
+    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"  # canonical name expected by comparative plots
+    df_ser_nm = run_sweep(
+        cfg, seeds,
+        'pipeline.Nm_per_symbol',
+        nm_values,
+        f"SER vs Nm ({mode})",
+        progress_mode=args.progress,
+        persist_csv=ser_csv,  # Always persist for crash safety,
+        resume=args.resume,
+        debug_calibration=args.debug_calibration
+    )
 
-        # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
-        if ser_csv.exists():
-            existing = pd.read_csv(ser_csv)
-            nm_key: Optional[str] = None
-            if 'pipeline_Nm_per_symbol' in existing.columns:
-                nm_key = 'pipeline_Nm_per_symbol'
-            elif 'pipeline.Nm_per_symbol' in existing.columns:
-                nm_key = 'pipeline.Nm_per_symbol'
-            if nm_key is not None:
-                # Combine prior rows with new rows from this run (if any)
-                combined = existing if df_ser_nm.empty else pd.concat([existing, df_ser_nm], ignore_index=True)
-                # Keep both CTRL states; last write wins per pair
-                if 'use_ctrl' in combined.columns:
-                    combined = combined.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values(by=[nm_key, 'use_ctrl'])
-                else:
-                    combined = combined.drop_duplicates(subset=[nm_key], keep='last').sort_values(by=[nm_key])
-                _atomic_write_csv(ser_csv, combined)
-        elif not df_ser_nm.empty:
-            _atomic_write_csv(ser_csv, df_ser_nm)
+    # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
+    if ser_csv.exists():
+        existing = pd.read_csv(ser_csv)
+        nm_key: Optional[str] = None
+        if 'pipeline_Nm_per_symbol' in existing.columns:
+            nm_key = 'pipeline_Nm_per_symbol'
+        elif 'pipeline.Nm_per_symbol' in existing.columns:
+            nm_key = 'pipeline.Nm_per_symbol'
+        if nm_key is not None:
+            # Combine prior rows with new rows from this run (if any)
+            combined = existing if df_ser_nm.empty else pd.concat([existing, df_ser_nm], ignore_index=True)
+            # Keep both CTRL states; last write wins per pair
+            if 'use_ctrl' in combined.columns:
+                combined = combined.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values(by=[nm_key, 'use_ctrl'])
+            else:
+                combined = combined.drop_duplicates(subset=[nm_key], keep='last').sort_values(by=[nm_key])
+            _atomic_write_csv(ser_csv, combined)
+    elif not df_ser_nm.empty:
+        _atomic_write_csv(ser_csv, df_ser_nm)
 
-        print(f"✅ SER vs Nm results saved to {ser_csv}")
+    print(f"✅ SER vs Nm results saved to {ser_csv}")
 
-        # ---------- 1′) HDS grid (Hybrid only): Nm × distance with component errors ----------
-        if mode == "Hybrid":
-            print("\n1′. Building Hybrid HDS grid (Nm × distance)…")
-            grid_csv = data_dir / "hybrid_hds_grid.csv"
+    # ---------- 1′) HDS grid (Hybrid only): Nm × distance with component errors ----------
+    if mode == "Hybrid":
+        print("\n1′. Building Hybrid HDS grid (Nm × distance)…")
+        grid_csv = data_dir / "hybrid_hds_grid.csv"
+        
+        # Use the distances configured for LoD (or fallback to a small set)
+        try:
+            distances = list(cfg['pipeline'].get('distances_um', []))
+        except Exception:
+            distances = []
+        if not distances:
+            # Fallback to a representative subset for the grid
+            distances = [25, 50, 100, 150, 200]
+        
+        # Use a subset of Nm values for the grid (to keep computation manageable)
+        grid_nm_values = [5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4]  # subset of nm_values
+        
+        rows = []
+        for d in distances:
+            cfg_d = deepcopy(cfg)
+            cfg_d['pipeline']['distance_um'] = int(d)
             
-            # Use the distances configured for LoD (or fallback to a small set)
+            # Recompute symbol period if your model depends on distance
             try:
-                distances = list(cfg['pipeline'].get('distances_um', []))
+                Ts = calculate_dynamic_symbol_period(int(d), cfg_d)
+                cfg_d['pipeline']['symbol_period_s'] = Ts
+                cfg_d['pipeline']['time_window_s'] = Ts
+                cfg_d['detection']['decision_window_s'] = Ts
             except Exception:
-                distances = []
-            if not distances:
-                # Fallback to a representative subset for the grid
-                distances = [25, 50, 100, 150, 200]
+                pass
             
-            # Use a subset of Nm values for the grid (to keep computation manageable)
-            grid_nm_values = [5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4]  # subset of nm_values
-            
-            rows = []
-            for d in distances:
-                cfg_d = deepcopy(cfg)
-                cfg_d['pipeline']['distance_um'] = int(d)
-                
-                # Recompute symbol period if your model depends on distance
-                try:
-                    Ts = calculate_dynamic_symbol_period(int(d), cfg_d)
-                    cfg_d['pipeline']['symbol_period_s'] = Ts
-                    cfg_d['pipeline']['time_window_s'] = Ts
-                    cfg_d['detection']['decision_window_s'] = Ts
-                except Exception:
-                    pass
-                
-                # Run SER sweep for this distance
-                df_d = run_sweep(
-                    cfg_d, seeds,
-                    'pipeline.Nm_per_symbol',
-                    grid_nm_values,
-                    f"HDS grid Hybrid (d={d} μm)",
-                    progress_mode=args.progress,
-                    persist_csv=None,  # Don't persist intermediate results
-                    resume=args.resume,
-                    debug_calibration=args.debug_calibration
-                )
-                
-                if not df_d.empty:
-                    df_d = df_d.copy()
-                    df_d['distance_um'] = int(d)
-                    rows.append(df_d)
-            
-            if rows:
-                grid = pd.concat(rows, ignore_index=True)
-                # Keep both CTRL states if present; de-dup by (d, Nm, use_ctrl)
-                nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
-                subset = ['distance_um', nm_key] + (['use_ctrl'] if 'use_ctrl' in grid.columns else [])
-                grid = grid.drop_duplicates(subset=subset, keep='last').sort_values(subset)
-                _atomic_write_csv(grid_csv, grid)
-                print(f"✅ HDS grid saved to {grid_csv}")
-            else:
-                print("⚠️ HDS grid: no rows produced (skipping).")
-
-        if not df_ser_nm.empty:
-            nm_col_print = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df_ser_nm.columns else 'pipeline.Nm_per_symbol'
-            cols_to_show = [c for c in [nm_col_print, 'ser', 'snr_db', 'use_ctrl'] if c in df_ser_nm.columns]
-            print(f"\nSER vs Nm Results (head) for {mode}:")
-            print(df_ser_nm[cols_to_show].head().to_string(index=False))
-
-        # After the standard CSK SER vs Nm sweep finishes and nm_values are known:
-        if mode == "CSK" and (args.nt_pairs or ""):
-            run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
-
-        # ---------- 2) LoD vs Distance ----------
-        print("\n2. Running LoD vs. Distance sweep...")
-        distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
-        lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
-
-        # Resume: only submit missing distances
-        d_run = distances
-        if args.resume and lod_csv.exists():
-            desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-            done_d = load_completed_values(lod_csv, 'distance_um', desired_ctrl)
-            d_run = [d for d in distances if d not in done_d]
-            if done_d:
-                print(f"↩️  Resume: skipping {len(done_d)} completed distances for use_ctrl={desired_ctrl}")
-
-        pool = global_pool.get_pool()
-        print(f"   Submitting {len(d_run)} distance searches to pool...\n")
-
-        future_to_dist: Dict[Any, int] = {
-            pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration): dist
-            for dist in d_run
-        }
-
-        pm = ProgressManager(args.progress)
-        lod_bar = pm.task(total=len(d_run), description="LoD vs distance")
-
-        lod_results: List[Dict[str, Any]] = []
-        for fut in as_completed(future_to_dist):
-            dist = future_to_dist[fut]
-            try:
-                res = fut.result(timeout=7200)
-            except TimeoutError:
-                print(f"  ✗ Timeout for distance {dist}μm")
-                res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
-                       'data_rate_bps': 0, 'symbol_period_s': 0.0,
-                       'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-                       'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
-                       'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
-                       'isi_overlap_ratio': 0.0,
-                       'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
-                       'mode': cfg['pipeline']['modulation']}
-            except Exception as e:
-                print(f"  ✗ Error for distance {dist}μm: {e}")
-                res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
-                       'data_rate_bps': 0, 'symbol_period_s': 0.0,
-                       'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-                       'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
-                       'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
-                       'isi_overlap_ratio': 0.0,
-                       'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
-                       'mode': cfg['pipeline']['modulation']}
-
-            # Append atomically per distance
-            append_row_atomic(lod_csv, res, list(res.keys()))
-            lod_results.append(res)
-
-            if res and not pd.isna(res.get('lod_nm', np.nan)):
-                print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
-            else:
-                print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm: No LoD found")
-            lod_bar.update(1)
-
-        lod_bar.close()
-        pm.stop()
-
-        # Merge with any prior rows (for a clean sorted CSV at the end)
-        if lod_csv.exists():
-            prior = pd.read_csv(lod_csv)
-            # Keep both CTRL states; sort by distance, then use_ctrl
-            if 'use_ctrl' in prior.columns:
-                df_lod = prior.drop_duplicates(subset=['distance_um', 'use_ctrl'], keep='last').sort_values(['distance_um', 'use_ctrl'])
-            else:
-                df_lod = prior.drop_duplicates(subset=['distance_um'], keep='last').sort_values('distance_um')
-        else:
-            df_lod = pd.DataFrame(lod_results).sort_values('distance_um')
-
-        _atomic_write_csv(lod_csv, df_lod)
-        print(f"\n✅ LoD vs distance saved to {lod_csv}")
-
-        if not df_lod.empty:
-            cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
-            print(f"\nLoD vs Distance (head) for {mode}:")
-            print(df_lod[cols_to_show].head().to_string(index=False))
-
-        # ---------- 3) ISI trade-off (guard-factor sweep) ----------
-        if cfg['pipeline'].get('enable_isi', True):
-            print("\n3. Running ISI trade-off sweep (guard factor)…")
-            # Representative distance: use current distance from cfg
-            # (user can change default distance in config/default.yaml)
-            guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
-            isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
-            # Ensure ISI is enabled for this sweep
-            cfg['pipeline']['enable_isi'] = True
-            df_isi = run_sweep(
-                cfg, seeds,
-                'pipeline.guard_factor',
-                guard_values,
-                f"ISI trade-off ({mode})",
+            # Run SER sweep for this distance
+            df_d = run_sweep(
+                cfg_d, seeds,
+                'pipeline.Nm_per_symbol',
+                grid_nm_values,
+                f"HDS grid Hybrid (d={d} μm)",
                 progress_mode=args.progress,
-                persist_csv=isi_csv,
+                persist_csv=None,  # Don't persist intermediate results
                 resume=args.resume,
                 debug_calibration=args.debug_calibration
             )
-            # De-duplicate by (guard_factor, use_ctrl)
-            if isi_csv.exists():
-                existing = pd.read_csv(isi_csv)
-                gf_key = 'guard_factor' if 'guard_factor' in existing.columns else 'pipeline.guard_factor'
-                if gf_key in existing.columns:
-                    combined = existing if df_isi.empty else pd.concat([existing, df_isi], ignore_index=True)
-                    if 'use_ctrl' in combined.columns:
-                        combined = combined.drop_duplicates(subset=[gf_key, 'use_ctrl'], keep='last').sort_values([gf_key, 'use_ctrl'])
-                    else:
-                        combined = combined.drop_duplicates(subset=[gf_key], keep='last').sort_values([gf_key])
-                    _atomic_write_csv(isi_csv, combined)
-            elif not df_isi.empty:
-                _atomic_write_csv(isi_csv, df_isi)
-            print(f"✅ ISI trade-off saved to {isi_csv}")
-
-            # NEW: Generate ISI-distance grid for Hybrid mode 2D visualization
-            if mode.lower() == "hybrid":
-                print("\n4. Generating Hybrid ISI-distance grid for 2D visualization…")
-                guard_grid = np.round(np.linspace(0.0, 1.0, 11), 2).tolist()  # [0.0, 0.1, ..., 1.0]
-                dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]  # Representative distances as floats
-                isi_grid_csv = data_dir / "isi_grid_hybrid.csv"
-                
-                if not (args.resume and isi_grid_csv.exists()):
-                    _write_hybrid_isi_distance_grid(
-                        cfg_base=cfg,  # Changed from cfg_run to cfg
-                        distances_um=dist_grid,
-                        guard_grid=guard_grid,
-                        out_csv=isi_grid_csv,
-                        seeds=seeds
-                    )
-                else:
-                    print(f"✓ ISI grid exists: {isi_grid_csv}")
+            
+            if not df_d.empty:
+                df_d = df_d.copy()
+                df_d['distance_um'] = int(d)
+                rows.append(df_d)
+        
+        if rows:
+            grid = pd.concat(rows, ignore_index=True)
+            # Keep both CTRL states if present; de-dup by (d, Nm, use_ctrl)
+            nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
+            subset = ['distance_um', nm_key] + (['use_ctrl'] if 'use_ctrl' in grid.columns else [])
+            grid = grid.drop_duplicates(subset=subset, keep='last').sort_values(subset)
+            _atomic_write_csv(grid_csv, grid)
+            print(f"✅ HDS grid saved to {grid_csv}")
         else:
-            print("\n3. ISI trade-off sweep skipped (ISI disabled).")
+            print("⚠️ HDS grid: no rows produced (skipping).")
 
-        elapsed = time.time() - start_time
-        print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
-        print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
-        print(f"{'='*60}")
+    if not df_ser_nm.empty:
+        nm_col_print = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df_ser_nm.columns else 'pipeline.Nm_per_symbol'
+        cols_to_show = [c for c in [nm_col_print, 'ser', 'snr_db', 'use_ctrl'] if c in df_ser_nm.columns]
+        print(f"\nSER vs Nm Results (head) for {mode}:")
+        print(df_ser_nm[cols_to_show].head().to_string(index=False))
 
-    finally:
-        global_pool.shutdown()
+    # After the standard CSK SER vs Nm sweep finishes and nm_values are known:
+    if mode == "CSK" and (args.nt_pairs or ""):
+        run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
+
+    # ---------- 2) LoD vs Distance ----------
+    print("\n2. Running LoD vs. Distance sweep...")
+    distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+    lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
+
+    # Resume: only submit missing distances
+    d_run = distances
+    if args.resume and lod_csv.exists():
+        desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+        done_d = load_completed_values(lod_csv, 'distance_um', desired_ctrl)
+        d_run = [d for d in distances if d not in done_d]
+        if done_d:
+            print(f"↩️  Resume: skipping {len(done_d)} completed distances for use_ctrl={desired_ctrl}")
+
+    pool = global_pool.get_pool()
+    print(f"   Submitting {len(d_run)} distance searches to pool...\n")
+
+    future_to_dist: Dict[Any, int] = {
+        pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration): dist
+        for dist in d_run
+    }
+
+    pm = ProgressManager(args.progress)
+    lod_bar = pm.task(total=len(d_run), description="LoD vs distance")
+
+    lod_results: List[Dict[str, Any]] = []
+    for fut in as_completed(future_to_dist):
+        dist = future_to_dist[fut]
+        try:
+            res = fut.result(timeout=7200)
+        except TimeoutError:
+            print(f"  ✗ Timeout for distance {dist}μm")
+            res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
+                    'data_rate_bps': 0, 'symbol_period_s': 0.0,
+                    'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+                    'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
+                    'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
+                    'isi_overlap_ratio': 0.0,
+                    'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+                    'mode': cfg['pipeline']['modulation']}
+        except Exception as e:
+            print(f"  ✗ Error for distance {dist}μm: {e}")
+            res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
+                    'data_rate_bps': 0, 'symbol_period_s': 0.0,
+                    'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+                    'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
+                    'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
+                    'isi_overlap_ratio': 0.0,
+                    'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+                    'mode': cfg['pipeline']['modulation']}
+
+        # Append atomically per distance
+        append_row_atomic(lod_csv, res, list(res.keys()))
+        lod_results.append(res)
+
+        if res and not pd.isna(res.get('lod_nm', np.nan)):
+            print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
+        else:
+            print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm: No LoD found")
+        lod_bar.update(1)
+
+    lod_bar.close()
+    pm.stop()
+
+    # Merge with any prior rows (for a clean sorted CSV at the end)
+    if lod_csv.exists():
+        prior = pd.read_csv(lod_csv)
+        # Keep both CTRL states; sort by distance, then use_ctrl
+        if 'use_ctrl' in prior.columns:
+            df_lod = prior.drop_duplicates(subset=['distance_um', 'use_ctrl'], keep='last').sort_values(['distance_um', 'use_ctrl'])
+        else:
+            df_lod = prior.drop_duplicates(subset=['distance_um'], keep='last').sort_values('distance_um')
+    else:
+        df_lod = pd.DataFrame(lod_results).sort_values('distance_um')
+
+    _atomic_write_csv(lod_csv, df_lod)
+    print(f"\n✅ LoD vs distance saved to {lod_csv}")
+
+    if not df_lod.empty:
+        cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
+        print(f"\nLoD vs Distance (head) for {mode}:")
+        print(df_lod[cols_to_show].head().to_string(index=False))
+
+    # ---------- 3) ISI trade-off (guard-factor sweep) ----------
+    if cfg['pipeline'].get('enable_isi', True):
+        print("\n3. Running ISI trade-off sweep (guard factor)…")
+        # Representative distance: use current distance from cfg
+        # (user can change default distance in config/default.yaml)
+        guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+        isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
+        # Ensure ISI is enabled for this sweep
+        cfg['pipeline']['enable_isi'] = True
+        df_isi = run_sweep(
+            cfg, seeds,
+            'pipeline.guard_factor',
+            guard_values,
+            f"ISI trade-off ({mode})",
+            progress_mode=args.progress,
+            persist_csv=isi_csv,
+            resume=args.resume,
+            debug_calibration=args.debug_calibration
+        )
+        # De-duplicate by (guard_factor, use_ctrl)
+        if isi_csv.exists():
+            existing = pd.read_csv(isi_csv)
+            gf_key = 'guard_factor' if 'guard_factor' in existing.columns else 'pipeline.guard_factor'
+            if gf_key in existing.columns:
+                combined = existing if df_isi.empty else pd.concat([existing, df_isi], ignore_index=True)
+                if 'use_ctrl' in combined.columns:
+                    combined = combined.drop_duplicates(subset=[gf_key, 'use_ctrl'], keep='last').sort_values([gf_key, 'use_ctrl'])
+                else:
+                    combined = combined.drop_duplicates(subset=[gf_key], keep='last').sort_values([gf_key])
+                _atomic_write_csv(isi_csv, combined)
+        elif not df_isi.empty:
+            _atomic_write_csv(isi_csv, df_isi)
+        print(f"✅ ISI trade-off saved to {isi_csv}")
+
+        # NEW: Generate ISI-distance grid for Hybrid mode 2D visualization
+        if mode.lower() == "hybrid":
+            print("\n4. Generating Hybrid ISI-distance grid for 2D visualization…")
+            guard_grid = np.round(np.linspace(0.0, 1.0, 11), 2).tolist()  # [0.0, 0.1, ..., 1.0]
+            dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]  # Representative distances as floats
+            isi_grid_csv = data_dir / "isi_grid_hybrid.csv"
+            
+            if not (args.resume and isi_grid_csv.exists()):
+                _write_hybrid_isi_distance_grid(
+                    cfg_base=cfg,  # Changed from cfg_run to cfg
+                    distances_um=dist_grid,
+                    guard_grid=guard_grid,
+                    out_csv=isi_grid_csv,
+                    seeds=seeds
+                )
+            else:
+                print(f"✓ ISI grid exists: {isi_grid_csv}")
+    else:
+        print("\n3. ISI trade-off sweep skipped (ISI disabled).")
+
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
+    print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
+    print(f"{'='*60}")
 
 def main() -> None:
     args = parse_arguments()
-    if args.mode == "ALL":
-        for m in ["MoSK", "CSK", "Hybrid"]:
-            run_one_mode(args, m)
-    else:
-        run_one_mode(args, args.mode)
+    
+    # Setup logging with the tee approach
+    if not args.no_log:
+        setup_tee_logging(Path(args.logdir), prefix="run_final_analysis", fsync=args.fsync_logs)
+    
+    # Determine which modes to run
+    modes = (["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode])
+    
+    # Initialize the shared process pool once
+    global_pool.get_pool(args.max_workers)
+    
+    try:
+        if args.parallel_modes > 1 and len(modes) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            n = min(args.parallel_modes, len(modes))
+            print(f"🔀 Interleaving modes with {n} thread(s): {modes}")
+            with ThreadPoolExecutor(max_workers=n) as tpool:
+                futs = [tpool.submit(run_one_mode, args, m) for m in modes]
+                for f in as_completed(futs):
+                    f.result()
+        else:
+            for m in modes:
+                run_one_mode(args, m)
+    finally:
+        global_pool.shutdown()
         
 def integration_test_noise_correlation() -> None:
     """
