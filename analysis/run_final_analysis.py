@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from html import parser
 import sys
 import json
 import argparse
@@ -18,14 +17,16 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 import multiprocessing as mp
 import psutil
-from tqdm import tqdm
-from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast
+from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable
 import gc
 import os
 import platform
 import time
 import typing
 import hashlib
+import threading
+import queue as pyqueue
+import signal
 
 # Add project root to path
 project_root = Path(__file__).parent.parent if (Path(__file__).parent.name == "analysis") else Path(__file__).parent
@@ -126,6 +127,30 @@ class GlobalProcessPool:
             )
             print(f"🚀 Global process pool initialized with {self._max_workers} workers")
         return t.cast(ProcessPoolExecutor, self._pool)
+    
+    def cancel_pending(self):
+        """Cancel futures that haven't started running yet."""
+        if self._pool:
+            try:
+                # Python 3.9+: cancel queued futures
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Older Python: best-effort
+                self._pool.shutdown(wait=False)
+            print("🛑 Pending futures cancelled")
+            
+    def force_kill(self):
+        """Terminate running worker processes (last resort)."""
+        if not self._pool:
+            return
+        procs = list(getattr(self._pool, "_processes", {}).values())  # private but practical
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        self._pool = None
+        print("💥 Worker processes terminated")
 
     def shutdown(self):
         if self._pool:
@@ -134,6 +159,36 @@ class GlobalProcessPool:
             print("✅ Global process pool shut down")
 
 global_pool = GlobalProcessPool()
+
+# ---- Cancellation: first ^C = graceful, second ^C = hard kill
+CANCEL = threading.Event()
+
+def _install_signal_handlers():
+    state = {"count": 0}
+    def _on_sig(_signum, _frame):
+        state["count"] += 1
+        if state["count"] == 1:
+            print("\n^C — cancelling pending work (press Ctrl+C again to abort immediately).", flush=True)
+            CANCEL.set()
+            try:
+                global_pool.cancel_pending()
+            except Exception:
+                pass
+        else:
+            print("\n^C again — force terminating workers.", flush=True)
+            try:
+                global_pool.force_kill()
+            finally:
+                os._exit(130)
+    
+    for sig in (getattr(signal, "SIGINT", None),
+                getattr(signal, "SIGTERM", None),
+                getattr(signal, "SIGBREAK", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _on_sig)
+            except Exception:
+                pass
 
 # ============= CALIBRATION CACHE =============
 calibration_cache: Dict[str, Dict[str, Union[float, List[float]]]] = {}
@@ -723,13 +778,20 @@ def run_sweep(cfg: Dict[str, Any],
               persist_csv: Optional[Path],
               resume: bool,
               debug_calibration: bool = False, 
-              cache_tag: Optional[str] = None) -> pd.DataFrame:
+              cache_tag: Optional[str] = None,
+              pm: Optional[ProgressManager] = None,  # NEW: accept progress manager
+              sweep_key: Optional[Any] = None,  # NEW: for nested updates
+              parent_key: Optional[Any] = None) -> pd.DataFrame:  # NEW: for hierarchical updates
     """
     Parameter sweep with parallelization; returns aggregated df.
     Writes each completed value's row immediately if persist_csv is given.
     """
     pool = global_pool.get_pool()
-    pm = ProgressManager(progress_mode)
+    # Use provided progress manager or create new one
+    local_pm = pm or ProgressManager(progress_mode)
+    if not pm:  # only create session meta if we're creating our own PM
+        session_meta = {"progress": progress_mode, "resume": False}
+        local_pm = ProgressManager(progress_mode, gui_session_meta=session_meta)
 
     # Resume: filter out done values (by their column in persisted CSV)
     values_to_run = sweep_values
@@ -790,9 +852,15 @@ def run_sweep(cfg: Dict[str, Any],
     # Optional enhancement: Add CTRL state to progress display
     use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
     ctrl_display = "CTRL" if use_ctrl else "NoCtrl"
-    display_name = f"{sweep_name} ({ctrl_display})"
+    display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({ctrl_display})"
 
-    job_bar = pm.task(total=total_jobs, description=display_name)
+    # Create or update the progress bar
+    if sweep_key and pm:
+        # Create or bind the task with the correct total under the intended parent
+        job_bar = pm.task(total=total_jobs, description=display_name,
+                        key=sweep_key, parent=parent_key, kind="sweep")
+    else:
+        job_bar = local_pm.task(total=total_jobs, description=display_name)
 
     # Collect rows
     aggregated_rows: List[Dict[str, Any]] = []
@@ -843,18 +911,34 @@ def run_sweep(cfg: Dict[str, Any],
         
         idx = 0
         pending: set = set()
-        while idx < len(seeds_to_run) or pending:
+        # NEW: stable worker-slot mapping (use a real queue to avoid duplicate assignment)
+        from collections import deque
+        slot_count = max(1, getattr(global_pool, "_max_workers", CPU_COUNT or 4))
+        free_slots = deque(range(slot_count))
+        fut_slot: Dict[Any, int] = {}
+        
+        while (idx < len(seeds_to_run) or pending) and not CANCEL.is_set():
             # top-up
-            while idx < len(seeds_to_run) and len(pending) < batch_size:
+            while idx < len(seeds_to_run) and len(pending) < batch_size and not CANCEL.is_set():
                 s = seeds_to_run[idx]
                 fut = pool.submit(
                     run_param_seed_combo, cfg, sweep_param, v, s, debug_calibration, thresholds_override,
                     sweep_name=sweep_folder, cache_tag=cache_tag
                 )
                 pending.add(fut)
+                
+                # Assign a stable slot
+                if pm:
+                    if not free_slots:
+                        # No idle UI slot available (more concurrency than slots); reuse slot 0 visually.
+                        slot = 0
+                    else:
+                        slot = free_slots.popleft()
+                    fut_slot[fut] = slot
+                    pm.worker_update(slot, f"{sweep_name} | {sweep_param}={v} | seed {s}")
                 idx += 1
             # wait for one to finish
-            if pending:  # Only process if we have pending futures
+            if pending and not CANCEL.is_set():  # Only process if we have pending futures
                 try:
                     done_fut = next(as_completed(pending, timeout=600))
                     pending.remove(done_fut)
@@ -865,6 +949,14 @@ def run_sweep(cfg: Dict[str, Any],
                         res = None
                     if res is not None:
                         results.append(res)
+                            
+                    # Update worker status to idle (stable slot)
+                    if pm:
+                        slot = fut_slot.pop(done_fut, -1)  # Use -1 as default instead of None
+                        if slot >= 0:  # Only update if we had a valid slot
+                            pm.worker_update(slot, "idle")
+                            free_slots.append(slot)
+                    
                     job_bar.update(1)
                 except TimeoutError:
                     # Enhanced: Log timeout details and implement retry logic
@@ -908,6 +1000,12 @@ def run_sweep(cfg: Dict[str, Any],
                             fut.cancel()
                         pending.clear()
                         break
+                    
+        # If cancellation was requested, try to cancel any still-pending futures
+        if CANCEL.is_set():
+            for f in list(pending):
+                f.cancel()
+            break  # stop processing more values
 
         if not results:
             continue
@@ -980,14 +1078,17 @@ def run_sweep(cfg: Dict[str, Any],
             append_row_atomic(persist_csv, row, persist_cols)
 
     job_bar.close()
-    pm.stop()
+    if not pm:  # Only stop if we created our own local_pm
+        local_pm.stop()
+    # Don't stop pm if it was provided by caller
 
     return pd.DataFrame(aggregated_rows)
 
 # ============= LOD SEARCH =============
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      target_ser: float = 0.01,
-                     debug_calibration: bool = False) -> Tuple[Union[int, float], float]:
+                     debug_calibration: bool = False,
+                     progress_cb: Optional[Any] = None) -> Tuple[Union[int, float], float, int]:
     nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
     nm_max = 100000
     lod_nm: float = float('nan')
@@ -998,13 +1099,14 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
     ctrl_str = "CTRL" if use_ctrl else "NoCtrl"
 
-    for iteration in range(14):
+    for iteration in range(20):
         if nm_min > nm_max:
             break
         nm_mid = int((nm_min + nm_max) / 2)
         if nm_mid == 0 or nm_mid > nm_max:
             break
-        print(f"    [{dist_um}μm|{ctrl_str}] Testing Nm={nm_mid} (iteration {iteration+1}/14, range: {nm_min}-{nm_max})")
+        print(f"    [{dist_um}μm|{ctrl_str}] Testing Nm={nm_mid} (iteration {iteration+1}/20, range: {nm_min}-{nm_max})")
+
 
         cfg_test = deepcopy(cfg_base)
         cfg_test['pipeline']['Nm_per_symbol'] = nm_mid
@@ -1034,6 +1136,12 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 results.append(r)
                 k_err += int(r.get('errors', 0))
                 n_seen += seq_len
+                # Progress callback for completed validation seed
+                if progress_cb is not None:
+                    try:
+                        progress_cb.put_nowait(1)
+                    except Exception:
+                        pass
                 # Deterministic screen: if even worst/best remaining cannot cross target
                 decide_below, decide_above = _deterministic_screen(
                     k_err, n_seen, len(seeds)*seq_len, target_ser
@@ -1084,23 +1192,35 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 r2 = None
             if r2 is not None:
                 results2.append(r2)
+                # Progress callback for completed validation seed
+                if progress_cb is not None:
+                    try:
+                        progress_cb.put(1)
+                    except Exception:
+                        pass
 
         if results2:
             total_symbols = len(results2) * cfg_final['pipeline']['sequence_length']
             total_errors = sum(cast(int, r['errors']) for r in results2)
             final_ser = total_errors / total_symbols if total_symbols > 0 else 1.0
             if final_ser <= target_ser:
-                return nm_min, final_ser
+                # Track actual progress - binary search iterations + final check seeds + overhead
+                actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
+                return nm_min, final_ser, actual_progress
 
-    return (int(lod_nm) if not math.isnan(lod_nm) else float('nan'), best_ser)
+    # Track actual progress increments for accurate parent progress
+    actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
+    return lod_nm, best_ser, actual_progress
 
 def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                              seeds: List[int], target_ser: float = 0.01,
-                             debug_calibration: bool = False) -> Dict[str, Any]:
+                             debug_calibration: bool = False,
+                             progress_cb: Optional[Any] = None) -> Dict[str, Any]:
     """
     Process a single distance for LoD calculation.
     Returns dict with lod_nm, ser_at_lod, and data_rate_bps.
     """
+    actual_progress = 0  # Initialize before try block
     cfg = deepcopy(cfg_base)
     cfg['pipeline']['distance_um'] = dist_um
     
@@ -1108,62 +1228,88 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     cfg['pipeline']['symbol_period_s'] = calculate_dynamic_symbol_period(dist_um, cfg)
     
     try:
-        lod_nm, ser_at_lod = find_lod_for_ser(cfg, seeds, target_ser, debug_calibration)
+        lod_nm, ser_at_lod, actual_progress = find_lod_for_ser(cfg, seeds, target_ser, debug_calibration, progress_cb)
         
         # Calculate data rate at LoD
         if not np.isnan(lod_nm):
             # Update config with LoD
             cfg['pipeline']['Nm_per_symbol'] = lod_nm
             
-            # ADDITION: Collect per-seed data rates for CI calculation
-            per_seed_rates = []
+            # Ensure detection window matches Ts
+            cfg['pipeline']['time_window_s'] = cfg['pipeline']['symbol_period_s']
+            cfg.setdefault('detection', {})
+            cfg['detection']['decision_window_s'] = cfg['pipeline']['symbol_period_s']
+
+            # Ensure the same thresholds used during LoD search are active here
+            cal_seeds = list(range(10))
+            th = calibrate_thresholds_cached(cfg, cal_seeds)
+            for k, v in th.items():
+                cfg['pipeline'][k] = v
             
-            # Run simulations to collect data rates
+            # --- Calculate data rate at LoD using per-seed SER (recommended) ---
+            per_seed_rates = []
+            per_seed_ser = []
+            per_seed_Ts = []
+
+            # Bits per symbol by mode
+            if cfg['pipeline']['modulation'] == 'MoSK':
+                bits_per_symbol = 1.0
+            elif cfg['pipeline']['modulation'] == 'CSK':
+                M = int(cfg['pipeline'].get('csk_levels', 4))
+                bits_per_symbol = float(math.log2(max(M, 2)))
+            else:  # Hybrid
+                bits_per_symbol = 2.0
+
             for seed in seeds:
                 try:
-                    result = run_single_instance(cfg, seed, attach_isi_meta=True)
-                    if result is not None:
-                        # Calculate instantaneous data rate for this seed
-                        Ts = float(cfg['pipeline']['symbol_period_s'])
-                        bits_per_symbol = 1.0
-                        if cfg['pipeline']['modulation'] == 'CSK':
-                            bits_per_symbol = 2.0
-                        elif cfg['pipeline']['modulation'] == 'Hybrid':
-                            bits_per_symbol = 2.0  # <-- FIX: Hybrid carries 2 bits/symbol
-                        
-                        seed_rate = (bits_per_symbol / Ts) * (1 - ser_at_lod)
-                        per_seed_rates.append(seed_rate)
+                    res = run_single_instance(cfg, seed, attach_isi_meta=True)
+                    if res is None:
+                        continue
+
+                    # Symbol period per seed (usually constant, but read if present)
+                    Ts_seed = float(res.get('symbol_period_s', cfg['pipeline']['symbol_period_s']))
+
+                    # SER per seed: prefer explicit keys, fall back to errors/sequence_length,
+                    # and finally to ser_at_lod as a last resort.
+                    L = int(cfg['pipeline']['sequence_length'])
+                    e = res.get('errors', None)
+                    ser_seed = res.get('ser', res.get('SER', (e / L) if (e is not None and L > 0) else ser_at_lod))
+                    ser_seed = float(min(max(ser_seed, 0.0), 1.0))
+
+                    per_seed_rates.append((bits_per_symbol / Ts_seed) * (1.0 - ser_seed))
+                    per_seed_ser.append(ser_seed)
+                    per_seed_Ts.append(Ts_seed)
+
+                    if progress_cb is not None:
+                        try: 
+                            progress_cb.put(1)
+                        except Exception: 
+                            pass
                 except Exception:
                     continue
-            
-            # Calculate aggregate data rate with CI bounds
+
+            # Aggregate data rate with 95% t-CI (fallback to normal if SciPy missing)
             if per_seed_rates:
                 mean_rate = float(np.mean(per_seed_rates))
-                std_rate = float(np.std(per_seed_rates))
-                n_seeds = len(per_seed_rates)
-                
-                # 95% CI using t-distribution
+                std_rate = float(np.std(per_seed_rates, ddof=1)) if len(per_seed_rates) > 1 else 0.0
+                n = max(1, len(per_seed_rates))
                 try:
-                    from scipy.stats import t   # type: ignore
-                    t_val = t.ppf(0.975, n_seeds - 1) if n_seeds > 1 else 1.96
-                except ImportError:
-                    # Fallback to normal approximation if SciPy unavailable
+                    from scipy.stats import t  # type: ignore
+                    t_val = t.ppf(0.975, n - 1) if n > 1 else 1.96
+                except Exception:
                     t_val = 1.96
-                ci_half_width = t_val * std_rate / np.sqrt(n_seeds)
-                
+                ci_half = t_val * std_rate / math.sqrt(n)
+
                 data_rate_bps = mean_rate
-                data_rate_ci_low = mean_rate - ci_half_width
-                data_rate_ci_high = mean_rate + ci_half_width
-            else:
-                # Fallback to deterministic calculation
+                data_rate_ci_low = max(0.0, float(mean_rate - ci_half))  # Clamp to physical bounds
+                # Optional: clamp upper bound to theoretical maximum
                 Ts = float(cfg['pipeline']['symbol_period_s'])
-                bits_per_symbol = 1.0
-                if cfg['pipeline']['modulation'] == 'CSK':
-                    bits_per_symbol = 2.0
-                elif cfg['pipeline']['modulation'] == 'Hybrid':
-                    bits_per_symbol = 2.0
-                
-                data_rate_bps = (bits_per_symbol / Ts) * (1 - ser_at_lod)
+                theoretical_max = float(bits_per_symbol / Ts)
+                data_rate_ci_high = min(theoretical_max, float(mean_rate + ci_half))
+            else:
+                # Fallback (deterministic)
+                Ts = float(cfg['pipeline']['symbol_period_s'])
+                data_rate_bps = (bits_per_symbol / Ts) * (1.0 - ser_at_lod)
                 data_rate_ci_low = data_rate_bps
                 data_rate_ci_high = data_rate_bps
         else:
@@ -1184,15 +1330,33 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         # Re-simulate at the LoD point to collect noise_sigma_I_diff
         cfg_lod = deepcopy(cfg_base)
         cfg_lod['pipeline']['distance_um'] = dist_um
+        # Recompute Ts and decision window for this distance
+        Ts_lod = calculate_dynamic_symbol_period(dist_um, cfg_lod)
+        cfg_lod['pipeline']['symbol_period_s'] = Ts_lod
+        cfg_lod['pipeline']['time_window_s'] = Ts_lod
+        cfg_lod.setdefault('detection', {})
+        cfg_lod['detection']['decision_window_s'] = Ts_lod
+
         cfg_lod['pipeline']['Nm_per_symbol'] = lod_nm
+
+        # Apply thresholds at this exact (distance, Ts, Nm)
+        th_lod = calibrate_thresholds_cached(cfg_lod, list(range(4)))
+        for k, v in th_lod.items():
+            cfg_lod['pipeline'][k] = v
         
         sigma_values = []
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
-                                         debug_calibration=debug_calibration, 
-                                         sweep_name="lod_validation", cache_tag="lod_sigma")
+                                        debug_calibration=debug_calibration, 
+                                        sweep_name="lod_validation", cache_tag="lod_sigma")
             if result and 'noise_sigma_I_diff' in result:
                 sigma_values.append(result['noise_sigma_I_diff'])
+            # Progress callback for completed noise sigma seed
+            if progress_cb is not None:
+                try: 
+                    progress_cb.put(1)
+                except Exception: 
+                    pass
         
         lod_sigma_median = float(np.median(sigma_values)) if sigma_values else float('nan')
     else:
@@ -1206,10 +1370,15 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'data_rate_ci_low': data_rate_ci_low,
         'data_rate_ci_high': data_rate_ci_high,
         'symbol_period_s': cfg['pipeline']['symbol_period_s'],
+        'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+        'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
+        'decision_window_s': float(cfg.get('detection', {}).get(
+            'decision_window_s', cfg['pipeline']['symbol_period_s'])),
         'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
         'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
         'mode': cfg['pipeline']['modulation'],
-        'noise_sigma_I_diff': lod_sigma_median  # NEW: Optional field from Step 9
+        'noise_sigma_I_diff': lod_sigma_median,
+        'actual_progress': int(actual_progress),
     }
 
 # ============= MAIN PLOTTING HELPERS (unchanged visuals) =============
@@ -1446,6 +1615,20 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
 
 # ============= MAIN =============
 def run_one_mode(args: argparse.Namespace, mode: str) -> None:
+    # Build session metadata for GUI context
+    session_meta = {
+        "modes": [mode],
+        "progress": args.progress,
+        "resume": bool(args.resume),
+        "with_ctrl": bool(args.use_ctrl),
+        "isi": not args.disable_isi,
+        "flags": [f"--num-seeds={args.num_seeds}", f"--sequence-length={args.sequence_length}"] +
+                ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
+                (["--recalibrate"] if args.recalibrate else [])
+    }
+    
+    _install_signal_handlers()
+    
     # Determine worker count
     maxw = args.max_workers
     if maxw is None:
@@ -1506,16 +1689,62 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     print(f"\n{'='*60}\nRunning Performance Sweeps\n{'='*60}")
 
-    default_distance = cfg['pipeline'].get('distance_um', 100)
-    symbol_period = calculate_dynamic_symbol_period(default_distance, cfg)
-    cfg['pipeline']['symbol_period_s'] = symbol_period
-    cfg['pipeline']['time_window_s'] = symbol_period
-    cfg['detection']['decision_window_s'] = symbol_period
-    print(f"  Symbol period Ts = {symbol_period:.0f}s; decision_window_s (runtime) = {cfg['detection']['decision_window_s']:.0f}s")
+    # Shared GUI for this mode
+    pm = ProgressManager(args.progress, gui_session_meta=session_meta)
+    pm.set_status(mode=mode, sweep="SER vs Nm")
+
+    # Pre-compute job counts for consistent totals
+    nm_values = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
+    distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+    guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+    ser_jobs = len(nm_values) * args.num_seeds
+    lod_jobs = len(distances) * args.num_seeds * 8  # estimate
+    isi_jobs = (len(guard_values) * args.num_seeds) if (not args.disable_isi) else 0
+
+    # Hierarchy
+    # Create overall progress bar first
+    overall_key = ("overall", mode)
+    # Create hierarchy only for GUI backend (avoids duplicate bars in rich/tqdm)
+    hierarchy_supported = (args.progress == "gui")
+    
+    # Initialize variables to prevent unbound issues
+    overall_manual = None
+    mode_bar = None
+    overall = None
+    
+    # Initialize variables with proper types
+    mode_key: Optional[Tuple[str, str]] = None
+    ser_key: Optional[Tuple[str, str, str]] = None
+    lod_key: Optional[Tuple[str, str, str]] = None
+    isi_key: Optional[Tuple[str, str, str]] = None
+    
+    if hierarchy_supported:
+        overall_key = ("overall", mode)
+        overall = pm.task(total=ser_jobs + lod_jobs + isi_jobs, 
+                         description=f"Overall ({mode})", 
+                         key=overall_key, kind="overall")
+        
+        mode_key = ("mode", mode)
+        mode_bar = pm.task(total=ser_jobs + lod_jobs + isi_jobs,
+                          description=f"{mode} Mode",
+                          parent=overall_key, key=mode_key, kind="mode")
+
+        ser_key = ("sweep", mode, "SER_vs_Nm")
+        lod_key = ("sweep", mode, "LoD_vs_distance") 
+        isi_key = ("sweep", mode, "ISI_vs_guard")
+
+    # Always create the ser_bar with appropriate parent
+    if hierarchy_supported:
+        ser_bar = pm.task(total=ser_jobs, description="SER vs Nm",
+                          parent=mode_key, key=("sweep", mode, "SER_vs_Nm"), kind="sweep")
+    else:
+        ser_bar = None
+
+    # CSV file paths
+    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"
 
     # ---------- 1) SER vs Nm ----------
     print("\n1. Running SER vs. Nm sweep...")
-    nm_values: List[Union[float, int]] = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
 
     # initial calibration (kept; thresholds hoisted per Nm in run_sweep)
     if mode in ['CSK', 'Hybrid']:
@@ -1527,17 +1756,20 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         for k, v in initial_thresholds.items():
             cfg['pipeline'][k] = v
 
-    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"  # canonical name expected by comparative plots
     df_ser_nm = run_sweep(
         cfg, seeds,
-        'pipeline.Nm_per_symbol',
-        nm_values,
+        'pipeline.Nm_per_symbol', nm_values,
         f"SER vs Nm ({mode})",
         progress_mode=args.progress,
-        persist_csv=ser_csv,  # Always persist for crash safety,
+        persist_csv=ser_csv,
         resume=args.resume,
-        debug_calibration=args.debug_calibration
+        debug_calibration=args.debug_calibration,
+        pm=pm,                                # always share one PM
+        sweep_key=ser_key if hierarchy_supported else None,
+        parent_key=mode_key if hierarchy_supported else None,
     )
+    # advance the aggregate mode bar by however many jobs actually ran
+    if ser_bar: ser_bar.close()
 
     # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
     if ser_csv.exists():
@@ -1560,6 +1792,13 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         _atomic_write_csv(ser_csv, df_ser_nm)
 
     print(f"✅ SER vs Nm results saved to {ser_csv}")
+    
+    # Manual parent update for non-GUI backends  
+    if not hierarchy_supported:
+        # For rich/tqdm, create simple overall progress tracker
+        if overall_manual is None:
+            overall_manual = pm.task(total=3, description=f"{mode} Progress")
+        overall_manual.update(1, description=f"{mode} - SER vs Nm completed")
 
     # ---------- 1′) HDS grid (Hybrid only): Nm × distance with component errors ----------
     if mode == "Hybrid":
@@ -1631,55 +1870,107 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
 
     # ---------- 2) LoD vs Distance ----------
-    print("\n2. Running LoD vs. Distance sweep...")
-    distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+    print("\n2. Building LoD vs distance curve…")
+    d_run = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
+    pm.set_status(mode=mode, sweep="LoD vs distance")
+    optimal_workers = get_optimal_workers("beast" if args.beast_mode else "optimal")
+    pool = global_pool.get_pool(max_workers=optimal_workers)
+    maxw = optimal_workers
 
-    # Resume: only submit missing distances
-    d_run = distances
-    if args.resume and lod_csv.exists():
-        desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-        done_d = load_completed_values(lod_csv, 'distance_um', desired_ctrl)
-        d_run = [d for d in distances if d not in done_d]
-        if done_d:
-            print(f"↩️  Resume: skipping {len(done_d)} completed distances for use_ctrl={desired_ctrl}")
+    # Calculate actual total after all distances complete, or use dynamic updating
+    estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5  # Keep for initial estimate
+    lod_jobs = len(d_run) * estimated_per_distance  # Use estimate for initial parent bar
+    lod_key = ("sweep", mode, "LoD")
+    if hierarchy_supported:
+        lod_bar = pm.task(total=lod_jobs, description="LoD vs distance",
+                          parent=mode_key, key=lod_key, kind="sweep")
+    else:
+        lod_bar = None
+    
+    # --- NEW: Setup multiprocessing-safe progress queues ---
+    mgr = mp.Manager()
+    progress_queues = {}
+    drainers = {}
 
-    pool = global_pool.get_pool()
-    print(f"   Submitting {len(d_run)} distance searches to pool...\n")
+    def _start_drain_thread(dist, bar, q):
+        stop = threading.Event()
+        def _drain():
+            while not stop.is_set():
+                try:
+                    inc = q.get(timeout=0.25)
+                    if inc is None:
+                        break
+                    bar.update(int(inc))
+                except pyqueue.Empty:
+                    pass
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        return t, stop
 
-    future_to_dist: Dict[Any, int] = {
-        pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration): dist
-        for dist in d_run
-    }
+    # Create individual distance progress bars FIRST with accurate totals
+    distance_bars = {} # binary search + data-rate + sigma sampling
+    dist_totals = {}  # NEW: track actual totals
+    for d_um in d_run:
+        dist_key = ("dist", mode, "LoD", float(d_um))
+        dist_bar = None
+        if hierarchy_supported:
+            dist_bar = pm.task(total=estimated_per_distance,
+                            description=f"LoD @ {d_um:.0f}μm",
+                            parent=lod_key, key=dist_key, kind="dist")
+        distance_bars[d_um] = dist_bar
+        dist_totals[d_um] = estimated_per_distance  # initial guess
+        q = mgr.Queue(maxsize=1000)
+        progress_queues[d_um] = q
+        t, stop_evt = _start_drain_thread(d_um, dist_bar, q)
+        drainers[d_um] = (t, stop_evt)
 
-    pm = ProgressManager(args.progress)
-    lod_bar = pm.task(total=len(d_run), description="LoD vs distance")
+    # --- NEW: Create per-worker progress bars ---
+    worker_bars = {}
+    for wid in range(maxw):
+        # Use same estimated_per_distance per worker as a coarse total
+        worker_bars[wid] = pm.worker_task(
+            worker_id=wid, 
+            total=estimated_per_distance, 
+            label=f"Worker {wid:02d}",
+            parent=lod_key if hierarchy_supported else None
+        )
+
+    future_to_dist: Dict[Any, int] = {}
+    future_worker: Dict[Any, int] = {}    # stable worker mapping
+    for i, dist in enumerate(d_run):
+        wid = i % max(1, maxw)
+        pm.worker_update(wid, f"LoD | d={dist} μm")
+        
+        # Pass the queue instead of a lambda callback
+        q = progress_queues[dist]
+        future = pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration, q)
+        future_to_dist[future] = dist
+        future_worker[future] = wid
 
     lod_results: List[Dict[str, Any]] = []
     for fut in as_completed(future_to_dist):
         dist = future_to_dist[fut]
+        wid = future_worker.pop(fut, 0)  # stable id assignment
+        
+        res = {}  # Initialize to prevent unbound variable
         try:
             res = fut.result(timeout=7200)
+            # Store actual progress for accurate parent counting  
+            res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
         except TimeoutError:
-            print(f"  ✗ Timeout for distance {dist}μm")
-            res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
-                    'data_rate_bps': 0, 'symbol_period_s': 0.0,
-                    'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-                    'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
-                    'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
-                    'isi_overlap_ratio': 0.0,
-                    'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
-                    'mode': cfg['pipeline']['modulation']}
-        except Exception as e:
-            print(f"  ✗ Error for distance {dist}μm: {e}")
-            res = {'distance_um': dist, 'lod_nm': np.nan, 'ser_at_lod': 1.0,
-                    'data_rate_bps': 0, 'symbol_period_s': 0.0,
-                    'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-                    'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
-                    'decision_window_s': float(cfg['pipeline'].get('symbol_period_s', 0.0)),
-                    'isi_overlap_ratio': 0.0,
-                    'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
-                    'mode': cfg['pipeline']['modulation']}
+            print(f"⚠️  LoD timeout at {dist}μm, skipping")
+            res = {}
+        except Exception as ex:
+            print(f"⚠️  LoD error at {dist}μm: {ex}")
+            res = {}
+        finally:
+            # Mark this worker as idle
+            pm.worker_update(wid, "idle")
+            # NEW: increment worker bar by the actual work performed for that distance
+            actual_total = res.get('actual_progress', estimated_per_distance)
+            if wid in worker_bars:
+                worker_bars[wid].update(actual_total)
 
         # Append atomically per distance
         append_row_atomic(lod_csv, res, list(res.keys()))
@@ -1689,10 +1980,47 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
         else:
             print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm: No LoD found")
-        lod_bar.update(1)
+        # Update distance bar with actual progress before closing
+        if dist in distance_bars:
+            bar = distance_bars[dist]
+            actual_total = res.get('actual_progress', estimated_per_distance)
+            
+            # Create the correct dist_key for this specific distance
+            current_dist_key = ("dist", mode, "LoD", float(dist))
+            
+            if hierarchy_supported and bar:
+                pm.update_total(key=current_dist_key, total=actual_total,
+                                label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
+                
+                # NEW: remember actual total
+                dist_totals[dist] = actual_total
+                
+                # NEW: update the parent LoD row with sum of actual totals
+                if hierarchy_supported and lod_bar:
+                    pm.update_total(key=lod_key, total=sum(dist_totals.values()),
+                                    label="LoD vs distance", kind="sweep", parent=mode_key)
+                
+                remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
+                if remaining > 0: bar.update(remaining)
+                if bar:
+                    bar.close()
 
-    lod_bar.close()
-    pm.stop()
+    # Close remaining distance bars
+    for bar in distance_bars.values():
+        if bar:
+            bar.close()
+
+    # NEW: Close worker bars
+    for bar in worker_bars.values():
+        if bar:
+            bar.close()
+    
+    # NEW: Clean up the multiprocessing manager
+    try:
+        mgr.shutdown()
+    except Exception:
+        pass
+    # DO NOT stop pm here; continue to ISI sweep
 
     # Merge with any prior rows (for a clean sorted CSV at the end)
     if lod_csv.exists():
@@ -1707,6 +2035,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     _atomic_write_csv(lod_csv, df_lod)
     print(f"\n✅ LoD vs distance saved to {lod_csv}")
+    
+    # Manual parent update for non-GUI backends
+    if not hierarchy_supported:
+        if overall_manual is None:
+            overall_manual = pm.task(total=3, description=f"{mode} Progress")
+        overall_manual.update(1, description=f"{mode} - LoD vs Distance completed")
 
     if not df_lod.empty:
         cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
@@ -1722,6 +2056,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
         # Ensure ISI is enabled for this sweep
         cfg['pipeline']['enable_isi'] = True
+        pm.set_status(mode=mode, sweep="ISI trade-off")
+        isi_key = ("sweep", mode, "ISI_tradeoff")
+        isi_bar = None
+        if hierarchy_supported:
+            isi_bar = pm.task(total=isi_jobs, description="ISI trade-off (guard)",
+                            parent=mode_key, key=isi_key, kind="sweep")
         df_isi = run_sweep(
             cfg, seeds,
             'pipeline.guard_factor',
@@ -1730,8 +2070,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             progress_mode=args.progress,
             persist_csv=isi_csv,
             resume=args.resume,
-            debug_calibration=args.debug_calibration
+            debug_calibration=args.debug_calibration,
+            pm=pm,                       # share PM
+            sweep_key=isi_key if hierarchy_supported else None,
+            parent_key=mode_key if hierarchy_supported else None
         )
+        if isi_bar: isi_bar.close()
         # De-duplicate by (guard_factor, use_ctrl)
         if isi_csv.exists():
             existing = pd.read_csv(isi_csv)
@@ -1746,17 +2090,23 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         elif not df_isi.empty:
             _atomic_write_csv(isi_csv, df_isi)
         print(f"✅ ISI trade-off saved to {isi_csv}")
+        
+        # Manual parent update for non-GUI backends
+        if not hierarchy_supported:
+            if overall_manual is None:
+                overall_manual = pm.task(total=3, description=f"{mode} Progress")
+            overall_manual.update(1, description=f"{mode} - ISI Trade-off completed")
 
         # NEW: Generate ISI-distance grid for Hybrid mode 2D visualization
         if mode.lower() == "hybrid":
             print("\n4. Generating Hybrid ISI-distance grid for 2D visualization…")
-            guard_grid = np.round(np.linspace(0.0, 1.0, 11), 2).tolist()  # [0.0, 0.1, ..., 1.0]
-            dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]  # Representative distances as floats
+            guard_grid = np.round(np.linspace(0.0, 1.0, 11), 2).tolist()
+            dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]
             isi_grid_csv = data_dir / "isi_grid_hybrid.csv"
             
             if not (args.resume and isi_grid_csv.exists()):
                 _write_hybrid_isi_distance_grid(
-                    cfg_base=cfg,  # Changed from cfg_run to cfg
+                    cfg_base=cfg,
                     distances_um=dist_grid,
                     guard_grid=guard_grid,
                     out_csv=isi_grid_csv,
@@ -1771,9 +2121,21 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
     print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
     print(f"{'='*60}")
+    
+    if hierarchy_supported:
+        if mode_bar is not None:
+            mode_bar.close()
+        if overall is not None:
+            overall.close()
+    pm.stop()
 
 def main() -> None:
     args = parse_arguments()
+    
+    # Guard: avoid multiple Tk windows when interleaving modes
+    if args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1:
+        print("⚠️  GUI + --parallel-modes>1 not supported reliably; falling back to 'rich'.")
+        args.progress = "rich"
     
     # Setup logging with the tee approach
     if not args.no_log:
@@ -1838,8 +2200,15 @@ def integration_test_noise_correlation() -> None:
         test_config['noise']['rho_between_channels_after_ctrl'] = rho_cc_value
         
         try:
+            # Ensure a symbol period is present (match your dynamic Ts logic)
+            test_config['pipeline']['symbol_period_s'] = calculate_dynamic_symbol_period(
+                float(test_config['pipeline']['distance_um']), test_config
+            )
             # Test 1: Verify sigma calculation
-            detection_window_s = test_config['pipeline']['symbol_period_s']
+            detection_window_s = 1.0  # Default value
+            test_config['pipeline']['symbol_period_s'] = detection_window_s
+            test_config['pipeline']['time_window_s'] = detection_window_s
+            test_config['detection']['decision_window_s'] = detection_window_s
             sigma_glu, sigma_gaba = calculate_proper_noise_sigma(test_config, detection_window_s)
             
             # Manual calculation for verification
