@@ -20,19 +20,34 @@ Usage (IEEE publication preset):
 """
 
 from __future__ import annotations
-
+import argparse
+import json
+import os
+import platform
+import shutil
+import signal
+import stat
 import subprocess
 import sys
-import json
-from pathlib import Path
-from typing import Dict, List, Any
+import threading
 import time
-import argparse
-import shutil
-import os
-import stat
-import signal
+from pathlib import Path
+from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Import TclError for GUI exception handling
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tkinter import TclError
+else:
+    try:
+        from tkinter import TclError
+    except ImportError:
+        # Fallback for environments without tkinter
+        class TclError(Exception):
+            """Fallback TclError for environments without tkinter"""
+            pass
 
 # Add project root
 project_root = Path(__file__).parent.parent
@@ -123,8 +138,12 @@ def _reset_state(mode: str = "all") -> None:
 
 def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     """Assemble the run_final_analysis.py command line with pass-through flags."""
-    # GUI limitation: if user asked parallel_modes>1 + gui, fall back to rich for the child
-    child_progress = "rich" if (args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1) else args.progress
+    # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
+    child_progress = args.progress
+    if args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1:
+        # Only force fallback on macOS, where Tk must run in the main thread.
+        if platform.system() == "Darwin":
+            child_progress = "rich"
     cmd = [
         sys.executable, "-u", "analysis/run_final_analysis.py",
         "--mode", "ALL" if args.modes.lower() == "all" else args.modes,
@@ -207,8 +226,16 @@ def main() -> None:
                    help="Disable file logging")
     p.add_argument("--fsync-logs", action="store_true",
                    help="Force fsync on each write")
+    p.add_argument("--inhibit-sleep", action="store_true",
+                   help="Prevent the OS from sleeping while the pipeline runs")
+    p.add_argument("--keep-display-on", action="store_true",
+                   help="Also keep the display awake (Windows/macOS)")
 
     args = p.parse_args()
+
+    # Auto-enable sleep inhibition when GUI is requested
+    if args.progress == "gui":
+        args.inhibit_sleep = True
 
     # Apply preset configurations
     if args.preset:
@@ -249,12 +276,12 @@ def main() -> None:
             
             # Optimize performance (but allow manual override)
             if args.max_workers is None and not args.extreme_mode and not args.beast_mode:
-                args.beast_mode = True  # Use P-cores with margin
+                args.extreme_mode = True  # Use max P-core threads (changed from beast_mode)
             
             print("🏆 IEEE preset applied: publication-grade configuration")
             print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
             print(f"   • Target CI: {args.target_ci}, All modes, Both ablations")
-            print(f"   • Supplementary: {args.supplementary}, Performance: {'beast-mode' if args.beast_mode else 'default'}")
+            print(f"   • Supplementary: {args.supplementary}, Performance: {'extreme-mode' if args.extreme_mode else 'default'}")
 
     # Initialize master-level logging
     if not args.no_log:
@@ -264,6 +291,65 @@ def main() -> None:
     if args.reset:
         print(f"⚠  Reset requested: {args.reset}. Deleting saved data under {RESULTS_DIR} ...")
         _reset_state(args.reset)
+
+    class SleepInhibitor:
+        def __init__(self):
+            self._proc = None
+        def __enter__(self):
+            try:
+                sysname = platform.system()
+                if sysname == "Windows":
+                    import ctypes
+                    ES_CONTINUOUS=0x80000000; ES_SYSTEM_REQUIRED=0x00000001; ES_AWAYMODE_REQUIRED=0x00000040; ES_DISPLAY_REQUIRED=0x00000002
+                    
+                    # Try with away mode first (preferred for background work)
+                    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+                    if getattr(self, '_keep_display_on', False):
+                        flags |= ES_DISPLAY_REQUIRED
+                    
+                    result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                    if result == 0:
+                        print("⚠️  Away mode failed, trying fallback without ES_AWAYMODE_REQUIRED...")
+                        # Fallback: remove away mode requirement
+                        flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                        if getattr(self, '_keep_display_on', False):
+                            flags |= ES_DISPLAY_REQUIRED
+                        result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                        
+                        if result == 0:
+                            print("⚠️  Sleep inhibition failed even with fallback flags")
+                        else:
+                            print("🛡️  Sleep inhibited (Windows fallback mode - no away mode).")
+                    else:
+                        print("🛡️  Sleep inhibited (Windows with away mode).")
+                        
+                elif sysname == "Darwin":
+                    self._proc = subprocess.Popen(
+                        ["/usr/bin/caffeinate", "-dimsu", "-w", str(os.getpid())])
+                    print("🛡️  Sleep inhibited via caffeinate (macOS).")
+                else:
+                    # systemd-inhibit blocks sleep while this child lives
+                    self._proc = subprocess.Popen(
+                        ["systemd-inhibit", "--what=idle:sleep", "--why=MCvD run",
+                         "sleep", "infinity"])
+                    print("🛡️  Sleep inhibited via systemd-inhibit (Linux).")
+            except Exception as e:
+                print(f"⚠️  Could not inhibit sleep: {e}")
+            return self
+        def __exit__(self, *exc):
+            try:
+                if platform.system() == "Windows":
+                    import ctypes
+                    result = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
+                    if result == 0:
+                        print("⚠️  Warning: Failed to restore execution state (Windows).")
+            except Exception:
+                pass
+            try:
+                if self._proc:
+                    self._proc.terminate()
+            except Exception:
+                pass
 
     # Resolve ablation plan
     if args.ablation == "on":
@@ -303,6 +389,43 @@ def main() -> None:
         steps.extend(["supplementary", "appendix"])
 
     pm = ProgressManager(mode=args.progress, gui_session_meta=session_meta)
+    
+    # Add global stop mechanism
+    master_cancelled = threading.Event()
+    current_process: Optional[subprocess.Popen] = None
+    process_lock = threading.Lock()
+    
+    def stop_callback():
+        """Called when GUI stop button is pressed."""
+        print("\n🛑 GUI Stop button pressed - initiating graceful shutdown...")
+        master_cancelled.set()
+        
+        # Terminate current subprocess if any
+        with process_lock:
+            if current_process is not None:
+                try:
+                    print("   → Terminating active subprocess...")
+                    if os.name == "nt":
+                        current_process.send_signal(signal.CTRL_BREAK_EVENT)
+                    else:
+                        killpg = getattr(os, 'killpg', None)
+                        if killpg and hasattr(current_process, 'pid'):
+                            killpg(current_process.pid, signal.SIGTERM)
+                        else:
+                            current_process.terminate()
+                except Exception as e:
+                    print(f"   ⚠️  Error terminating subprocess: {e}")
+                    try:
+                        current_process.terminate()
+                    except Exception:
+                        pass
+    
+    # Connect stop callback to progress manager
+    if hasattr(pm, 'set_stop_callback'):
+        pm.set_stop_callback(stop_callback)
+    else:
+        print("⚠️  Stop button not available in this ProgressManager version")
+    
     overall = pm.task(total=len(steps), description="Master Pipeline", key="overall", kind="overall")
     sub = {s: pm.task(total=1, description=s.replace("_"," ").title(),
                       parent="overall", key=("step", s), kind="mode") for s in steps}
@@ -310,53 +433,174 @@ def main() -> None:
     state: Dict[str, Any] = _load_state() if args.resume and not args.reset else {}
     t0 = time.time()
 
+    # Initialize ctx to prevent "possibly unbound" error
+    ctx = None
+    
     try:
+        ctx = SleepInhibitor() if args.inhibit_sleep else None
+        if ctx and args.keep_display_on:
+            setattr(ctx, "_keep_display_on", True)
+        if ctx:
+            ctx.__enter__()
+            
+        # Enhanced _run function to track current process
+        def _run_tracked(cmd: List[str]) -> int:
+            """Run a command with process tracking for stop button."""
+            nonlocal current_process
+            
+            if master_cancelled.is_set():
+                print("🛑 Run cancelled before starting")
+                return 130  # Standard cancellation exit code
+            
+            creationflags = 0
+            preexec_fn = None
+            if os.name == "nt":
+                creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+            else:
+                preexec_fn = getattr(os, 'setsid', None)
+            
+            with process_lock:
+                current_process = subprocess.Popen(
+                    cmd, cwd=project_root,
+                    creationflags=creationflags, 
+                    preexec_fn=preexec_fn
+                )
+            
+            try:
+                # Poll for completion or cancellation
+                while current_process.poll() is None:
+                    if master_cancelled.is_set():
+                        print("🛑 Cancelling due to stop button...")
+                        try:
+                            if os.name == "nt":
+                                current_process.send_signal(signal.CTRL_BREAK_EVENT)
+                            else:
+                                killpg = getattr(os, 'killpg', None)
+                                if killpg:
+                                    killpg(current_process.pid, signal.SIGTERM)
+                                else:
+                                    current_process.terminate()
+                        except Exception:
+                            current_process.terminate()
+                        return 130
+                    time.sleep(0.1)  # Check every 100ms
+                
+                return current_process.returncode
+                
+            except KeyboardInterrupt:
+                print("\n^C received — stopping child process...", flush=True)
+                try:
+                    if os.name == "nt":
+                        current_process.send_signal(signal.CTRL_BREAK_EVENT)
+                    else:
+                        killpg = getattr(os, 'killpg', None)
+                        if killpg:
+                            killpg(current_process.pid, signal.SIGTERM)
+                        else:
+                            current_process.terminate()
+                except Exception:
+                    current_process.terminate()
+                return current_process.wait()
+            finally:
+                with process_lock:
+                    current_process = None
+
         # --- Simulations per ablation state ---
         def _do_one_ablation(use_ctrl: bool) -> int:
+            if master_cancelled.is_set():
+                return 130
+                
             skey = "simulate_ctrl_on" if use_ctrl else "simulate_ctrl_off"
             if args.resume and state.get(skey, {}).get("done"):
                 print(f"↩️  Resume: skipping {skey} (already done)")
                 return 0
             cmd = _build_run_final_cmd(args, use_ctrl=use_ctrl)
             print(f"\n🧪 Simulate ({'CTRL' if use_ctrl else 'NoCTRL'}):\n  $ {' '.join(cmd)}\n")
-            rc = _run(cmd)
+            rc = _run_tracked(cmd)  # Use tracked runner
             if rc == 0:
                 _mark_done(state, skey)
+            elif rc == 130:
+                print(f"🛑 Simulation cancelled: {skey}")
             return rc
 
+        # Run ablations (check cancellation between each)
         if args.ablation_parallel and len(ablation_runs) == 2:
-            # Launch CTRL ON/OFF concurrently (each will internally interleave modes if requested)
-            with ThreadPoolExecutor(max_workers=2) as tpool:
-                futs = [tpool.submit(_do_one_ablation, use) for use in ablation_runs]
-                for f, use in zip(as_completed(futs), ablation_runs):
-                    rc = f.result()
+            # Run CTRL ON/OFF concurrently and still honor stop
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futs = {pool.submit(_do_one_ablation, use): use for use in ablation_runs}
+                for fut in as_completed(futs):
+                    if master_cancelled.is_set():
+                        # Cancel remaining futures
+                        for f in futs:
+                            f.cancel()
+                        break
+                    use = futs[fut]
+                    rc = fut.result()
                     key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
-                    if rc != 0:
-                        sub[key].close(); overall.close(); pm.stop(); sys.exit(rc)
+                    if rc == 130:
+                        sub[key].close(); overall.close(); pm.stop()
+                        print("🛑 Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        sub[key].close(); overall.close(); pm.stop()
+                        sys.exit(rc)
                     sub[key].update(1); sub[key].close(); overall.update(1)
         else:
             for use in ablation_runs:
+                if master_cancelled.is_set():
+                    break
                 rc = _do_one_ablation(use)
                 key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
-                if rc != 0:
-                    sub[key].close(); overall.close(); pm.stop(); sys.exit(rc)
+                if rc == 130:  # Cancellation
+                    sub[key].close(); overall.close(); pm.stop()
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    sub[key].close(); overall.close(); pm.stop()
+                    sys.exit(rc)
                 sub[key].update(1); sub[key].close(); overall.update(1)
+
+        # Check cancellation before each major step
+        if master_cancelled.is_set():
+            overall.close(); pm.stop()
+            print("🛑 Master pipeline stopped by user")
+            sys.exit(130)
 
         # --- Comparative plots (Fig.7/10/11) ---
         if not (args.resume and state.get("plots", {}).get("done")):
-            rc = _run([sys.executable, "-u", "analysis/generate_comparative_plots.py"])
-            if rc != 0:
+            rc = _run_tracked([sys.executable, "-u", "analysis/generate_comparative_plots.py"])
+            if rc == 130:
+                sub["plots"].close(); overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
                 sub["plots"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "plots")
         sub["plots"].update(1); sub["plots"].close(); overall.update(1)
 
+        # Check cancellation before ISI step
+        if master_cancelled.is_set():
+            overall.close(); pm.stop()
+            print("🛑 Master pipeline stopped by user")
+            sys.exit(130)
+
         # --- ISI trade-off ---
         if not (args.resume and state.get("isi", {}).get("done")):
-            rc = _run([sys.executable, "-u", "analysis/plot_isi_tradeoff.py"])
-            if rc != 0:
+            rc = _run_tracked([sys.executable, "-u", "analysis/plot_isi_tradeoff.py"])
+            if rc == 130:
+                sub["isi"].close(); overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
                 sub["isi"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "isi")
         sub["isi"].update(1); sub["isi"].close(); overall.update(1)
+
+        # Check cancellation before hybrid step
+        if master_cancelled.is_set():
+            overall.close(); pm.stop()
+            print("🛑 Master pipeline stopped by user")
+            sys.exit(130)
 
         # --- Hybrid multidimensional benchmarks (Stage 10) ---
         if not (args.resume and state.get("hybrid", {}).get("done")):
@@ -370,11 +614,21 @@ def main() -> None:
             hybrid_cmd = [sys.executable, "-u", hybrid_script]
             if args.realistic_onsi:
                 hybrid_cmd.append("--realistic-onsi")
-            rc = _run(hybrid_cmd)
-            if rc != 0:
+            rc = _run_tracked(hybrid_cmd)
+            if rc == 130:
+                sub["hybrid"].close(); overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
                 sub["hybrid"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "hybrid")
         sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
+
+        # Check cancellation before nb_replicas step
+        if master_cancelled.is_set():
+            overall.close(); pm.stop()
+            print("🛑 Master pipeline stopped by user")
+            sys.exit(130)
 
         # --- Optional notebook-replica panels (if present) ---
         if not (args.resume and state.get("nb_replicas", {}).get("done")):
@@ -386,46 +640,93 @@ def main() -> None:
             ]:
                 script_path = Path(script)
                 if not script_path.exists():
-                    print(f"⚠️  Skipping optional notebook script: {script} (not found)")
-                    continue
-                rc = _run([sys.executable, "-u", script])
-                if rc != 0:
+                    print(f"⚠️  Script not found: {script}"); continue
+                rc = _run_tracked([sys.executable, "-u", script])
+                if rc == 130:
+                    sub["nb_replicas"].close(); overall.close(); pm.stop()
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
                     sub["nb_replicas"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "nb_replicas")
         sub["nb_replicas"].update(1); sub["nb_replicas"].close(); overall.update(1)
 
+        # Check cancellation before tables step
+        if master_cancelled.is_set():
+            overall.close(); pm.stop()
+            print("🛑 Master pipeline stopped by user")
+            sys.exit(130)
+
         # --- Tables (Table I & II) ---
         if not (args.resume and state.get("tables", {}).get("done")):
-            rc = _run([sys.executable, "-u", "analysis/param_table.py"])
-            if rc != 0:
+            rc = _run_tracked([sys.executable, "-u", "analysis/param_table.py"])
+            if rc == 130:
+                sub["tables"].close(); overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
                 sub["tables"].close(); overall.close(); pm.stop(); sys.exit(rc)
-            rc = _run([sys.executable, "-u", "analysis/table_maker.py"])
-            if rc != 0:
+            rc = _run_tracked([sys.executable, "-u", "analysis/table_maker.py"])
+            if rc == 130:
+                sub["tables"].close(); overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
                 sub["tables"].close(); overall.close(); pm.stop(); sys.exit(rc)
             _mark_done(state, "tables")
         sub["tables"].update(1); sub["tables"].close(); overall.update(1)
 
         # --- Supplementary (optional) ---
         if "supplementary" in sub:
+            if master_cancelled.is_set():
+                overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
             if not (args.resume and state.get("supplementary", {}).get("done")):
-                rc = _run([sys.executable, "-u", "analysis/generate_supplementary_figures.py",
+                rc = _run_tracked([sys.executable, "-u", "analysis/generate_supplementary_figures.py",
                            "--strict", "--only-data"])
-                if rc != 0:
+                if rc == 130:
+                    sub["supplementary"].close(); overall.close(); pm.stop()
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
                     sub["supplementary"].close(); overall.close(); pm.stop(); sys.exit(rc)
                 _mark_done(state, "supplementary")
             sub["supplementary"].update(1); sub["supplementary"].close(); overall.update(1)
 
         if "appendix" in sub:
+            if master_cancelled.is_set():
+                overall.close(); pm.stop()
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
             if not (args.resume and state.get("appendix", {}).get("done")):
-                rc = _run([sys.executable, "-u", "analysis/diagnose_csk.py"])
-                if rc != 0:
+                rc = _run_tracked([sys.executable, "-u", "analysis/diagnose_csk.py"])
+                if rc == 130:
+                    sub["appendix"].close(); overall.close(); pm.stop()
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
                     sub["appendix"].close(); overall.close(); pm.stop(); sys.exit(rc)
                 _mark_done(state, "appendix")
             sub["appendix"].update(1); sub["appendix"].close(); overall.update(1)
 
+    except KeyboardInterrupt:
+        print("\n🛑 Master pipeline interrupted")
+        overall.close()
+        pm.stop()
+        sys.exit(130)
     finally:
         overall.close()
         pm.stop()
+        try:
+            if ctx is not None:  # Changed from checking if 'ctx' in locals()
+                ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    if master_cancelled.is_set():
+        print("🛑 Master pipeline stopped by user")
+        sys.exit(130)
 
     elapsed = (time.time() - t0) / 60.0
     print(f"\n✓ All steps completed in {elapsed:.1f} min")

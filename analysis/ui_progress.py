@@ -1,7 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, Union, TYPE_CHECKING
-import time, threading, queue, math, sys
+from typing import Any, Dict, Optional, Tuple, Union, TYPE_CHECKING, Callable
+import time
+import math
+import threading
+import queue
+import platform
 
 # For better type hints
 if TYPE_CHECKING:
@@ -60,6 +64,10 @@ class _GuiBackend:
         self.root: Optional[Any] = None  # Fix: Use Any instead of TkWidget
         self.frames: Dict[str, Any] = {}  # Fix: Use Any instead of TkWidget
         self.status_var: Optional[Any] = None  # Fix: Use Any instead of tk.StringVar
+        # Add stop button infrastructure
+        self.stop_button: Optional[Any] = None
+        self.stop_callback: Optional[Callable[[], None]] = None
+        self.stop_pressed: bool = False
 
     # -------------- public --------------
     def start(self) -> None:
@@ -75,6 +83,10 @@ class _GuiBackend:
             if not self.thread.is_alive(): break
             time.sleep(0.01)
 
+    def set_stop_callback(self, callback: Callable[[], None]) -> None:
+        """Set the callback function to call when stop button is pressed."""
+        self.stop_callback = callback
+
     # -------------- ui thread --------------
     def _run(self) -> None:
         import tkinter as tk
@@ -88,10 +100,22 @@ class _GuiBackend:
         root.protocol("WM_DELETE_WINDOW", lambda: self.post({"type":"stop"}))
         root.minsize(720, 420)
 
-        # --- Top header (flags / modes / resume) ---
+        # --- Top header (flags / modes / resume) with STOP button ---
         header = ttk.Frame(root, padding=8); header.pack(side="top", fill="x")
         title = ttk.Label(header, text="Tri‑Channel OECT Simulator", font=("TkDefaultFont", 12, "bold"))
         title.pack(side="left")
+
+        # Add stop button to the right side of header
+        stop_frame = ttk.Frame(header)
+        stop_frame.pack(side="right")
+        
+        self.stop_button = ttk.Button(
+            stop_frame, 
+            text="🛑 STOP", 
+            command=self._on_stop_clicked,
+            width=10
+        )
+        self.stop_button.pack(side="right", padx=(0, 10))
 
         self.status_var = tk.StringVar(value="Status: preparing…")
         status = ttk.Label(header, textvariable=self.status_var)
@@ -124,8 +148,7 @@ class _GuiBackend:
                 while processed < max_per_tick:
                     evt = self.events.get_nowait()
                     if evt["type"] == "stop":
-                        # Schedule destroy on Tk's own event loop; avoids cross-thread destroy
-                        root.after(0, root.destroy)
+                        root.quit()
                         return
                     self._handle_event(evt)
                     processed += 1
@@ -142,6 +165,31 @@ class _GuiBackend:
             # If Tk crashes (e.g., after sleep/wake), log it but don't crash the whole program
             print(f"⚠️  GUI crashed: {e}. Simulation continues in background.")
             pass
+
+    def _on_stop_clicked(self) -> None:
+        """Handle stop button click - trigger graceful shutdown."""
+        if self.stop_pressed:
+            return  # Prevent double-clicks
+        
+        self.stop_pressed = True
+        
+        # Update button state to show it's been pressed
+        if self.stop_button:
+            self.stop_button.configure(text="🛑 STOPPING...", state="disabled")
+        
+        # Update status
+        if self.status_var:
+            self.status_var.set("Status: Stopping simulation...")
+        
+        # Trigger the callback (will set CANCEL event)
+        if self.stop_callback:
+            try:
+                self.stop_callback()
+            except Exception as e:
+                print(f"⚠️  Stop callback error: {e}")
+        
+        # Post stop event to the GUI event loop
+        self.post({"type": "user_stop"})
 
     def _meta_summary(self) -> str:
         # Build a compact, fixed string; persists at top
@@ -195,6 +243,14 @@ class _GuiBackend:
 
     def _handle_event(self, evt: Dict[str, Any]) -> None:
         t = evt.get("type")
+        
+        if t == "user_stop":
+            # User clicked stop - show feedback but don't close GUI yet
+            # (let the main process handle cleanup and close)
+            if self.status_var:
+                self.status_var.set("Status: Shutdown requested...")
+            return
+            
         if t == "set_status":
             mode = evt.get("mode"); sweep = evt.get("sweep")
             txt = "Status: "
@@ -295,16 +351,26 @@ class _GuiBackend:
                 if row._smoothed_rate is None:
                     row._smoothed_rate = current_rate
                 else:
-                    alpha = 0.3
-                    row._smoothed_rate = alpha * current_rate + (1 - alpha) * row._smoothed_rate
+                    row._smoothed_rate = 0.3 * current_rate + 0.7 * row._smoothed_rate
                 
                 remaining = (row.total - row.completed) / max(row._smoothed_rate, 1e-9)
                 rem = _fmt_hms(remaining)
             
             lbl_txt = self._label_with_stats(key)
             frame, lbl, bar, eta_lbl = row.widget
-            lbl.configure(text=lbl_txt)
-            eta_lbl.configure(text=f"elapsed: {_fmt_hms(elapsed)}  •  eta: {rem}")
+            
+            # Harden widget updates against sleep/wake cycles
+            try:
+                if lbl.winfo_exists():
+                    lbl.configure(text=lbl_txt)
+            except Exception:  # Covers TclError and others
+                pass
+            
+            try:
+                if eta_lbl.winfo_exists():
+                    eta_lbl.configure(text=f"elapsed: {_fmt_hms(elapsed)}  •  eta: {rem}")
+            except Exception:
+                pass
 
 # ---------------------- Public Manager ------------------------------
 
@@ -321,8 +387,8 @@ class ProgressManager:
         if self.mode == "gui":
             try:
                 # Quick import check for headless environments / macOS constraints
-                import tkinter as _tk  # noqa: F401
-                import platform, threading
+                import tkinter as tk  # noqa: F401
+                import platform
                 if platform.system() == "Darwin" and threading.current_thread() is not threading.main_thread():
                     # Tk on macOS must run on the main thread; fall back gracefully
                     print("⚠️  GUI not supported on macOS (must run in main thread). Falling back to 'rich'.")
@@ -354,6 +420,11 @@ class ProgressManager:
             except Exception:
                 self.mode = "none"
 
+    def set_stop_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback to be called when GUI stop button is pressed."""
+        if self._gui is not None:
+            self._gui.set_stop_callback(callback)
+
     # --- session header ticker ---
     def set_status(self, mode: Optional[str] = None, sweep: Optional[str] = None) -> None:
         if self._gui is not None:  # Fix: More explicit None check
@@ -374,13 +445,13 @@ class ProgressManager:
                     self._completed = 0
                 def update(self, n: int = 1, description: Optional[str] = None):
                     self._completed += n
-                    if mgr._gui is not None:  # Fix: Add None check inside proxy
+                    if mgr._gui is not None:
                         mgr._gui.post({"type":"update_task","key":key,"inc":n,"label":description})
                 def set_description(self, text: str):
-                    if mgr._gui is not None:  # Fix: Add None check inside proxy
+                    if mgr._gui is not None:
                         mgr._gui.post({"type":"update_task","key":key,"inc":0,"label":text})
                 def close(self):
-                    if mgr._gui is not None:  # Fix: Add None check inside proxy
+                    if mgr._gui is not None:
                         mgr._gui.post({"type":"close_task","key":key})
                 @property
                 def completed(self) -> int:
@@ -395,10 +466,9 @@ class ProgressManager:
                     self._completed = 0
                 def update(self, n: int = 1, description: Optional[str] = None):
                     self._completed += n
+                    progress.update(task_id, advance=n)
                     if description:
-                        progress.update(task_id, advance=n, description=description)
-                    else:
-                        progress.update(task_id, advance=n)
+                        progress.update(task_id, description=description)
                 def set_description(self, text: str):
                     progress.update(task_id, description=text)
                 def close(self):
@@ -406,6 +476,7 @@ class ProgressManager:
                 @property
                 def completed(self) -> int:
                     return self._completed
+
             # remember task so we can update totals later
             self._rich_tasks[key] = task_id
             return _RichProxy()
@@ -418,25 +489,19 @@ class ProgressManager:
                     self._completed = 0
                 def update(self, n: int = 1, description: Optional[str] = None):
                     self._completed += n
-                    if description:
-                        try:
-                            bar.set_description_str(description, refresh=False)
-                        except Exception:
-                            pass
                     bar.update(n)
+                    if description:
+                        bar.set_description(description)
                 def set_description(self, text: str):
-                    try:
-                        bar.set_description_str(text, refresh=False)
-                    except Exception:
-                        pass
+                    bar.set_description(text)
                 def close(self):
-                    try:
-                        bar.close()
-                    except Exception:
-                        pass
+                    bar.close()
+                    if key in mgr._tqdm_bars:
+                        del mgr._tqdm_bars[key]
                 @property
                 def completed(self) -> int:
                     return self._completed
+
             self._tqdm_bars[key] = bar
             return _TqdmProxy()
 
@@ -474,7 +539,7 @@ class ProgressManager:
                 bar = self._tqdm_bars[key]
                 bar.total = int(total)
                 if label:
-                    bar.set_description_str(label, refresh=False)
+                    bar.set_description(label)
                 bar.refresh()
             except Exception:
                 pass

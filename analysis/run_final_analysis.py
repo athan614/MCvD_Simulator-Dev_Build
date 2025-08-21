@@ -27,6 +27,7 @@ import hashlib
 import threading
 import queue as pyqueue
 import signal
+import subprocess
 
 # Add project root to path
 project_root = Path(__file__).parent.parent if (Path(__file__).parent.name == "analysis") else Path(__file__).parent
@@ -52,6 +53,67 @@ class CPUConfig(TypedDict):
     e_cores_logical: List[int]
     p_core_count: int
     total_p_threads: int
+    
+class SleepInhibitor:
+    """Cross-platform sleep inhibition for long-running simulations."""
+    def __init__(self):
+        self._proc = None
+    def __enter__(self):
+        try:
+            sysname = platform.system()
+            if sysname == "Windows":
+                import ctypes
+                ES_CONTINUOUS=0x80000000; ES_SYSTEM_REQUIRED=0x00000001; ES_AWAYMODE_REQUIRED=0x00000040; ES_DISPLAY_REQUIRED=0x00000002
+                
+                # Try with away mode first (preferred for background work)
+                flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+                if getattr(self, '_keep_display_on', False):
+                    flags |= ES_DISPLAY_REQUIRED
+                
+                result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                if result == 0:
+                    print("⚠️  Away mode failed, trying fallback without ES_AWAYMODE_REQUIRED...")
+                    # Fallback: remove away mode requirement
+                    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                    if getattr(self, '_keep_display_on', False):
+                        flags |= ES_DISPLAY_REQUIRED
+                    result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                    
+                    if result == 0:
+                        print("⚠️  Sleep inhibition failed even with fallback flags")
+                    else:
+                        print("🛡️  Sleep inhibited (Windows fallback mode - no away mode).")
+                else:
+                    print("🛡️  Sleep inhibited (Windows with away mode).")
+                    
+            elif sysname == "Darwin":
+                self._proc = subprocess.Popen(
+                    ["/usr/bin/caffeinate", "-dimsu", "-w", str(os.getpid())])
+                print("🛡️  Sleep inhibited via caffeinate (macOS).")
+            else:
+                # systemd-inhibit blocks sleep while this child lives
+                self._proc = subprocess.Popen(
+                    ["systemd-inhibit", "--what=idle:sleep", "--why=MCvD run",
+                     "sleep", "infinity"])
+                print("🛡️  Sleep inhibited via systemd-inhibit (Linux).")
+        except Exception as e:
+            print(f"⚠️  Could not inhibit sleep: {e}")
+        return self
+        
+    def __exit__(self, *exc):
+        try:
+            if platform.system() == "Windows":
+                import ctypes
+                result = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
+                if result == 0:
+                    print("⚠️  Could not restore Windows power state")
+        except Exception:
+            pass
+        try:
+            if self._proc:
+                self._proc.terminate()
+        except Exception:
+            pass
 
 # ============= CPU DETECTION & OPTIMIZATION =============
 CPU_COUNT = mp.cpu_count()
@@ -116,7 +178,11 @@ class GlobalProcessPool:
         return cls._instance
 
     def get_pool(self, max_workers: Optional[int] = None, mode: str = "optimal") -> ProcessPoolExecutor:
-        resolved_workers = max_workers or get_optimal_workers(mode)
+        # If a pool already exists and caller did not request a change, keep it as-is.
+        if self._pool is not None and max_workers is None:
+            return t.cast(ProcessPoolExecutor, self._pool)
+        # Otherwise resolve desired size; prefer the current size if present.
+        resolved_workers = max_workers or (self._max_workers or get_optimal_workers(mode))
         if self._pool is None or self._max_workers != resolved_workers:
             if self._pool:
                 self._pool.shutdown(wait=True)
@@ -191,6 +257,9 @@ def _install_signal_handlers():
                 pass
 
 # ============= CALIBRATION CACHE =============
+# Maximum calibration cache entries before cleanup (prevent memory bloat)
+MAX_CACHE_SIZE = 50
+
 calibration_cache: Dict[str, Dict[str, Union[float, List[float]]]] = {}
 
 def get_cache_key(cfg: Dict[str, Any]) -> str:
@@ -356,10 +425,18 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
 
     if save_to_file:
         try:
-            with open(threshold_file, 'w', encoding='utf-8') as f:  # Add encoding='utf-8'
+            tmp = threshold_file.with_suffix(threshold_file.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(thresholds, f, indent=2)
+            os.replace(tmp, threshold_file)
         except Exception:
-            pass
+            # Best-effort; calibration can be recomputed if needed
+            try:
+                tmp = threshold_file.with_suffix(threshold_file.suffix + ".tmp")
+                if tmp.exists(): 
+                    tmp.unlink()
+            except Exception:
+                pass
 
     return thresholds
 
@@ -372,6 +449,14 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int]) -> Dict[s
         return calibration_cache[cache_key]
     # IMPORTANT: persist to file (save_to_file=True) and do not force recalibration here
     result = calibrate_thresholds(cfg, seeds, recalibrate=False, save_to_file=True, verbose=False)
+    
+    # Bound cache size to prevent memory bloat during long sweeps
+    if len(calibration_cache) >= MAX_CACHE_SIZE:
+        # Remove oldest entries (FIFO eviction)
+        oldest_keys = list(calibration_cache.keys())[:len(calibration_cache) - MAX_CACHE_SIZE + 1]
+        for old_key in oldest_keys:
+            del calibration_cache[old_key]
+    
     calibration_cache[cache_key] = result
     return result
 
@@ -464,23 +549,69 @@ def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
     df.to_csv(tmp, index=False)
     os.replace(tmp, csv_path)
 
+def _with_file_lock(path: Path, fn: Callable[[], None], timeout_s: float = 60.0) -> None:
+    """Very small cross-platform lock via .lock sentinel file."""
+    lock = path.with_suffix(path.suffix + ".lock")
+    t0 = time.time()
+    while True:
+        try:
+            # O_CREAT|O_EXCL -> exclusive create
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            try:
+                fn()
+            finally:
+                try:
+                    lock.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return
+        except FileExistsError:
+            if (time.time() - t0) > timeout_s:
+                # Improved: Force cleanup stale lock and retry once more
+                print(f"⚠️  CSV lock timeout ({timeout_s}s) for {path.name}, attempting cleanup...")
+                try:
+                    lock.unlink(missing_ok=True)  # Remove potentially stale lock
+                    time.sleep(0.1)  # Brief pause
+                    # Try once more with the cleaned lock
+                    fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                    try:
+                        fn()
+                    finally:
+                        try:
+                            lock.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    # Last resort: warn and proceed without lock
+                    print(f"⚠️  CSV lock cleanup failed for {path.name}, proceeding without lock protection")
+                    return fn()
+            time.sleep(0.1)
+
 def append_row_atomic(csv_path: Path, row: Dict[str, Any], columns: Optional[List[str]] = None) -> None:
     """
-    Append a single row to a CSV using write-then-rename for crash safety.
+    Append a row with a lock + atomic rename. Read *and* write occur under the lock
+    to prevent lost updates when multiple processes append concurrently.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     new_row = pd.DataFrame([row])
     if columns is not None:
         new_row = new_row.reindex(columns=columns)
-    if csv_path.exists():
-        try:
-            existing = pd.read_csv(csv_path)
-            combined = pd.concat([existing, new_row], ignore_index=True)
-        except Exception:
+
+    def _read_and_write():
+        if csv_path.exists():
+            try:
+                existing = pd.read_csv(csv_path)
+                combined = pd.concat([existing, new_row], ignore_index=True)
+            except Exception:
+                combined = new_row
+        else:
             combined = new_row
-    else:
-        combined = new_row
-    _atomic_write_csv(csv_path, combined)
+        _atomic_write_csv(csv_path, combined)
+
+    _with_file_lock(csv_path, _read_and_write)
 
 def load_completed_values(csv_path: Path, key: str, use_ctrl: Optional[bool] = None) -> set:
     """Return the set of completed sweep values for resume, optionally filtered by CTRL state."""
@@ -495,7 +626,9 @@ def load_completed_values(csv_path: Path, key: str, use_ctrl: Optional[bool] = N
         
         for cand in (key, 'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol'):
             if cand in df.columns:
-                return set(pd.to_numeric(df[cand], errors='coerce').dropna().tolist())
+                vals = pd.to_numeric(df[cand], errors='coerce').dropna().tolist()
+                # Normalize to canonical string keys (avoids float equality pitfalls)
+                return set(_value_key(v) for v in vals)
     except Exception:
         pass
     return set()
@@ -559,7 +692,10 @@ def read_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int,
     p = seed_cache_path(mode, sweep, value, seed, use_ctrl, cache_tag)
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            # Ensure the seed tag is present even for older cache files
+            data.setdefault("__seed", int(seed))
+            return data
         except Exception:
             return None
     return None
@@ -569,9 +705,33 @@ def write_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int,
     cache_path = seed_cache_path(mode, sweep, value, seed, use_ctrl, cache_tag)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with open(tmp, "w", encoding='utf-8') as f:  # Add encoding='utf-8'
-        json.dump(payload, f, indent=2)
+    # Tag the payload with its seed for later de‑duplication in aggregations
+    payload = dict(payload)
+    payload.setdefault("__seed", int(seed))
+    with open(tmp, "w", encoding='utf-8') as f:
+        json.dump(_json_safe(payload), f, indent=2)
     os.replace(tmp, cache_path)
+
+def _lod_state_path(mode: str, dist_um: float, use_ctrl: bool) -> Path:
+    ctrl_seg = "wctrl" if use_ctrl else "noctrl"
+    base = project_root / "results" / "cache" / mode.lower() / "lod_state" / ctrl_seg
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"d{int(dist_um)}um_state.json"
+
+def _lod_state_load(mode: str, dist_um: float, use_ctrl: bool) -> Optional[Dict[str, Any]]:
+    p = _lod_state_path(mode, dist_um, use_ctrl)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+def _lod_state_save(mode: str, dist_um: float, use_ctrl: bool, state: Dict[str, Any]) -> None:
+    p = _lod_state_path(mode, dist_um, use_ctrl)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
 
 # ============= ARGUMENTS =============
 def parse_arguments() -> argparse.Namespace:
@@ -595,8 +755,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--no-ctrl", dest="use_ctrl", action="store_false", help="Disable CTRL subtraction (ablation)")
     parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none"], default="tqdm",
                     help="Progress UI backend")
-    parser.add_argument("--nt-pairs", type=str, default="", help="Comma-separated NT pairs for CSK pair sweeps, e.g. GLU-GABA,GLU-DA,ACH-GABA")
-    # Stage 13: Adaptive seeds   
+    parser.add_argument("--nt-pairs", type=str, default="", help="CSV nt-pairs for CSK sweeps")
+    parser.add_argument("--watchdog-secs", type=int, default=1800,
+                        help="Soft timeout for seed completion before retry hint (default: 1800s/30min)") 
     parser.add_argument("--target-ci", type=float, default=0.0,
                         help="If >0, stop adding seeds once Wilson 95% CI half-width <= target. 0 disables.")
     parser.add_argument("--min-ci-seeds", type=int, default=6,
@@ -611,8 +772,17 @@ def parse_arguments() -> argparse.Namespace:
                         help="Disable file logging")
     parser.add_argument("--fsync-logs", action="store_true", 
                         help="Force fsync on each write")
+    parser.add_argument("--inhibit-sleep", action="store_true",
+                        help="Prevent the OS from sleeping while the pipeline runs")
+    parser.add_argument("--keep-display-on", action="store_true",
+                        help="Also keep the display awake (Windows/macOS)")
     parser.set_defaults(use_ctrl=True)
     args = parser.parse_args()
+    
+    # Auto-enable sleep inhibition when GUI is requested
+    if args.progress == "gui":
+        args.inhibit_sleep = True
+        
     # Normalize: prefer --modes if provided
     if args.modes is not None:
         args.mode = "ALL" if args.modes.lower() == "all" else args.modes
@@ -799,7 +969,7 @@ def run_sweep(cfg: Dict[str, Any],
         key = 'pipeline_Nm_per_symbol' if sweep_param == 'pipeline.Nm_per_symbol' else sweep_param
         desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
         done = load_completed_values(persist_csv, key, desired_ctrl)
-        values_to_run = [v for v in sweep_values if v not in done]
+        values_to_run = [v for v in sweep_values if _value_key(v) not in done]
         if done:
             print(f"↩️  Resume: skipping {len(done)} already-completed values for use_ctrl={desired_ctrl}")
 
@@ -916,6 +1086,7 @@ def run_sweep(cfg: Dict[str, Any],
         slot_count = max(1, getattr(global_pool, "_max_workers", CPU_COUNT or 4))
         free_slots = deque(range(slot_count))
         fut_slot: Dict[Any, int] = {}
+        fut_seed: Dict[Any, int] = {}  # NEW: Track which seed each future handles
         
         while (idx < len(seeds_to_run) or pending) and not CANCEL.is_set():
             # top-up
@@ -926,6 +1097,7 @@ def run_sweep(cfg: Dict[str, Any],
                     sweep_name=sweep_folder, cache_tag=cache_tag
                 )
                 pending.add(fut)
+                fut_seed[fut] = s  # NEW: Track which seed this future handles
                 
                 # Assign a stable slot
                 if pm:
@@ -935,13 +1107,16 @@ def run_sweep(cfg: Dict[str, Any],
                     else:
                         slot = free_slots.popleft()
                     fut_slot[fut] = slot
-                    pm.worker_update(slot, f"{sweep_name} | {sweep_param}={v} | seed {s}")
+                    if hasattr(pm, "worker_update"):
+                        pm.worker_update(slot, f"{sweep_name} | {sweep_param}={v} | seed {s}")
                 idx += 1
             # wait for one to finish
             if pending and not CANCEL.is_set():  # Only process if we have pending futures
+                wd = int(cfg.get('_watchdog_secs', 600))  # NEW: Configurable timeout
                 try:
-                    done_fut = next(as_completed(pending, timeout=600))
+                    done_fut = next(as_completed(pending, timeout=wd))
                     pending.remove(done_fut)
+                    fut_seed.pop(done_fut, None)  # NEW: Clean up seed tracking
                     try:
                         res = done_fut.result(timeout=10)  # Quick result extraction
                     except Exception as e:
@@ -954,43 +1129,42 @@ def run_sweep(cfg: Dict[str, Any],
                     if pm:
                         slot = fut_slot.pop(done_fut, -1)  # Use -1 as default instead of None
                         if slot >= 0:  # Only update if we had a valid slot
-                            pm.worker_update(slot, "idle")
+                            if hasattr(pm, "worker_update"):
+                                pm.worker_update(slot, "idle")
                             free_slots.append(slot)
                     
                     job_bar.update(1)
                 except TimeoutError:
-                    # Enhanced: Log timeout details and implement retry logic
-                    timed_out_futures = list(pending)
-                    print(f"        ⚠️  Timeout (600s) for {sweep_param}={v}, {len(timed_out_futures)} futures pending")
+                    print(f"        ⚠️  Timeout ({wd}s) for {sweep_param}={v}, {len(pending)} futures pending")
                     
-                    # Enhanced: Attempt one retry for the oldest future
-                    if timed_out_futures:
-                        oldest_future = timed_out_futures[0]
-                        pending.remove(oldest_future)
+                    # Pick a reproducible future to retry: the one with the smallest seed
+                    if pending:
+                        to_retry = min(pending, key=lambda f: fut_seed.get(f, 1<<31))
+                        seed_r = fut_seed.get(to_retry, seeds_to_run[0] if seeds_to_run else 12345)  # FIX: Provide default seed
                         
-                        # Log which seed likely timed out (approximate)
-                        approx_seed_idx = len(results) + len(pending)
-                        if approx_seed_idx < len(seeds_to_run):
-                            approx_seed = seeds_to_run[approx_seed_idx]
-                            print(f"        🔄 Retrying seed {approx_seed} for {sweep_param}={v}")
-                            
-                            # Submit retry with shorter timeout
-                            retry_fut = pool.submit(
-                                run_param_seed_combo, cfg, sweep_param, v, approx_seed, 
-                                debug_calibration, thresholds_override,
-                                sweep_name=sweep_folder, cache_tag=f"{cache_tag}_retry" if cache_tag else "retry"
-                            )
-                            pending.add(retry_fut)
+                        # Try to cancel the old future if it hasn't started
+                        if to_retry.cancel():
+                            print(f"        ✅ Cancelled stale future for seed {seed_r}")
+                            pending.remove(to_retry)
+                            fut_seed.pop(to_retry, None)
                         else:
-                            print(f"        ❌ Dropping timed-out future for {sweep_param}={v}")
-                            job_bar.update(1)  # Update progress bar for dropped job
+                            print(f"        ⚠️  Could not cancel running future for seed {seed_r}")
+                        
+                        print(f"        🔄 Retrying seed {seed_r} for {sweep_param}={v}")
+                        retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
+                        retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
+                                              debug_calibration, thresholds_override,
+                                              sweep_name=sweep_folder, cache_tag=retry_tag)
+                        pending.add(retry_fut)
+                        fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
+                    continue  # NEW: Skip to next iteration after timeout handling
 
                 # adaptive early-stop when enough seeds and CI small enough
                 if target_ci > 0.0 and len(results) >= min_ci_seeds:
                     if _current_halfwidth() <= target_ci:
                         print(f"        ✓ Early stop: CI halfwidth {_current_halfwidth():.6f} ≤ {target_ci}")
                         # Progress bar nicety: complete the bar when stopping early
-                        remaining_not_submitted = len(seeds_to_run) - (idx + 1)
+                        remaining_not_submitted = len(seeds_to_run) - idx
                         still_pending = len(pending)
                         remaining = remaining_not_submitted + still_pending
                         if remaining > 0:
@@ -1003,12 +1177,25 @@ def run_sweep(cfg: Dict[str, Any],
                     
         # If cancellation was requested, try to cancel any still-pending futures
         if CANCEL.is_set():
+            global_pool.cancel_pending()  # Optional: immediate GUI feedback
             for f in list(pending):
                 f.cancel()
             break  # stop processing more values
 
         if not results:
             continue
+
+        # --- Aggregate across unique seeds (drop duplicate retries) ---
+        if any("__seed" in r for r in results):
+            by_seed: Dict[int, Dict[str, Any]] = {}
+            for r in results:
+                sid = int(r.get("__seed", -1))
+                if sid not in by_seed:
+                    by_seed[sid] = r
+                else:
+                    # Prefer the later write (e.g., retry) if you want; either is fine
+                    by_seed[sid] = r
+            results = list(by_seed.values())
 
         # Aggregate across seeds for this value
         total_symbols = len(results) * cfg['pipeline']['sequence_length']
@@ -1071,11 +1258,10 @@ def run_sweep(cfg: Dict[str, Any],
             row['csk_ser'] = csk_errors / total_symbols
 
         aggregated_rows.append(row)
-
-        # Append immediately if requested
+        
+        # Append this value's aggregated row immediately (crash‑safe)
         if persist_csv is not None:
-            persist_cols = list(row.keys())
-            append_row_atomic(persist_csv, row, persist_cols)
+            append_row_atomic(persist_csv, row, list(row.keys()))
 
     job_bar.close()
     if not pm:  # Only stop if we created our own local_pm
@@ -1088,15 +1274,25 @@ def run_sweep(cfg: Dict[str, Any],
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      target_ser: float = 0.01,
                      debug_calibration: bool = False,
-                     progress_cb: Optional[Any] = None) -> Tuple[Union[int, float], float, int]:
+                     progress_cb: Optional[Any] = None,
+                     resume: bool = False,
+                     cache_tag: Optional[str] = None) -> Tuple[Union[int, float], float, int]:
     nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
     nm_max = 100000
     lod_nm: float = float('nan')
     best_ser: float = 1.0
     dist_um = cfg_base['pipeline'].get('distance_um', 0)
+    mode_name = cfg_base['pipeline']['modulation']
+    use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
+    
+    # Load prior state if resuming
+    state = _lod_state_load(mode_name, float(dist_um), use_ctrl) if resume else None
+    if state:
+        nm_min = int(state.get("nm_min", nm_min))
+        nm_max = int(state.get("nm_max", nm_max))
+        print(f"    ↩️  Resuming LoD search @ {dist_um}μm: range {nm_min}-{nm_max}")
     
     # Extract CTRL state for debug logging
-    use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
     ctrl_str = "CTRL" if use_ctrl else "NoCtrl"
 
     for iteration in range(20):
@@ -1118,30 +1314,73 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         for k, v in thresholds.items():
             cfg_test['pipeline'][k] = v
 
+        # --- Gather cached seed results first (if any) ---
         results: List[Dict[str, Any]] = []
         k_err = 0
         n_seen = 0
         seq_len = int(cfg_test['pipeline']['sequence_length'])
-        delta = float(cfg_base.get("_stage13_lod_delta", 1e-4))
-        # loop seeds with screening
-        for i, seed in enumerate(seeds):
-            cfg_run = deepcopy(cfg_test)
-            cfg_run['pipeline']['random_seed'] = seed
-            cfg_run['disable_progress'] = True
-            try:
-                r = run_sequence(cfg_run)
-            except Exception:
-                r = None
+        tested_nm = {}
+        if state and "tested" in state and str(nm_mid) in state["tested"]:
+            tested_nm = state["tested"][str(nm_mid)]
+        
+        # pull cached seeds from disk
+        cached = []
+        for sd in seeds:
+            r = read_seed_cache(mode_name, "lod_search", nm_mid, sd, use_ctrl,
+                                cache_tag=cache_tag)
             if r is not None:
-                results.append(r)
-                k_err += int(r.get('errors', 0))
+                cached.append((sd, r))
+        
+        for sd, r in cached:
+            results.append(r)
+            k_err += int(r.get('errors', 0))
+            n_seen += seq_len
+            if progress_cb is not None:
+                try: 
+                    progress_cb.put_nowait(1)
+                except Exception: 
+                    pass
+        
+        # Fallback: if nothing was cached but we have a saved tally, reuse it
+        if not cached and tested_nm:
+            k_err = int(tested_nm.get("k_err", 0))
+            n_seen = int(tested_nm.get("n_seen", 0))
+        
+        delta = float(cfg_base.get("_stage13_lod_delta", 1e-4))
+        
+        # loop remaining (non-cached) seeds with screening
+        for i, seed in enumerate(seeds):
+            # skip if already cached
+            if any(sd == seed for sd, _ in cached):
+                continue
+            
+            # reuse our generic worker to also persist the per-seed result
+            res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm_mid, seed,
+                                       debug_calibration=False,
+                                       thresholds_override=thresholds,
+                                       sweep_name="lod_search",
+                                       cache_tag=cache_tag)
+            if res is not None:
+                results.append(res)
+                k_err += int(res.get('errors', 0))
                 n_seen += seq_len
-                # Progress callback for completed validation seed
                 if progress_cb is not None:
-                    try:
+                    try: 
                         progress_cb.put_nowait(1)
-                    except Exception:
+                    except Exception: 
                         pass
+                
+                # persist search checkpoint after each seed
+                checkpoint = {
+                    "nm_min": nm_min, "nm_max": nm_max, "iteration": iteration,
+                    "last_nm": nm_mid,
+                    "tested": {
+                        **(state.get("tested", {}) if state else {}),
+                        str(nm_mid): {"k_err": k_err, "n_seen": n_seen}
+                    }
+                }
+                _lod_state_save(mode_name, float(dist_um), use_ctrl, checkpoint)
+                
                 # Deterministic screen: if even worst/best remaining cannot cross target
                 decide_below, decide_above = _deterministic_screen(
                     k_err, n_seen, len(seeds)*seq_len, target_ser
@@ -1152,16 +1391,23 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 low, high = _hoeffding_bounds(k_err, n_seen, delta=delta)
                 if high < target_ser or low > target_ser:
                     break
-            if i % 3 == 0:
-                print(f"      [{dist_um}μm] Nm={nm_mid}: seed {i+1}/{len(seeds)}")
+            # light heartbeat
+            if (len(results) % 3) == 0:
+                print(f"      [{dist_um}μm] Nm={nm_mid}: {len(results)}/{len(seeds)} seeds")
 
-        if not results:
+        # Compute SER using either real per-seed results or checkpoint tallies
+        if results:
+            total_symbols = len(results) * cfg_test['pipeline']['sequence_length']
+            total_errors = sum(cast(int, r['errors']) for r in results)
+            ser = total_errors / total_symbols if total_symbols > 0 else 1.0
+        elif n_seen > 0:
+            # Resume path: use previously saved (k_err, n_seen) for this Nm
+            ser = k_err / n_seen
+            print(f"      [{dist_um}μm|{ctrl_str}] Nm={nm_mid}: SER≈{ser:.4f} (checkpoint)")
+        else:
+            # No information collected for this Nm; move to higher Nm
             nm_min = nm_mid + 1
             continue
-
-        total_symbols = len(results) * cfg_test['pipeline']['sequence_length']
-        total_errors = sum(cast(int, r['errors']) for r in results)
-        ser = total_errors / total_symbols if total_symbols > 0 else 1.0
 
         print(f"      [{dist_um}μm|{ctrl_str}] Nm={nm_mid}: SER={ser:.4f} {'✓ PASS' if ser <= target_ser else '✗ FAIL'}")
 
@@ -1171,6 +1417,11 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             nm_max = nm_mid - 1
         else:
             nm_min = nm_mid + 1
+        
+        # persist bounds after each iteration
+        _lod_state_save(mode_name, float(dist_um), use_ctrl,
+                        {"nm_min": nm_min, "nm_max": nm_max, "iteration": iteration,
+                         "last_nm": nm_mid})
 
     if math.isnan(lod_nm) and nm_min <= 100000:
         print(f"    [{dist_um}μm|{ctrl_str}] Final check at Nm={nm_min}")
@@ -1215,7 +1466,8 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
 def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                              seeds: List[int], target_ser: float = 0.01,
                              debug_calibration: bool = False,
-                             progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+                             progress_cb: Optional[Any] = None,
+                             resume: bool = False) -> Dict[str, Any]:
     """
     Process a single distance for LoD calculation.
     Returns dict with lod_nm, ser_at_lod, and data_rate_bps.
@@ -1228,7 +1480,11 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     cfg['pipeline']['symbol_period_s'] = calculate_dynamic_symbol_period(dist_um, cfg)
     
     try:
-        lod_nm, ser_at_lod, actual_progress = find_lod_for_ser(cfg, seeds, target_ser, debug_calibration, progress_cb)
+        cache_tag = f"d{int(dist_um)}um"
+        lod_nm, ser_at_lod, actual_progress = find_lod_for_ser(
+            cfg, seeds, target_ser, debug_calibration, progress_cb,
+            resume=resume, cache_tag=cache_tag
+        )
         
         # Calculate data rate at LoD
         if not np.isnan(lod_nm):
@@ -1362,6 +1618,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     else:
         lod_sigma_median = float('nan')
 
+    # mark LoD state as done (clean checkpoint)
+    try:
+        done_state = {"done": True, "nm_min": lod_nm, "nm_max": lod_nm}
+        _lod_state_save(cfg['pipeline']['modulation'], float(dist_um),
+                        bool(cfg['pipeline'].get('use_control_channel', True)), done_state)
+    except Exception:
+        pass
+    
     return {
         'distance_um': dist_um,
         'lod_nm': lod_nm,
@@ -1585,9 +1849,17 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                         # Use normalized 'ser' key (run_single_instance converts 'SER' → 'ser')
                         # and attached 'symbol_period_s' metadata
                         ser_val = float(res.get('ser', res.get('SER', 1.0)))  # fallback chain
+                        mosk_err = int(res.get('subsymbol_errors', {}).get('mosk', 0))
+                        csk_err  = int(res.get('subsymbol_errors', {}).get('csk', 0))
+                        L        = int(cfg['pipeline']['sequence_length'])
+                        # Best-effort: convert component error counts to SER fractions
+                        mosk_ser_val = (mosk_err / L) if L > 0 else float('nan')
+                        csk_ser_val  = (csk_err  / L) if L > 0 else float('nan')
                         ts_val = float(res.get('symbol_period_s', cfg['pipeline']['symbol_period_s']))
                         seed_results.append({
                             'ser': ser_val,
+                            'mosk_ser': mosk_ser_val,
+                            'csk_ser': csk_ser_val,
                             'symbol_period_s': ts_val
                         })
                 except Exception as e:
@@ -1603,7 +1875,9 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     'distance_um': d,
                     'guard_factor': g,
                     'symbol_period_s': median_ts,
-                    'ser': median_ser
+                    'ser': median_ser,
+                    'mosk_ser': float(np.nanmedian([r['mosk_ser'] for r in seed_results])),
+                    'csk_ser':  float(np.nanmedian([r['csk_ser']  for r in seed_results]))
                 })
     
     if rows:
@@ -1672,6 +1946,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_target_ci'] = float(args.target_ci)
     cfg['_stage13_min_ci_seeds'] = int(args.min_ci_seeds)
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
+    cfg['_watchdog_secs'] = int(args.watchdog_secs)
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
@@ -1698,7 +1973,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
     ser_jobs = len(nm_values) * args.num_seeds
-    lod_jobs = len(distances) * args.num_seeds * 8  # estimate
+    lod_seed_cap = 10
+    lod_jobs = len(distances) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
     isi_jobs = (len(guard_values) * args.num_seeds) if (not args.disable_isi) else 0
 
     # Hierarchy
@@ -1901,7 +2177,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                     inc = q.get(timeout=0.25)
                     if inc is None:
                         break
-                    bar.update(int(inc))
+                    if bar is not None:
+                        bar.update(int(inc))
                 except pyqueue.Empty:
                     pass
         t = threading.Thread(target=_drain, daemon=True)
@@ -1927,24 +2204,26 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     # --- NEW: Create per-worker progress bars ---
     worker_bars = {}
-    for wid in range(maxw):
-        # Use same estimated_per_distance per worker as a coarse total
-        worker_bars[wid] = pm.worker_task(
-            worker_id=wid, 
-            total=estimated_per_distance, 
-            label=f"Worker {wid:02d}",
-            parent=lod_key if hierarchy_supported else None
-        )
+    if hierarchy_supported:
+        for wid in range(maxw):
+            worker_bars[wid] = pm.worker_task(
+                worker_id=wid, 
+                total=estimated_per_distance, 
+                label=f"Worker {wid:02d}",
+                parent=lod_key
+            )
 
     future_to_dist: Dict[Any, int] = {}
     future_worker: Dict[Any, int] = {}    # stable worker mapping
     for i, dist in enumerate(d_run):
         wid = i % max(1, maxw)
-        pm.worker_update(wid, f"LoD | d={dist} μm")
+        if hasattr(pm, "worker_update"):
+            pm.worker_update(wid, f"LoD | d={dist} μm")
         
         # Pass the queue instead of a lambda callback
         q = progress_queues[dist]
-        future = pool.submit(process_distance_for_lod, dist, cfg, seeds[:10], 0.01, args.debug_calibration, q)
+        future = pool.submit(process_distance_for_lod, dist, cfg, seeds[:lod_seed_cap], 0.01,
+                            args.debug_calibration, q, args.resume)
         future_to_dist[future] = dist
         future_worker[future] = wid
 
@@ -1966,14 +2245,34 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             res = {}
         finally:
             # Mark this worker as idle
-            pm.worker_update(wid, "idle")
+            if hasattr(pm, "worker_update"):
+                pm.worker_update(wid, "idle")
             # NEW: increment worker bar by the actual work performed for that distance
             actual_total = res.get('actual_progress', estimated_per_distance)
-            if wid in worker_bars:
+            if hierarchy_supported and wid in worker_bars:
                 worker_bars[wid].update(actual_total)
+            # NEW: stop the per-distance drainer cleanly
+            try:
+                queue_for_cleanup: Optional[Any] = progress_queues.get(dist)
+                if queue_for_cleanup is not None:
+                    queue_for_cleanup.put_nowait(None)  # sentinel for drainer
+                t, stop_evt = drainers.get(dist, (None, None))
+                if stop_evt is not None:
+                    stop_evt.set()
+            except Exception:
+                pass
 
-        # Append atomically per distance
-        append_row_atomic(lod_csv, res, list(res.keys()))
+        # Append atomically per distance (only if we have a real result)
+        if res and len(res.keys()) > 0:
+            # NEW: Only append if res has meaningful data
+            if res and len(res.keys()) > 0:
+                append_row_atomic(lod_csv, res, list(res.keys()))
+            else:
+                # Keep the CSV clean: skip empty / failed results
+                pass
+        else:
+            # Keep the CSV clean: skip empty / failed results
+            pass
         lod_results.append(res)
 
         if res and not pd.isna(res.get('lod_nm', np.nan)):
@@ -1988,7 +2287,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             # Create the correct dist_key for this specific distance
             current_dist_key = ("dist", mode, "LoD", float(dist))
             
-            if hierarchy_supported and bar:
+            if hierarchy_supported and bar and hasattr(pm, "update_total"):
                 pm.update_total(key=current_dist_key, total=actual_total,
                                 label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
                 
@@ -1996,7 +2295,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 dist_totals[dist] = actual_total
                 
                 # NEW: update the parent LoD row with sum of actual totals
-                if hierarchy_supported and lod_bar:
+                if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
                     pm.update_total(key=lod_key, total=sum(dist_totals.values()),
                                     label="LoD vs distance", kind="sweep", parent=mode_key)
                 
@@ -2005,15 +2304,25 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 if bar:
                     bar.close()
 
-    # Close remaining distance bars
+    # Close remaining distance bars and stop any drainers just in case
     for bar in distance_bars.values():
         if bar:
             bar.close()
+    for dist, (t, stop_evt) in drainers.items():
+        try:
+            if stop_evt is not None:
+                stop_evt.set()
+            cleanup_queue: Optional[Any] = progress_queues.get(dist)
+            if cleanup_queue is not None:
+                cleanup_queue.put_nowait(None)
+        except Exception:
+            pass
 
     # NEW: Close worker bars
-    for bar in worker_bars.values():
-        if bar:
-            bar.close()
+    if hierarchy_supported:
+        for bar in worker_bars.values():
+            if bar:
+                bar.close()
     
     # NEW: Clean up the multiprocessing manager
     try:
@@ -2130,11 +2439,18 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     pm.stop()
 
 def main() -> None:
+    # Install signal handlers for graceful cancellation
+    _install_signal_handlers()
+    
     args = parse_arguments()
     
-    # Guard: avoid multiple Tk windows when interleaving modes
-    if args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1:
-        print("⚠️  GUI + --parallel-modes>1 not supported reliably; falling back to 'rich'.")
+    # Auto-enable sleep inhibition when GUI is requested
+    if args.progress == "gui":
+        args.inhibit_sleep = True
+    
+    # Guard: avoid multiple Tk windows when interleaving modes (macOS only)
+    if platform.system() == "Darwin" and args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1:
+        print("⚠️  macOS Tkinter limitation → falling back to 'rich'.")
         args.progress = "rich"
     
     # Setup logging with the tee approach
@@ -2144,10 +2460,17 @@ def main() -> None:
     # Determine which modes to run
     modes = (["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode])
     
-    # Initialize the shared process pool once
-    global_pool.get_pool(args.max_workers)
+    # Initialize sleep inhibition context
+    ctx = None
     
     try:
+        ctx = SleepInhibitor() if args.inhibit_sleep else None
+        if ctx and args.keep_display_on:
+            setattr(ctx, "_keep_display_on", True)
+        if ctx:
+            ctx.__enter__()
+        
+        # Existing parallel/sequential execution logic
         if args.parallel_modes > 1 and len(modes) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             n = min(args.parallel_modes, len(modes))
@@ -2159,7 +2482,16 @@ def main() -> None:
         else:
             for m in modes:
                 run_one_mode(args, m)
+                
+    except KeyboardInterrupt:
+        print("\n🛑 Analysis interrupted")
+        sys.exit(130)
     finally:
+        try:
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+        except Exception:
+            pass
         global_pool.shutdown()
         
 def integration_test_noise_correlation() -> None:
