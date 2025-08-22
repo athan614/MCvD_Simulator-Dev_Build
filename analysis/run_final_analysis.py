@@ -1034,10 +1034,11 @@ def run_sweep(cfg: Dict[str, Any],
             thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds)
 
     # Determine how many seed-jobs remain (for progress accounting)
+    # --- NEW: resolve sweep folder early (for seed cache lookups) ---
     if "Nm_per_symbol" in sweep_param:
         sweep_folder = "ser_vs_nm"
     elif "distance_um" in sweep_param:
-        sweep_folder = "lod_vs_distance"
+        sweep_folder = "lod_vs_distance"  # (only used for aggregated CSV; LoD search is handled elsewhere)
     elif "guard_factor" in sweep_param:
         sweep_folder = "isi_tradeoff"
     else:
@@ -1045,23 +1046,59 @@ def run_sweep(cfg: Dict[str, Any],
 
     mode_name = cfg['pipeline']['modulation']
     use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-    
+
+    # --- NEW: compute "planned total" and "already done" for prefill ---
+    planned_total_jobs = len(sweep_values) * len(seeds)
+    done_jobs = 0
+
+    def _value_done_in_csv(val) -> bool:
+        if persist_csv is None or not persist_csv.exists():
+            return False
+        try:
+            df = pd.read_csv(persist_csv)
+            if sweep_param == 'pipeline.Nm_per_symbol':
+                csv_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df.columns else 'pipeline.Nm_per_symbol'
+            elif sweep_param == 'pipeline.guard_factor':
+                csv_key = 'guard_factor' if 'guard_factor' in df.columns else 'pipeline.guard_factor'
+            else:
+                csv_key = sweep_param
+            if csv_key not in df.columns:
+                return False
+            df2 = df
+            if 'use_ctrl' in df2.columns:
+                df2 = df2[df2['use_ctrl'] == use_ctrl]
+            vals = pd.to_numeric(df2[csv_key], errors='coerce').dropna().tolist()
+            return _value_key(val) in { _value_key(v) for v in vals }
+        except Exception:
+            return False
+
+    # Count completed seed-jobs across ALL sweep values
+    for v in sweep_values:
+        if _value_done_in_csv(v):
+            done_jobs += len(seeds)
+        else:
+            for s in seeds:
+                if read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None:
+                    done_jobs += 1
+
     def _seed_done(v, s):
         return read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None if resume else False
-    total_jobs = sum(1 for v in values_to_run for s in seeds if not _seed_done(v, s))
 
-    # Optional enhancement: Add CTRL state to progress display
-    use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-    ctrl_display = "CTRL" if use_ctrl else "NoCtrl"
-    display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({ctrl_display})"
+    # Original "total_jobs" only counts remaining (we keep it for batching logic)
+    total_jobs_remaining = sum(1 for v in values_to_run for s in seeds if not _seed_done(v, s))
 
-    # Create or update the progress bar
+    # --- Create/bind the bar with the FULL total, and prefill ---
+    display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({'CTRL' if use_ctrl else 'NoCtrl'})"
     if sweep_key and pm:
-        # Create or bind the task with the correct total under the intended parent
-        job_bar = pm.task(total=total_jobs, description=display_name,
+        # Update totals for the already-created keyed row
+        job_bar = pm.task(total=planned_total_jobs, description=display_name,
                         key=sweep_key, parent=parent_key, kind="sweep")
     else:
-        job_bar = local_pm.task(total=total_jobs, description=display_name)
+        job_bar = local_pm.task(total=planned_total_jobs, description=display_name)
+
+    if done_jobs > 0:
+        # Jump the bar to reflect completed work
+        job_bar.update(done_jobs)
 
     # Collect rows
     aggregated_rows: List[Dict[str, Any]] = []
@@ -1085,8 +1122,6 @@ def run_sweep(cfg: Dict[str, Any],
         
         # Account instantly for cached seeds in the bar
         results: List[Dict[str, Any]] = list(cached_results)
-        if cached_results:
-            job_bar.update(len(cached_results))
 
         # Stage 13: adaptive seed batches
         target_ci = float(cfg.get("_stage13_target_ci", 0.0))
@@ -1174,11 +1209,14 @@ def run_sweep(cfg: Dict[str, Any],
                     job_bar.update(1)
                 except TimeoutError:
                     print(f"        ⚠️  Timeout ({wd}s) for {sweep_param}={v}, {len(pending)} futures pending")
-                    
                     # Pick a reproducible future to retry: the one with the smallest seed
                     if pending:
                         to_retry = min(pending, key=lambda f: fut_seed.get(f, 1<<31))
                         seed_r = fut_seed.get(to_retry, seeds_to_run[0] if seeds_to_run else 12345)  # FIX: Provide default seed
+                        
+                        # Enhanced logging for timeout retry tracking
+                        print(f"        🔍 Timeout details: {sweep_param}={v}, seed={seed_r}, "
+                              f"timeout={wd}s, pending_count={len(pending)}, worker_count={getattr(global_pool, '_max_workers', 'unknown')}")
                         
                         # Try to cancel the old future if it hasn't started
                         if to_retry.cancel():
@@ -2549,23 +2587,75 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     # ---------- 2) LoD vs Distance ----------
     print("\n2. Building LoD vs distance curve…")
-    # Resolve distance grid: CLI > config > safe default
     if args.distances:
         d_run = [int(x) for x in args.distances.split(",") if x.strip()]
     else:
-        try:
+        if 'distances_um' in cfg:
             d_run = [int(x) for x in cfg['distances_um']]
-        except Exception:
+        else:
             d_run = [25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150, 175, 200]
     lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
     pm.set_status(mode=mode, sweep="LoD vs distance")
     optimal_workers = get_optimal_workers("beast" if args.beast_mode else "optimal")
     pool = global_pool.get_pool(max_workers=optimal_workers)
     maxw = optimal_workers
+    use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
 
-    # Calculate actual total after all distances complete, or use dynamic updating
-    estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5  # Keep for initial estimate
-    lod_jobs = len(d_run) * estimated_per_distance  # Use estimate for initial parent bar
+    estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5
+
+    # --- NEW: find fully-completed distances for this CTRL state ---
+    done_distances: set[int] = set()
+    if args.resume and lod_csv.exists():
+        df_prev = None
+        try:
+            df_prev = pd.read_csv(lod_csv)
+        except Exception as e:
+            print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
+            df_prev = None
+
+        if df_prev is not None:
+            # Respect CTRL state if present
+            if 'use_ctrl' in df_prev.columns:
+                df_prev = df_prev[df_prev['use_ctrl'] == bool(cfg['pipeline'].get('use_control_channel', True))]
+
+            if 'lod_nm' in df_prev.columns:
+                # Base success mask: finite & > 0
+                lod_nm_num = pd.to_numeric(df_prev['lod_nm'], errors='coerce')
+                success_mask = lod_nm_num.gt(0) & np.isfinite(lod_nm_num)
+
+                # Optional: require SER success when available
+                if 'ser_at_lod' in df_prev.columns:
+                    ser_num = pd.to_numeric(df_prev['ser_at_lod'], errors='coerce')
+                    # 0.01 is the default target in this script; change if you use a different target
+                    success_mask &= ser_num.le(0.01)
+
+                df_successful = df_prev[success_mask].copy()
+
+                # If multiple rows per distance exist, keep the last
+                if 'distance_um' in df_successful.columns:
+                    df_successful = (
+                        df_successful
+                        .sort_index()                # assumes later appends have larger index
+                        .drop_duplicates(['distance_um'], keep='last')
+                    )
+
+                    done_distances = {
+                        int(x) for x in pd.to_numeric(
+                            df_successful['distance_um'], errors='coerce'
+                        ).dropna().tolist()
+                    }
+
+                if done_distances:
+                    print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
+                          f"{sorted(done_distances)} μm")
+            else:
+                # Old CSV without lod_nm → just don't prefill
+                print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
+
+    # Worklist excludes done distances
+    d_run_work = [int(d) for d in d_run if int(d) not in done_distances]
+
+    lod_jobs = len(d_run) * estimated_per_distance
     lod_key = ("sweep", mode, "LoD")
     if hierarchy_supported:
         lod_bar = pm.task(total=lod_jobs, description="LoD vs distance",
@@ -2601,19 +2691,31 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Create individual distance progress bars FIRST with accurate totals
     distance_bars = {} # binary search + data-rate + sigma sampling
     dist_totals = {}  # NEW: track actual totals
+
     for d_um in d_run:
         dist_key = ("dist", mode, "LoD", float(d_um))
-        dist_bar = None
         if hierarchy_supported:
             dist_bar = pm.task(total=estimated_per_distance,
-                            description=f"LoD @ {d_um:.0f}μm",
+                            description=f"LoD @ {float(d_um):.0f}μm",
                             parent=lod_key, key=dist_key, kind="dist")
-        distance_bars[d_um] = dist_bar
-        dist_totals[d_um] = estimated_per_distance  # initial guess
+        else:
+            dist_bar = None
+        distance_bars[int(d_um)] = dist_bar
+        dist_totals[int(d_um)] = estimated_per_distance
+
+        if int(d_um) in done_distances:
+            # Prefill 100% and close; also bubble progress to parents
+            if dist_bar:
+                dist_bar.update(estimated_per_distance)
+                dist_bar.close()
+            # No queue/drainer for completed distances
+            continue
+
+        # Not done yet: set up queue & drainer
         q = mgr.Queue(maxsize=1000)
-        progress_queues[d_um] = q
-        t, stop_evt = _start_drain_thread(d_um, dist_bar, q)
-        drainers[d_um] = (t, stop_evt)
+        progress_queues[int(d_um)] = q
+        t, stop_evt = _start_drain_thread(int(d_um), dist_bar, q)
+        drainers[int(d_um)] = (t, stop_evt)
 
     # --- NEW: Create per-worker progress bars ---
     worker_bars = {}
@@ -2681,36 +2783,37 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             return all_seeds[:lod_num_seeds_arg]
 
     # Submit distance jobs in batches for effective warm-start
-    future_to_dist: Dict[Any, float] = {}  # Changed int to float for distance
+    future_to_dist: Dict[Any, float] = {}
     future_worker: Dict[Any, int] = {}
-    last_lod_guess: Optional[int] = None  # NEW: track warm-start guess
-    batch_size = 3  # Process 3 distances at a time for warm-start effectiveness
-    
+    last_lod_guess: Optional[int] = None
+    batch_size = 3
     lod_results: List[Dict[str, Any]] = []
-    
-    for i in range(0, len(d_run), batch_size):
-        batch_d = d_run[i:i+batch_size]  # ascending distances
+
+    # Ensure we only process distances that have progress queues
+    d_run_work_with_queues = [d for d in d_run_work if d in progress_queues]
+
+    for i in range(0, len(d_run_work_with_queues), batch_size):
+        batch_d = d_run_work_with_queues[i:i+batch_size]
         future_to_dist.clear()
         future_worker.clear()
-        
-        # Submit batch
+
         for j, dist in enumerate(batch_d):
             wid = (i + j) % max(1, maxw)
             if hasattr(pm, "worker_update"):
                 pm.worker_update(wid, f"LoD | d={dist} μm")
-            q = progress_queues[dist]
             
-            # Distance-specific seed selection (moved inside loop)
+            # Now we know this queue exists
+            q = progress_queues[dist]  # Safe to use direct access
+            
             seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
-            # Store full seeds in args for validation
             args.full_seeds = seeds
-            
+
             future = pool.submit(
                 process_distance_for_lod, float(dist), cfg, seeds_for_lod, 0.01,
                 args.debug_calibration, q, args.resume, args,
-                warm_lod_guess=last_lod_guess  # now warm-start is meaningful
+                warm_lod_guess=last_lod_guess
             )
-            future_to_dist[future] = float(dist)  # Store as float
+            future_to_dist[future] = float(dist)
             future_worker[future] = wid
 
         # Process batch results and update warm-start guess
@@ -2729,7 +2832,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 if res and not pd.isna(res.get('lod_nm', np.nan)):
                     last_lod_guess = int(res['lod_nm'])
             except TimeoutError:
-                print(f"⚠️  LoD timeout at {dist}μm, skipping")
+                print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout=7200s), skipping")
                 res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
             except Exception as ex:
                 print(f"💥 Distance processing failed for {dist}μm: {ex}")
@@ -2784,8 +2887,22 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                     
                     # NEW: update the parent LoD row with sum of actual totals
                     if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
-                        pm.update_total(key=lod_key, total=sum(dist_totals.values()),
+                        new_lod_total = sum(dist_totals.values())
+                        pm.update_total(key=lod_key, total=new_lod_total,
                                         label="LoD vs distance", kind="sweep", parent=mode_key)
+                        
+                        # Also update overall total to reflect actual work
+                        if overall_key:
+                            # Calculate difference between estimated and actual LoD work
+                            original_lod_estimate = len(d_run) * estimated_per_distance
+                            actual_lod_total = new_lod_total
+                            lod_diff = actual_lod_total - original_lod_estimate
+                            
+                            # Update overall total if there's a significant difference
+                            if abs(lod_diff) > 0:
+                                new_overall_total = ser_jobs + actual_lod_total + isi_jobs
+                                pm.update_total(key=overall_key, total=new_overall_total,
+                                                label=f"Overall ({mode})", kind="overall")
                     
                     remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
                     if remaining > 0: bar.update(remaining)
