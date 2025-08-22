@@ -141,19 +141,43 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
     plt.close(fig)
 
 def plot_figure_10_11_combined(results: Dict[str, Dict[str, pd.DataFrame]], save_dir: Path):
-    # Figure 10 - unchanged
+    # Figure 10 - ENHANCED: Separate CTRL states
     plt.figure(figsize=(10, 5.7))
     colors = {'MoSK': '#0072B2', 'CSK': '#009E73', 'Hybrid': '#D55E00'}
     markers = {'MoSK': 'o', 'CSK': 's', 'Hybrid': '^'}
+    
+    # CTRL state styling
+    ctrl_styles = {True: '-', False: '--'}      # with-CTRL: solid, no-CTRL: dashed
+    ctrl_labels = {True: '', False: ' (no CTRL)'}  # suffix for no-CTRL
+    
     for mode in ['MoSK', 'CSK', 'Hybrid']:
         if mode in results and 'lod_vs_distance' in results[mode]:
             df = results[mode]['lod_vs_distance']
-            df_valid = df.dropna(subset=['lod_nm'])
-            if not df_valid.empty:
-                df_valid = df_valid.sort_values('distance_um')
-                plt.semilogy(df_valid['distance_um'], df_valid['lod_nm'],
-                             color=colors[mode], marker=markers[mode],
-                             markersize=8, label=mode, linewidth=2.2)
+            df_clean = df.dropna(subset=['lod_nm'])
+            
+            if not df_clean.empty:
+                # Check if CTRL state separation is needed
+                if 'use_ctrl' in df_clean.columns and df_clean['use_ctrl'].nunique() > 1:
+                    # Separate plotting by CTRL state
+                    for ctrl_state, grp in df_clean.groupby('use_ctrl'):
+                        if grp.empty:
+                            continue
+                        grp_sorted = grp.sort_values('distance_um')
+                        
+                        plt.semilogy(grp_sorted['distance_um'], grp_sorted['lod_nm'],
+                                     color=colors[mode], 
+                                     marker=markers[mode],
+                                     markersize=8,
+                                     label=f"{mode}{ctrl_labels[bool(ctrl_state)]}",
+                                     linewidth=2.2,
+                                     linestyle=ctrl_styles[bool(ctrl_state)],
+                                     alpha=0.9 if ctrl_state else 0.6)  # Fade no-CTRL slightly
+                else:
+                    # Single CTRL state or no CTRL column - original behavior
+                    df_sorted = df_clean.sort_values('distance_um')
+                    plt.semilogy(df_sorted['distance_um'], df_sorted['lod_nm'],
+                                 color=colors[mode], marker=markers[mode],
+                                 markersize=8, label=mode, linewidth=2.2)
     plt.xlabel('Distance (μm)')
     plt.ylabel('Limit of Detection (molecules)')
     plt.title('Figure 10: Comparative LoD vs. Distance')
@@ -164,28 +188,58 @@ def plot_figure_10_11_combined(results: Dict[str, Dict[str, pd.DataFrame]], save
     plt.savefig(save_dir / "fig10_comparative_lod.png", dpi=300)
     plt.close()
 
-    # Figure 11 - ENHANCED with confidence intervals
+    # Figure 11 - ENHANCED with CTRL state separation AND confidence intervals
     plt.figure(figsize=(10, 5.7))
     for mode in ['MoSK', 'CSK', 'Hybrid']:
         if mode in results and 'lod_vs_distance' in results[mode]:
             df = results[mode]['lod_vs_distance']
-            df_valid = df.dropna(subset=['data_rate_bps'])
-            if not df_valid.empty:
-                df_valid = df_valid.sort_values('distance_um')
-                
-                # Main line plot
-                plt.semilogy(df_valid['distance_um'], df_valid['data_rate_bps'],
-                             color=colors[mode], marker=markers[mode],
-                             markersize=8, label=mode, linewidth=2.2)
-                
-                # NEW: Add confidence intervals if available
-                if all(col in df_valid.columns for col in ['data_rate_ci_low', 'data_rate_ci_high']):
-                    ci_valid = df_valid.dropna(subset=['data_rate_ci_low', 'data_rate_ci_high'])
-                    if not ci_valid.empty:
-                        plt.fill_between(ci_valid['distance_um'], 
-                                       ci_valid['data_rate_ci_low'], 
-                                       ci_valid['data_rate_ci_high'],
-                                       color=colors[mode], alpha=0.2)
+            df_clean = df.dropna(subset=['data_rate_bps'])
+            
+            if not df_clean.empty:
+                # Check if CTRL state separation is needed
+                if 'use_ctrl' in df_clean.columns and df_clean['use_ctrl'].nunique() > 1:
+                    # Separate plotting by CTRL state
+                    for ctrl_state, grp in df_clean.groupby('use_ctrl'):
+                        if grp.empty:
+                            continue
+                        grp_sorted = grp.sort_values('distance_um')
+                        
+                        # Main line plot
+                        plt.semilogy(grp_sorted['distance_um'], grp_sorted['data_rate_bps'],
+                                    color=colors[mode], 
+                                    marker=markers[mode],
+                                    markersize=8,
+                                    label=f"{mode}{ctrl_labels[bool(ctrl_state)]}",
+                                    linewidth=2.2,
+                                    linestyle=ctrl_styles[bool(ctrl_state)],
+                                    alpha=0.9 if ctrl_state else 0.6)
+                        
+                        # Confidence intervals if available
+                        if all(col in grp_sorted.columns for col in ['data_rate_ci_low', 'data_rate_ci_high']):
+                            ci_valid = grp_sorted.dropna(subset=['data_rate_ci_low', 'data_rate_ci_high'])
+                            if not ci_valid.empty:
+                                plt.fill_between(ci_valid['distance_um'], 
+                                            ci_valid['data_rate_ci_low'], 
+                                            ci_valid['data_rate_ci_high'],
+                                            color=colors[mode], 
+                                            alpha=0.15 if ctrl_state else 0.08)
+                else:
+                    # Single CTRL state or no CTRL column - original behavior
+                    grp_sorted = df_clean.sort_values('distance_um')
+                    
+                    # Main line plot
+                    plt.semilogy(grp_sorted['distance_um'], grp_sorted['data_rate_bps'],
+                                color=colors[mode], marker=markers[mode],
+                                markersize=8, label=mode, linewidth=2.2)
+                    
+                    # Confidence intervals if available
+                    if all(col in grp_sorted.columns for col in ['data_rate_ci_low', 'data_rate_ci_high']):
+                        ci_valid = grp_sorted.dropna(subset=['data_rate_ci_low', 'data_rate_ci_high'])
+                        if not ci_valid.empty:
+                            plt.fill_between(ci_valid['distance_um'], 
+                                        ci_valid['data_rate_ci_low'], 
+                                        ci_valid['data_rate_ci_high'],
+                                        color=colors[mode], alpha=0.2)
                         
     plt.xlabel('Distance (μm)')
     plt.ylabel('Achievable Data Rate (bps)')

@@ -2241,9 +2241,12 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                                     seeds: List[int]) -> None:
     """
     Generate ISI-distance grid for Hybrid mode 2D visualization.
-    Creates a CSV with (distance_um, guard_factor, symbol_period_s, ser) for heatmaps.
+    Creates a CSV with (distance_um, guard_factor, symbol_period_s, ser, use_ctrl) for heatmaps.
     """
     print(f"🔧 Generating Hybrid ISI-distance grid: {len(distances_um)} distances × {len(guard_grid)} guard factors")
+    
+    # Extract CTRL state from base config
+    use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
     
     rows = []
     for d in distances_um:
@@ -2309,13 +2312,38 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     'symbol_period_s': median_ts,
                     'ser': median_ser,
                     'mosk_ser': float(np.nanmedian([r['mosk_ser'] for r in seed_results])),
-                    'csk_ser':  float(np.nanmedian([r['csk_ser']  for r in seed_results]))
+                    'csk_ser':  float(np.nanmedian([r['csk_ser']  for r in seed_results])),
+                    'use_ctrl': use_ctrl  # NEW: Track CTRL state
                 })
     
     if rows:
-        df = pd.DataFrame(rows)
-        _atomic_write_csv(out_csv, df)
-        print(f"✓ Saved ISI-distance grid: {out_csv} ({len(rows)} points)")
+        # Load existing data and merge with current CTRL state
+        existing_df = pd.DataFrame()
+        if out_csv.exists():
+            try:
+                existing_df = pd.read_csv(out_csv)
+                # Filter out rows with the same CTRL state (we're updating them)
+                if 'use_ctrl' in existing_df.columns:
+                    existing_df = existing_df[existing_df['use_ctrl'] != use_ctrl]
+            except Exception as e:
+                print(f"⚠️  Could not read existing grid CSV: {e}")
+                existing_df = pd.DataFrame()
+        
+        # Combine existing data with new data
+        new_df = pd.DataFrame(rows)
+        if not existing_df.empty:
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            combined_df = new_df
+            
+        # Sort and ensure no duplicates
+        combined_df = combined_df.drop_duplicates(
+            subset=['distance_um', 'guard_factor', 'use_ctrl'], 
+            keep='last'
+        ).sort_values(['use_ctrl', 'distance_um', 'guard_factor'])
+        
+        _atomic_write_csv(out_csv, combined_df)
+        print(f"✓ Saved ISI-distance grid: {out_csv} ({len(rows)} new points, {len(combined_df)} total)")
     else:
         print("⚠️  No valid grid points generated")
 
@@ -3038,7 +3066,24 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]
             isi_grid_csv = data_dir / "isi_grid_hybrid.csv"
             
-            if not (args.resume and isi_grid_csv.exists()):
+            # NEW: Check for current CTRL state data instead of just file existence
+            use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+            skip_grid = False
+            
+            if args.resume and isi_grid_csv.exists():
+                try:
+                    existing_grid = pd.read_csv(isi_grid_csv)
+                    if 'use_ctrl' in existing_grid.columns:
+                        # Check if we already have data for this CTRL state
+                        current_ctrl_data = existing_grid[existing_grid['use_ctrl'] == use_ctrl]
+                        expected_points = len(guard_grid) * len(dist_grid)
+                        if len(current_ctrl_data) >= expected_points:
+                            skip_grid = True
+                            print(f"    ↩️  Resume: ISI grid already complete for use_ctrl={use_ctrl}")
+                except Exception:
+                    pass
+            
+            if not skip_grid:
                 _write_hybrid_isi_distance_grid(
                     cfg_base=cfg,
                     distances_um=dist_grid,
