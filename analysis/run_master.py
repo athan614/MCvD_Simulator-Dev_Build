@@ -156,9 +156,59 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     ]
     # Ablation flag
     cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
-    # Interleaving across modes
-    if args.parallel_modes and args.parallel_modes > 1:
-        cmd.extend(["--parallel-modes", str(args.parallel_modes)])
+    if args.resume and not args.reset:
+        cmd.append("--resume")
+    if args.recalibrate:
+        cmd.append("--recalibrate")
+    # Performance flags
+    if args.max_workers is not None:
+        cmd.extend(["--max-workers", str(args.max_workers)])
+    if args.extreme_mode:
+        cmd.append("--extreme-mode")
+    elif args.beast_mode:
+        cmd.append("--beast-mode")
+    # NT-pairs (forward for CSK versatility)
+    if args.nt_pairs:
+        cmd.extend(["--nt-pairs", args.nt_pairs])
+    # Forward new optimization flags
+    if args.distances:
+        cmd.extend(["--distances", args.distances])
+    if args.lod_num_seeds is not None:
+        cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
+    if args.lod_seq_len is not None:
+        cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    # Add AFTER the existing max-ts-for-lod pass-through:
+    if getattr(args, 'max_ts_for_lod', None) is not None:
+        cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
+
+    # ADD THESE MISSING LINES:
+    if getattr(args, 'max_lod_validation_seeds', None) is not None:
+        cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
+    if getattr(args, 'max_symbol_duration_s', None) is not None:
+        cmd.extend(["--max-symbol-duration-s", str(args.max_symbol_duration_s)])
+
+    # Pass logging controls through to child...
+    return cmd
+
+def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool) -> List[str]:
+    """Assemble the run_final_analysis.py command line for a single mode (no --parallel-modes)."""
+    # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
+    child_progress = args.progress
+    if args.progress == "gui" and platform.system() == "Darwin":
+        child_progress = "rich"
+        
+    cmd = [
+        sys.executable, "-u", "analysis/run_final_analysis.py",
+        "--mode", mode,
+        "--num-seeds", str(args.num_seeds),
+        "--sequence-length", str(args.sequence_length),
+        "--progress", child_progress,
+        "--target-ci", str(args.target_ci),
+        "--min-ci-seeds", str(args.min_ci_seeds),
+        "--lod-screen-delta", str(args.lod_screen_delta),
+    ]
+    # Ablation flag
+    cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
     # Resume / recalibrate
     if args.resume and not args.reset:
         cmd.append("--resume")
@@ -174,7 +224,24 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     # NT-pairs (forward for CSK versatility)
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
-    # Pass logging controls through to child as environment variables if needed (stdout is already tee'd)
+    # Forward new optimization flags
+    if args.distances:
+        cmd.extend(["--distances", args.distances])
+    if args.lod_num_seeds is not None:
+        cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
+    if args.lod_seq_len is not None:
+        cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    # Add AFTER the existing max-ts-for-lod pass-through:
+    if getattr(args, 'max_ts_for_lod', None) is not None:
+        cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
+
+    # ADD THESE MISSING LINES:
+    if getattr(args, 'max_lod_validation_seeds', None) is not None:
+        cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
+    if getattr(args, 'max_symbol_duration_s', None) is not None:
+        cmd.extend(["--max-symbol-duration-s", str(args.max_symbol_duration_s)])
+
+    # Pass logging controls through to child...
     return cmd
 
 def main() -> None:
@@ -211,6 +278,12 @@ def main() -> None:
                    help="Minimum seeds before CI stopping can trigger (pass-through)")
     p.add_argument("--lod-screen-delta", type=float, default=1e-4,
                    help="Hoeffding screening significance for LoD binary search (pass-through)")
+    p.add_argument("--distances", type=str, default="",
+                   help="Comma-separated distance grid in µm for LoD (pass-through)")
+    p.add_argument("--lod-num-seeds", type=int, default=None,
+                   help="Use only this many seeds for LoD binary search (pass-through)")
+    p.add_argument("--lod-seq-len", type=int, default=None,
+                   help="Override sequence_length during LoD search only (pass-through)")
     # Reset
     p.add_argument(
         "--reset",
@@ -268,6 +341,20 @@ def main() -> None:
             _set_if_default("num_seeds", 50)
             _set_if_default("sequence_length", 2000)
             _set_if_default("target_ci", 0.002)       # Tighter confidence intervals
+            _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
+            
+            # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
+            _set_if_default("lod_num_seeds", 8)     # search uses 8 seeds, later validated with full 50
+            _set_if_default("lod_seq_len", 300)     # search uses 300 symbols/seed
+            
+                # NEW: Add these lines at the end of the IEEE preset:
+            _set_if_default("max_lod_validation_seeds", 12)    # Cap expensive validation retries
+            _set_if_default("max_symbol_duration_s", 180.0)    # Skip when Ts > 3 minutes
+            
+            # Avoid infeasible tails: skip LoD when Ts is too large (no physics change)
+            if not hasattr(args, 'distances') or args.distances == "":
+                # keep long points optional; user can restore by passing --max-ts-for-lod=None
+                args.distances = "25,35,45,55,65,75,85,95,105,125,150,175"
             
             # Force comprehensive coverage
             args.modes = "all"
@@ -280,6 +367,7 @@ def main() -> None:
             
             print("🏆 IEEE preset applied: publication-grade configuration")
             print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
+            print(f"   • LoD search: {getattr(args, 'lod_num_seeds', 8)} seeds × {getattr(args, 'lod_seq_len', 300)} symbols")
             print(f"   • Target CI: {args.target_ci}, All modes, Both ablations")
             print(f"   • Supplementary: {args.supplementary}, Performance: {'extreme-mode' if args.extreme_mode else 'default'}")
 
@@ -514,14 +602,57 @@ def main() -> None:
             if args.resume and state.get(skey, {}).get("done"):
                 print(f"↩️  Resume: skipping {skey} (already done)")
                 return 0
-            cmd = _build_run_final_cmd(args, use_ctrl=use_ctrl)
-            print(f"\n🧪 Simulate ({'CTRL' if use_ctrl else 'NoCTRL'}):\n  $ {' '.join(cmd)}\n")
-            rc = _run_tracked(cmd)  # Use tracked runner
-            if rc == 0:
+            
+            # Determine which modes to run
+            modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+            print(f"\n🧪 Simulate ({'CTRL' if use_ctrl else 'NoCTRL'}) — modes: {modes}")
+
+            # Run per-mode children concurrently (isolated process pools)
+            maxp = min(args.parallel_modes or 1, len(modes))
+            rcs = []
+            
+            if maxp > 1 and len(modes) > 1:
+                # Concurrent mode execution
+                with ThreadPoolExecutor(max_workers=maxp) as tpool:
+                    futs = []
+                    for m in modes:
+                        cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl)
+                        print(f"  $ {' '.join(cmd)}")
+                        futs.append(tpool.submit(_run_tracked, cmd))
+                    
+                    for f in as_completed(futs):
+                        if master_cancelled.is_set():
+                            return 130
+                        rc = f.result()
+                        rcs.append(rc)
+                        if rc == 130:
+                            print(f"🛑 Mode cancelled: {skey}")
+                            return 130
+                        elif rc != 0:
+                            print(f"✗ Mode failed with exit code {rc}: {skey}")
+                            return rc
+            else:
+                # Sequential mode execution (fallback)
+                for m in modes:
+                    if master_cancelled.is_set():
+                        return 130
+                    cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl)
+                    print(f"  $ {' '.join(cmd)}")
+                    rc = _run_tracked(cmd)
+                    rcs.append(rc)
+                    if rc == 130:
+                        print(f"🛑 Mode cancelled: {skey}")
+                        return 130
+                    elif rc != 0:
+                        print(f"✗ Mode failed with exit code {rc}: {skey}")
+                        return rc
+            
+            # All modes completed successfully
+            if all(rc == 0 for rc in rcs):
                 _mark_done(state, skey)
-            elif rc == 130:
-                print(f"🛑 Simulation cancelled: {skey}")
-            return rc
+                return 0
+            else:
+                return 130 if any(rc == 130 for rc in rcs) else 1
 
         # Run ablations (check cancellation between each)
         if args.ablation_parallel and len(ablation_runs) == 2:

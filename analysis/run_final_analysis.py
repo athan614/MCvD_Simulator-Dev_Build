@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from html import parser
 import sys
 import json
 import argparse
@@ -764,6 +765,24 @@ def parse_arguments() -> argparse.Namespace:
                         help="Minimum seeds required before adaptive CI stopping can trigger.")
     parser.add_argument("--lod-screen-delta", type=float, default=1e-4,
                         help="Hoeffding screening significance (delta) for early-stop LoD tests.")
+    parser.add_argument("--distances",
+                        type=str,
+                        default="",
+                        help="Comma-separated distance grid in µm for LoD (e.g., 25,35,45,55,65,75,85,95,105,115,125,150,175,200)")
+    parser.add_argument("--lod-num-seeds",
+                        type=str,
+                        default=None,
+                        help=(
+                            "LoD seed schedule. Options:\n"
+                            "  N                 -> use fixed N seeds for LoD search\n"
+                            "  min,max           -> linearly scale from min at 25µm to max at 200µm\n"
+                            "  rules             -> e.g. '<=100:6,<=150:8,>150:10'\n"
+                            "Final LoD validation always uses the full seed set."
+                        ))
+    parser.add_argument("--lod-seq-len",
+                        type=int,
+                        default=None,
+                        help="If set, temporarily override sequence_length during LoD search only.")
     parser.add_argument("--parallel-modes", type=int, default=1,
                         help=">1 to run MoSK/CSK/Hybrid concurrently (e.g., 3).")
     parser.add_argument("--logdir", default=str((project_root / "results" / "logs")),
@@ -776,6 +795,14 @@ def parse_arguments() -> argparse.Namespace:
                         help="Prevent the OS from sleeping while the pipeline runs")
     parser.add_argument("--keep-display-on", action="store_true",
                         help="Also keep the display awake (Windows/macOS)")
+    parser.add_argument("--max-ts-for-lod", type=float, default=None,
+                        help="If set, skip LoD at distances whose dynamic Ts exceeds this (seconds).")
+    parser.add_argument("--max-lod-validation-seeds", type=int, default=None,
+                        help="Cap the number of seeds used for LoD validation (default: use all seeds).")
+    parser.add_argument("--max-symbol-duration-s", type=float, default=None,
+                        help="Skip LoD search at distances where symbol period exceeds this limit (seconds).")
+    parser.add_argument("--analytic-lod-bracket", action="store_true",
+                    help="Use Gaussian SER approximation for tighter LoD bracketing (experimental).")
     parser.set_defaults(use_ctrl=True)
     args = parser.parse_args()
     
@@ -927,9 +954,13 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         # Run the instance and attach per-run ISI metrics
         result = run_single_instance(cfg_run, seed, attach_isi_meta=True)
         if result is not None:
+            # Tag the in‑memory result so mixed cached+fresh paths dedupe correctly
+            try:
+                result["__seed"] = int(seed)
+            except Exception:
+                pass
             mode = cfg_base['pipeline']['modulation']
             use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
-            # Cast to Dict[str, Any] since we know result is a dict from run_single_instance
             result_safe = cast(Dict[str, Any], _json_safe(result))
             write_seed_cache(mode, sweep_name, param_value, seed, result_safe, use_ctrl, cache_tag)
         return result
@@ -1115,10 +1146,17 @@ def run_sweep(cfg: Dict[str, Any],
                 wd = int(cfg.get('_watchdog_secs', 600))  # NEW: Configurable timeout
                 try:
                     done_fut = next(as_completed(pending, timeout=wd))
+                    # capture seed before removing from map
+                    sid = fut_seed.pop(done_fut, -1)
                     pending.remove(done_fut)
-                    fut_seed.pop(done_fut, None)  # NEW: Clean up seed tracking
                     try:
                         res = done_fut.result(timeout=10)  # Quick result extraction
+                        if res is not None:
+                            # Ensure tag is present even if worker missed it
+                            try:
+                                res.setdefault("__seed", int(sid))
+                            except Exception:
+                                pass
                     except Exception as e:
                         print(f"        ⚠️  Result extraction failed for {sweep_param}={v}: {e}")
                         res = None
@@ -1271,6 +1309,145 @@ def run_sweep(cfg: Dict[str, Any],
     return pd.DataFrame(aggregated_rows)
 
 # ============= LOD SEARCH =============
+def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser: float = 0.01) -> Tuple[int, int]:
+    """
+    Gaussian SER approximation to bracket LoD. Safe + fast; no physics change.
+    Returns (nm_min_guess, nm_max_guess) or (0, 0) if we can't estimate.
+    """
+    try:
+        mode = cfg_base['pipeline']['modulation']
+        if mode not in ['MoSK', 'CSK']:
+            return (0, 0)
+
+        def _Q(x: float) -> float:
+            # Q(x) = 0.5 * erfc(x / sqrt(2))
+            return 0.5 * math.erfc(x / math.sqrt(2.0))
+
+        # short, ISI-off probes
+        cal_cfg = deepcopy(cfg_base)
+        cal_cfg['pipeline']['sequence_length'] = 40
+        cal_cfg['pipeline']['enable_isi'] = False
+
+        # Adaptive probes to better bracket the target SER
+        probes = [1000, 10000]
+        estimates: List[Tuple[int, float]] = []
+
+        # Adaptive probe expansion (up to 3 iterations)
+        for expansion in range(3):  # initial + 2 expansions max
+            estimates.clear()
+            
+            for nm_probe in probes:
+                cfg_p = deepcopy(cal_cfg)
+                cfg_p['pipeline']['Nm_per_symbol'] = int(nm_probe)
+
+                # thresholds at this Nm (few seeds, cached)
+                th = calibrate_thresholds_cached(cfg_p, seeds[:3])
+                for k, v in th.items():
+                    cfg_p['pipeline'][k] = v
+
+                if mode == 'MoSK':
+                    stats_0, stats_1 = [], []
+                    for sd in seeds[:3]:
+                        r0 = run_calibration_symbols(cfg_p, 0, mode='MoSK', num_symbols=20)
+                        r1 = run_calibration_symbols(cfg_p, 1, mode='MoSK', num_symbols=20)
+                        if r0 and 'q_values' in r0: stats_0.extend(r0['q_values'])
+                        if r1 and 'q_values' in r1: stats_1.extend(r1['q_values'])
+                    
+                    if len(stats_0) >= 5 and len(stats_1) >= 5:
+                        mu0, mu1 = float(np.mean(stats_0)), float(np.mean(stats_1))
+                        s0, s1 = max(1e-15, float(np.std(stats_0))), max(1e-15, float(np.std(stats_1)))
+                        # MoSK threshold should be a single float value
+                        threshold_raw = th.get('mosk_threshold', (mu0 + mu1) / 2.0)
+                        if isinstance(threshold_raw, list):
+                            threshold_val = float(threshold_raw[0]) if threshold_raw else (mu0 + mu1) / 2.0
+                        else:
+                            threshold_val = float(threshold_raw)
+                        ser_est = 0.5 * (_Q((threshold_val - mu0) / s0) + _Q((mu1 - threshold_val) / s1))
+                        estimates.append((nm_probe, max(1e-8, min(1.0, ser_est))))
+
+                elif mode == 'CSK':
+                    M = int(cfg_p['pipeline'].get('csk_levels', 4))
+                    level_stats: List[List[float]] = [[] for _ in range(M)]
+                    for sd in seeds[:3]:
+                        for i in range(M):
+                            r = run_calibration_symbols(cfg_p, i, mode='CSK', num_symbols=20)
+                            if r and 'q_values' in r:
+                                level_stats[i].extend(r['q_values'])
+                    
+                    means, stds = [], []
+                    for i in range(M):
+                        if len(level_stats[i]) < 5:
+                            break
+                        means.append(float(np.mean(level_stats[i])))
+                        stds.append(max(1e-15, float(np.std(level_stats[i]))))
+                    if len(means) == M:
+                        target_ch = cfg_p['pipeline'].get('csk_target_channel', 'GLU').lower()
+                        tau = th.get(f'csk_thresholds_{target_ch}', [])
+                        tau = [float(x) for x in (tau if isinstance(tau, list) else [])]
+                        if len(tau) == M - 1:
+                            # SER ≈ average over classes of tail probabilities across adjacent thresholds
+                            ser_sum = 0.0
+                            for i in range(M):
+                                # lower tail
+                                if i > 0:
+                                    ser_sum += 0.5 * math.erfc((tau[i-1] - means[i]) / (stds[i] * math.sqrt(2)))
+                                # upper tail
+                                if i < M - 1:
+                                    ser_sum += 0.5 * math.erfc((means[i] - tau[i]) / (stds[i] * math.sqrt(2)))
+                            ser_est = ser_sum / M
+                            estimates.append((nm_probe, max(1e-8, min(1.0, ser_est))))
+
+            # Check if we have good estimates and whether to expand probes
+            if len(estimates) == 2:
+                ser1, ser2 = estimates[0][1], estimates[1][1]
+                # Check if both probes are far from target
+                if ser1 > 10*target_ser and ser2 > 10*target_ser:
+                    # Both too high - increase Nm (shift probes up)
+                    probes = [p * 3 for p in probes]
+                    print(f"    🔄 Analytic probes too high ({ser1:.1e}, {ser2:.1e} >> {target_ser:.1e}), expanding up: {probes}")
+                    continue
+                elif ser1 < 0.1*target_ser and ser2 < 0.1*target_ser:
+                    # Both too low - decrease Nm (shift probes down)  
+                    probes = [max(50, p // 3) for p in probes]
+                    print(f"    🔄 Analytic probes too low ({ser1:.1e}, {ser2:.1e} << {target_ser:.1e}), expanding down: {probes}")
+                    continue
+                else:
+                    # Good bracket - proceed with interpolation
+                    print(f"    ✓ Good analytic bracket found: {probes} -> SER [{ser1:.1e}, {ser2:.1e}]")
+                    break
+            else:
+                # Failed to get estimates - break and return (0,0)
+                break
+
+        # If we have good estimates, interpolate in log-space to find target
+        if len(estimates) == 2 and estimates[0][1] != estimates[1][1]:
+            nm1, ser1 = estimates[0]
+            nm2, ser2 = estimates[1]
+            
+            # Interpolate in log-space for more stable results
+            lnm1, lnm2 = math.log(nm1), math.log(nm2)
+            lser1, lser2 = math.log(ser1), math.log(ser2)
+            lser_t = math.log(target_ser)
+            
+            # Linear interpolation in log-space
+            alpha = (lser_t - lser1) / (lser2 - lser1)
+            lnm_t = lnm1 + alpha * (lnm2 - lnm1)
+            nm_t = int(math.exp(lnm_t))
+            
+            # Conservative bracket: ±50% around interpolated point
+            nm_min_est = max(50, int(nm_t * 0.5))
+            nm_max_est = min(100000, int(nm_t * 1.5))
+            
+            print(f"    📊 Analytic interpolation: target SER {target_ser:.1e} → Nm ≈ {nm_t}, bracket [{nm_min_est}-{nm_max_est}]")
+            return (nm_min_est, nm_max_est)
+        else:
+            print(f"    ⚠️  Analytic bracketing failed: insufficient data")
+            return (0, 0)
+            
+    except Exception as e:
+        print(f"    ⚠️  Analytic bracketing failed: {e}")
+        return (0, 0)
+
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      target_ser: float = 0.01,
                      debug_calibration: bool = False,
@@ -1279,11 +1456,63 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      cache_tag: Optional[str] = None) -> Tuple[Union[int, float], float, int]:
     nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
     nm_max = 100000
+    nm_max_default = nm_max  # Store original default
+
+    # NEW: Try analytic bracketing if enabled (experimental feature)
+    analytic_bracket_cache = None  # Cache for analytic bracket result
+    if cfg_base.get('_analytic_lod_bracket', False):
+        analytic_bracket_cache = _analytic_lod_bracket(cfg_base, seeds, target_ser)
+        nm_min_analytic, nm_max_analytic = analytic_bracket_cache
+        if nm_min_analytic > 0 and nm_max_analytic > nm_min_analytic:
+            nm_min = max(nm_min, nm_min_analytic)
+            nm_max = min(nm_max, nm_max_analytic)
+            print(f"    📊 Using analytic bracket: [{nm_min} - {nm_max}]")
+
+    # NEW: warm-start bracket if provided with analytic intersection
+    warm = int(cfg_base.get('_warm_lod_guess', 0))
+    if warm > 0:
+        # Simplified nm_min calculation (removes redundant max)
+        nm_min = max(nm_min, int(warm * 0.5))
+        
+        # Distance-aware upper bound: longer distances need wider brackets
+        dist_um = cfg_base['pipeline'].get('distance_um', 0)
+        if dist_um >= 175:
+            mult = 10.0
+        elif dist_um > 150:
+            mult = 8.0
+        elif dist_um > 100:
+            mult = 4.0
+        else:
+            mult = 2.0
+        
+        # Intersect analytic and warm brackets when both available
+        if cfg_base.get('_analytic_lod_bracket', False) and analytic_bracket_cache:
+            # Reuse cached analytic bounds
+            nm_min_analytic, nm_max_analytic = analytic_bracket_cache
+            if nm_min_analytic > 0 and nm_max_analytic > nm_min_analytic:
+                # Take intersection: analytic upper bound constrains warm expansion  
+                upper_from_warm = int(mult * warm)
+                upper_from_analytic = int(1.25 * nm_max_analytic)   # optional +25% safety
+                
+                # intersect "warm high" with (padded) analytic high, then cap to the global ceiling
+                nm_max = min(max(nm_max_default, upper_from_warm), upper_from_analytic)
+                nm_min = max(nm_min, nm_min_analytic)
+                nm_max = min(nm_max, nm_max_default)  # enforce ≤ 100_000
+                
+                print(f"    🔄 Warm + analytic intersect: [{nm_min} - {nm_max}] (capped at 100k)")
+        else:
+            # Pure warm-start without analytic constraints
+            nm_max = max(nm_max_default, int(mult * warm))
+            print(f"    🔥 Warm-start bracket: [{nm_min} - {nm_max}]")
+    
     lod_nm: float = float('nan')
     best_ser: float = 1.0
     dist_um = cfg_base['pipeline'].get('distance_um', 0)
     mode_name = cfg_base['pipeline']['modulation']
     use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
+    
+    # Track actual progress increments
+    progress_count = 0
     
     # Load prior state if resuming
     state = _lod_state_load(mode_name, float(dist_um), use_ctrl) if resume else None
@@ -1295,23 +1524,34 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     # Extract CTRL state for debug logging
     ctrl_str = "CTRL" if use_ctrl else "NoCtrl"
 
+    # NEW: Cache thresholds during bisection to reduce calibration overhead
+    th_cache: Dict[int, Dict[str, Union[float, List[float]]]] = {}  # nm -> thresholds dict
+    
+    def _get_th(nm: int):
+        if nm in th_cache:
+            return th_cache[nm]
+        cfg_tmp = deepcopy(cfg_base)
+        cfg_tmp['pipeline']['Nm_per_symbol'] = nm
+        th = calibrate_thresholds_cached(cfg_tmp, list(range(6)))  # faster with fewer seeds
+        th_cache[nm] = th
+        return th
+
     for iteration in range(20):
+        if CANCEL.is_set():
+            break
         if nm_min > nm_max:
             break
         nm_mid = int((nm_min + nm_max) / 2)
         if nm_mid == 0 or nm_mid > nm_max:
             break
-        print(f"    [{dist_um}μm|{ctrl_str}] Testing Nm={nm_mid} (iteration {iteration+1}/20, range: {nm_min}-{nm_max})")
 
+        print(f"    [{dist_um}μm|{ctrl_str}] Testing Nm={nm_mid} (iteration {iteration+1}/20, range: {nm_min}-{nm_max})")
 
         cfg_test = deepcopy(cfg_base)
         cfg_test['pipeline']['Nm_per_symbol'] = nm_mid
 
-        # IMPORTANT: persist thresholds to JSON for reuse (no forced recalibration)
-        cal_seeds = list(range(10))
-        thresholds = calibrate_thresholds(cfg_test, cal_seeds, recalibrate=False, save_to_file=True,
-                                          verbose=debug_calibration and iteration == 0)
-        for k, v in thresholds.items():
+        # Apply cached thresholds for the current test point
+        for k, v in _get_th(nm_mid).items():
             cfg_test['pipeline'][k] = v
 
         # --- Gather cached seed results first (if any) ---
@@ -1357,7 +1597,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             # reuse our generic worker to also persist the per-seed result
             res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm_mid, seed,
                                        debug_calibration=False,
-                                       thresholds_override=thresholds,
+                                       thresholds_override=_get_th(nm_mid),
                                        sweep_name="lod_search",
                                        cache_tag=cache_tag)
             if res is not None:
@@ -1417,12 +1657,16 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             nm_max = nm_mid - 1
         else:
             nm_min = nm_mid + 1
+            
+        # Count each binary search iteration
+        progress_count += 1
         
         # persist bounds after each iteration
         _lod_state_save(mode_name, float(dist_um), use_ctrl,
                         {"nm_min": nm_min, "nm_max": nm_max, "iteration": iteration,
                          "last_nm": nm_mid})
 
+    # OPTIMIZATION 1: Cap LoD validation retries
     if math.isnan(lod_nm) and nm_min <= 100000:
         print(f"    [{dist_um}μm|{ctrl_str}] Final check at Nm={nm_min}")
         cfg_final = deepcopy(cfg_base)
@@ -1432,8 +1676,14 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         for k, v in thresholds.items():
             cfg_final['pipeline'][k] = v
 
+        # NEW: Cap validation seeds for performance
+        max_validation_seeds = cfg_base.get('max_lod_validation_seeds', len(seeds))
+        validation_seeds = seeds[:max_validation_seeds] if max_validation_seeds < len(seeds) else seeds
+        if len(validation_seeds) < len(seeds):
+            print(f"    [{dist_um}μm|{ctrl_str}] Validation capped at {max_validation_seeds}/{len(seeds)} seeds")
+
         results2: List[Dict[str, Any]] = []
-        for sd in seeds:
+        for i, sd in enumerate(validation_seeds):
             cfg_run2 = deepcopy(cfg_final)
             cfg_run2['pipeline']['random_seed'] = sd
             cfg_run2['disable_progress'] = True
@@ -1443,12 +1693,22 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 r2 = None
             if r2 is not None:
                 results2.append(r2)
+                progress_count += 1  # Count validation seeds
                 # Progress callback for completed validation seed
                 if progress_cb is not None:
                     try:
                         progress_cb.put(1)
                     except Exception:
                         pass
+                
+                # NEW: Early success detection for statistical efficiency
+                if len(results2) >= 5:  # Minimum for statistical validity
+                    interim_errors = sum(cast(int, r['errors']) for r in results2)
+                    interim_symbols = len(results2) * cfg_final['pipeline']['sequence_length']
+                    interim_ser = interim_errors / interim_symbols if interim_symbols > 0 else 1.0
+                    if interim_ser <= target_ser * 0.8:  # Clear success margin
+                        print(f"    [{dist_um}μm|{ctrl_str}] Early validation success after {len(results2)} seeds (SER={interim_ser:.4f})")
+                        break
 
         if results2:
             total_symbols = len(results2) * cfg_final['pipeline']['sequence_length']
@@ -1459,25 +1719,129 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
                 return nm_min, final_ser, actual_progress
 
-    # Track actual progress increments for accurate parent progress
-    actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
-    return lod_nm, best_ser, actual_progress
+    # Return actual count instead of constant
+    return lod_nm, best_ser, progress_count
+
+def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
+                                        lod_nm: int,
+                                        full_seeds: List[int]) -> Tuple[float, float, float, float]:
+    """
+    Run one pass at the chosen LoD using the FULL seeds + FULL sequence_length
+    to report paper-grade SER and data-rate with 95% CI.
+    Returns: (ser_at_lod, data_rate_bps, ci_low, ci_high)
+    """
+    cfg = deepcopy(cfg_base)
+    # Ensure symbol period and decision window are consistent for this distance
+    Ts = calculate_dynamic_symbol_period(float(cfg['pipeline']['distance_um']), cfg)
+    cfg['pipeline']['symbol_period_s'] = Ts
+    cfg['pipeline']['time_window_s'] = Ts
+    cfg.setdefault('detection', {})
+    cfg['detection']['decision_window_s'] = Ts
+
+    cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
+
+    # Apply thresholds at this exact operating point
+    th = calibrate_thresholds_cached(cfg, list(range(10)))
+    for k, v in th.items():
+        cfg['pipeline'][k] = v
+
+    # Determine bits/symbol
+    mode = cfg['pipeline']['modulation']
+    if mode == 'MoSK':
+        bpsym = 1.0
+    elif mode == 'CSK':
+        M = int(cfg['pipeline'].get('csk_levels', 4))
+        bpsym = float(math.log2(max(M, 2)))
+    else:
+        bpsym = 2.0
+
+    per_seed_rates, per_seed_ser = [], []
+    Ts_list = []
+
+    for seed in full_seeds:
+        res = run_single_instance(cfg, seed, attach_isi_meta=True)
+        if res is None:
+            continue
+        L = int(cfg['pipeline']['sequence_length'])
+        e = res.get('errors', None)
+        ser_seed = float(res.get('ser', res.get('SER', (e / L) if (e is not None and L > 0) else 1.0)))
+        Ts_seed = float(res.get('symbol_period_s', Ts))
+        per_seed_rates.append((bpsym / Ts_seed) * (1.0 - ser_seed))
+        per_seed_ser.append(ser_seed)
+        Ts_list.append(Ts_seed)
+
+    if per_seed_rates:
+        mean_rate = float(np.mean(per_seed_rates))
+        std_rate = float(np.std(per_seed_rates, ddof=1)) if len(per_seed_rates) > 1 else 0.0
+        n = max(1, len(per_seed_rates))
+        try:
+            from scipy.stats import t
+            t_val = t.ppf(0.975, n - 1) if n > 1 else 1.96
+        except Exception:
+            t_val = 1.96
+        ci_half = t_val * std_rate / math.sqrt(n)
+        Ts_mean = float(np.mean(Ts_list)) if Ts_list else Ts
+        return (float(np.mean(per_seed_ser)),
+                mean_rate,
+                max(0.0, mean_rate - ci_half),
+                min(bpsym / Ts_mean, mean_rate + ci_half))
+    else:
+        # Conservative fallback
+        Ts_mean = float(np.mean(Ts_list)) if Ts_list else Ts
+        ser_fallback = 1.0
+        rate = (bpsym / Ts_mean) * (1.0 - ser_fallback)
+        return (ser_fallback, rate, rate, rate)
 
 def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                              seeds: List[int], target_ser: float = 0.01,
                              debug_calibration: bool = False,
                              progress_cb: Optional[Any] = None,
-                             resume: bool = False) -> Dict[str, Any]:
+                             resume: bool = False, args: Optional[Any] = None,
+                             warm_lod_guess: Optional[int] = None) -> Dict[str, Any]:
     """
     Process a single distance for LoD calculation.
     Returns dict with lod_nm, ser_at_lod, and data_rate_bps.
     """
     actual_progress = 0  # Initialize before try block
+    skipped_reason = None  # ✅ Initialize skipped_reason variable
     cfg = deepcopy(cfg_base)
-    cfg['pipeline']['distance_um'] = dist_um
+    Ts_dyn = calculate_dynamic_symbol_period(dist_um, cfg)
     
-    # Dynamic symbol period calculation
-    cfg['pipeline']['symbol_period_s'] = calculate_dynamic_symbol_period(dist_um, cfg)
+    # NEW: Check for Ts explosion and skip if too large (OPTIMIZATION 2)
+    max_symbol_duration_s = cfg_base.get('max_symbol_duration_s', None)
+    if max_symbol_duration_s is not None and Ts_dyn > max_symbol_duration_s:
+        print(f"⚠️  Skipping distance {dist_um}μm: symbol period {Ts_dyn:.1f}s exceeds limit {max_symbol_duration_s}s")
+        return {
+            'distance_um': dist_um,
+            'lod_nm': float('nan'),
+            'ser_at_lod': float('nan'),
+            'data_rate_bps': 0.0,
+            'ci_low': float('nan'),
+            'ci_high': float('nan'),
+            'symbol_period_s': Ts_dyn,
+            'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
+        }
+    
+    # Continue with existing logic for args.max_ts_for_lod (keep this too)
+    if args and getattr(args, "max_ts_for_lod", None) and Ts_dyn > float(args.max_ts_for_lod):
+        return {
+            'distance_um': dist_um, 'lod_nm': float('nan'), 'ser_at_lod': float('nan'),
+            'data_rate_bps': float('nan'), 'data_rate_ci_low': float('nan'), 'data_rate_ci_high': float('nan'),
+            'symbol_period_s': Ts_dyn, 'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+            'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
+            'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+            'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
+            'actual_progress': 0
+        }
+    cfg['pipeline']['symbol_period_s'] = Ts_dyn
+    
+    # LoD search can use shorter sequences to bracket quickly
+    if args and getattr(args, "lod_seq_len", None):
+        cfg['pipeline']['sequence_length'] = args.lod_seq_len
+    
+    # NEW: Propagate warm-start guess
+    if warm_lod_guess and warm_lod_guess > 0:
+        cfg['_warm_lod_guess'] = int(warm_lod_guess)
     
     try:
         cache_tag = f"d{int(dist_um)}um"
@@ -1580,6 +1944,28 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         data_rate_bps = float('nan')
         data_rate_ci_low = float('nan')
         data_rate_ci_high = float('nan')
+        skipped_reason = 'lod_search_failed'  # ✅ Set in exception block
+    
+    # NEW: Re-validate final LoD with full seeds for publication-grade statistics
+    full_seeds = getattr(args, "full_seeds", seeds)  # default to reduced set if absent
+    if not np.isnan(lod_nm) and lod_nm > 0:
+        # Build a cfg with the chosen distance baked in (so Ts is recomputed inside helper)
+        cfg_base_with_distance = deepcopy(cfg_base)
+        cfg_base_with_distance['pipeline']['distance_um'] = dist_um
+        ser_at_lod, data_rate_bps, data_rate_ci_low, data_rate_ci_high = \
+            _validate_lod_point_with_full_seeds(cfg_base_with_distance, int(lod_nm), full_seeds)
+        
+        # NEW: Enforce 1% target after validation - adjust upward if needed
+        target_ser = 0.01
+        if ser_at_lod > target_ser:
+            nm_try = int(max(lod_nm, 1))
+            for _ in range(6):   # hard cap safety
+                nm_try = int(math.ceil(nm_try * 1.25))
+                ser2, rate2, lo2, hi2 = _validate_lod_point_with_full_seeds(cfg_base_with_distance, nm_try, full_seeds)
+                if ser2 <= target_ser:
+                    lod_nm, ser_at_lod = nm_try, ser2
+                    data_rate_bps, data_rate_ci_low, data_rate_ci_high = rate2, lo2, hi2
+                    break
     
     # NEW: Optional noise_sigma persistence aggregation
     if lod_nm > 0:
@@ -1643,6 +2029,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'mode': cfg['pipeline']['modulation'],
         'noise_sigma_I_diff': lod_sigma_median,
         'actual_progress': int(actual_progress),
+        'skipped_reason': skipped_reason,  # ✅ Use the variable instead of None
     }
 
 # ============= MAIN PLOTTING HELPERS (unchanged visuals) =============
@@ -1834,6 +2221,13 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     cfg['pipeline']['enable_isi'] = True
                     cfg['pipeline']['random_seed'] = int(seed)  # Set seed in config
                     
+                    # NEW: Recompute symbol period and decision window for this distance
+                    Ts = calculate_dynamic_symbol_period(d, cfg)
+                    cfg['pipeline']['symbol_period_s'] = Ts
+                    cfg['pipeline']['time_window_s'] = Ts
+                    cfg.setdefault('detection', {})
+                    cfg['detection']['decision_window_s'] = Ts
+                    
                     # NEW: Calibrate thresholds for this specific (distance, guard_factor) point
                     try:
                         cal_seeds = list(range(4))  # Fast calibration with 4 seeds
@@ -1947,6 +2341,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_min_ci_seeds'] = int(args.min_ci_seeds)
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
+    cfg['_analytic_lod_bracket'] = getattr(args, 'analytic_lod_bracket', False)
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
@@ -2147,7 +2542,14 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     # ---------- 2) LoD vs Distance ----------
     print("\n2. Building LoD vs distance curve…")
-    d_run = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+    # Resolve distance grid: CLI > config > safe default
+    if args.distances:
+        d_run = [int(x) for x in args.distances.split(",") if x.strip()]
+    else:
+        try:
+            d_run = [int(x) for x in cfg['distances_um']]
+        except Exception:
+            d_run = [25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150, 175, 200]
     lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
     pm.set_status(mode=mode, sweep="LoD vs distance")
     optimal_workers = get_optimal_workers("beast" if args.beast_mode else "optimal")
@@ -2161,6 +2563,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     if hierarchy_supported:
         lod_bar = pm.task(total=lod_jobs, description="LoD vs distance",
                           parent=mode_key, key=lod_key, kind="sweep")
+        # Keep the overall headline consistent with the true LoD total
+        if hasattr(pm, "update_total") and overall is not None:
+            pm.update_total(key=("overall", mode), total=ser_jobs + lod_jobs + isi_jobs,
+                            label=f"Overall ({mode})", kind="overall")
     else:
         lod_bar = None
     
@@ -2213,96 +2619,171 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 parent=lod_key
             )
 
-    future_to_dist: Dict[Any, int] = {}
-    future_worker: Dict[Any, int] = {}    # stable worker mapping
-    for i, dist in enumerate(d_run):
-        wid = i % max(1, maxw)
-        if hasattr(pm, "worker_update"):
-            pm.worker_update(wid, f"LoD | d={dist} μm")
-        
-        # Pass the queue instead of a lambda callback
-        q = progress_queues[dist]
-        future = pool.submit(process_distance_for_lod, dist, cfg, seeds[:lod_seed_cap], 0.01,
-                            args.debug_calibration, q, args.resume)
-        future_to_dist[future] = dist
-        future_worker[future] = wid
+    def _choose_seeds_for_distance(distance_um: float, all_seeds: List[int], lod_num_seeds_arg: Optional[Union[int, str]]) -> List[int]:
+        """Auto-tune LoD search seed count based on distance."""
+        if lod_num_seeds_arg is None:
+            return all_seeds
 
+        # Parse schedule if it's a string
+        if isinstance(lod_num_seeds_arg, str):
+            if ',' in lod_num_seeds_arg:
+                try:
+                    # Format: "min,max" or "<=100:6,<=150:8,>150:10"
+                    if lod_num_seeds_arg.count(',') == 1 and all(x.isdigit() for x in lod_num_seeds_arg.split(',')):
+                        # Simple min,max format
+                        min_seeds, max_seeds = map(int, lod_num_seeds_arg.split(','))
+                        # Linear interpolation by distance
+                        ratio = min(1.0, max(0.0, (distance_um - 25) / (200 - 25)))  # 25-200μm range
+                        seed_count = int(min_seeds + ratio * (max_seeds - min_seeds))
+                        return all_seeds[:seed_count]
+                    else:
+                        # Rich schedule format: "<=100:6,<=150:8,>150:10"
+                        for rule in lod_num_seeds_arg.split(','):
+                            if ':' in rule:
+                                condition, count_str = rule.split(':')
+                                count = int(count_str)  # Ensure it's an integer
+                                if condition.startswith('<='):
+                                    threshold = float(condition[2:])
+                                    if distance_um <= threshold:
+                                        return all_seeds[:count]
+                                elif condition.startswith('>='):
+                                    threshold = float(condition[2:])
+                                    if distance_um >= threshold:
+                                        return all_seeds[:count]
+                                elif condition.startswith('>'):
+                                    threshold = float(condition[1:])
+                                    if distance_um > threshold:
+                                        return all_seeds[:count]
+                                elif condition.startswith('<'):
+                                    threshold = float(condition[1:])
+                                    if distance_um < threshold:
+                                        return all_seeds[:count]
+                        # Fallback if no rule matches
+                        return all_seeds[:8]
+                except Exception:
+                    # Parse error - fallback to simple integer
+                    return all_seeds[:8]
+            else:
+                # Single number as string
+                try:
+                    return all_seeds[:int(lod_num_seeds_arg)]
+                except Exception:
+                    return all_seeds
+        else:
+            # Integer argument
+            return all_seeds[:lod_num_seeds_arg]
+
+    # Submit distance jobs in batches for effective warm-start
+    future_to_dist: Dict[Any, float] = {}  # Changed int to float for distance
+    future_worker: Dict[Any, int] = {}
+    last_lod_guess: Optional[int] = None  # NEW: track warm-start guess
+    batch_size = 3  # Process 3 distances at a time for warm-start effectiveness
+    
     lod_results: List[Dict[str, Any]] = []
-    for fut in as_completed(future_to_dist):
-        dist = future_to_dist[fut]
-        wid = future_worker.pop(fut, 0)  # stable id assignment
+    
+    for i in range(0, len(d_run), batch_size):
+        batch_d = d_run[i:i+batch_size]  # ascending distances
+        future_to_dist.clear()
+        future_worker.clear()
         
-        res = {}  # Initialize to prevent unbound variable
-        try:
-            res = fut.result(timeout=7200)
-            # Store actual progress for accurate parent counting  
-            res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
-        except TimeoutError:
-            print(f"⚠️  LoD timeout at {dist}μm, skipping")
-            res = {}
-        except Exception as ex:
-            print(f"⚠️  LoD error at {dist}μm: {ex}")
-            res = {}
-        finally:
-            # Mark this worker as idle
+        # Submit batch
+        for j, dist in enumerate(batch_d):
+            wid = (i + j) % max(1, maxw)
             if hasattr(pm, "worker_update"):
-                pm.worker_update(wid, "idle")
-            # NEW: increment worker bar by the actual work performed for that distance
-            actual_total = res.get('actual_progress', estimated_per_distance)
-            if hierarchy_supported and wid in worker_bars:
-                worker_bars[wid].update(actual_total)
-            # NEW: stop the per-distance drainer cleanly
-            try:
-                queue_for_cleanup: Optional[Any] = progress_queues.get(dist)
-                if queue_for_cleanup is not None:
-                    queue_for_cleanup.put_nowait(None)  # sentinel for drainer
-                t, stop_evt = drainers.get(dist, (None, None))
-                if stop_evt is not None:
-                    stop_evt.set()
-            except Exception:
-                pass
+                pm.worker_update(wid, f"LoD | d={dist} μm")
+            q = progress_queues[dist]
+            
+            # Distance-specific seed selection (moved inside loop)
+            seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
+            # Store full seeds in args for validation
+            args.full_seeds = seeds
+            
+            future = pool.submit(
+                process_distance_for_lod, float(dist), cfg, seeds_for_lod, 0.01,
+                args.debug_calibration, q, args.resume, args,
+                warm_lod_guess=last_lod_guess  # now warm-start is meaningful
+            )
+            future_to_dist[future] = float(dist)  # Store as float
+            future_worker[future] = wid
 
-        # Append atomically per distance (only if we have a real result)
-        if res and len(res.keys()) > 0:
-            # NEW: Only append if res has meaningful data
+        # Process batch results and update warm-start guess
+        for fut in as_completed(list(future_to_dist)):
+            dist_float = future_to_dist[fut]
+            dist = int(dist_float)  # Convert to int for consistency
+            wid = future_worker.pop(fut, 0)  # stable id assignment
+            
+            res = {}  # Initialize to prevent unbound variable
+            try:
+                res = fut.result(timeout=7200)
+                # Store actual progress for accurate parent counting  
+                res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
+                
+                # NEW: Update warm-start guess if we got a valid LoD (feeds next batch)
+                if res and not pd.isna(res.get('lod_nm', np.nan)):
+                    last_lod_guess = int(res['lod_nm'])
+            except TimeoutError:
+                print(f"⚠️  LoD timeout at {dist}μm, skipping")
+                res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
+            except Exception as ex:
+                print(f"💥 Distance processing failed for {dist}μm: {ex}")
+                res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
+            finally:
+                # Mark this worker as idle
+                if hasattr(pm, "worker_update"):
+                    pm.worker_update(wid, "idle")
+                # NEW: increment worker bar by the actual work performed for that distance
+                actual_total = res.get('actual_progress', estimated_per_distance)
+                if hierarchy_supported and wid in worker_bars:
+                    worker_bars[wid].update(actual_total)
+                # NEW: stop the per-distance drainer cleanly
+                try:
+                    q_cleanup = progress_queues.get(dist)
+                    if q_cleanup is not None:
+                        try:
+                            q_cleanup.put_nowait(None)  # sentinel for drainer
+                        except Exception:
+                            pass
+                    t, stop_evt = drainers.get(dist, (None, None))
+                    if stop_evt is not None:
+                        stop_evt.set()
+                except Exception:
+                    pass
+
+            # Append atomically per distance (only if we have a real result)
             if res and len(res.keys()) > 0:
                 append_row_atomic(lod_csv, res, list(res.keys()))
+            
+            lod_results.append(res)
+            
+            if res and not pd.isna(res.get('lod_nm', np.nan)):
+                print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
             else:
-                # Keep the CSV clean: skip empty / failed results
-                pass
-        else:
-            # Keep the CSV clean: skip empty / failed results
-            pass
-        lod_results.append(res)
-
-        if res and not pd.isna(res.get('lod_nm', np.nan)):
-            print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
-        else:
-            print(f"  [{len(lod_results)}/{len(d_run)}] {dist}μm: No LoD found")
-        # Update distance bar with actual progress before closing
-        if dist in distance_bars:
-            bar = distance_bars[dist]
-            actual_total = res.get('actual_progress', estimated_per_distance)
+                print(f"  ⚠️  [{len(lod_results)}/{len(d_run)}] {dist}μm failed")
             
-            # Create the correct dist_key for this specific distance
-            current_dist_key = ("dist", mode, "LoD", float(dist))
-            
-            if hierarchy_supported and bar and hasattr(pm, "update_total"):
-                pm.update_total(key=current_dist_key, total=actual_total,
-                                label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
+            # Update distance bar with actual progress before closing
+            if dist in distance_bars:
+                bar = distance_bars[dist]
+                actual_total = res.get('actual_progress', estimated_per_distance)
                 
-                # NEW: remember actual total
-                dist_totals[dist] = actual_total
+                # Create the correct dist_key for this specific distance
+                current_dist_key = ("dist", mode, "LoD", float(dist))
                 
-                # NEW: update the parent LoD row with sum of actual totals
-                if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
-                    pm.update_total(key=lod_key, total=sum(dist_totals.values()),
-                                    label="LoD vs distance", kind="sweep", parent=mode_key)
-                
-                remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
-                if remaining > 0: bar.update(remaining)
-                if bar:
-                    bar.close()
+                if hierarchy_supported and bar and hasattr(pm, "update_total"):
+                    pm.update_total(key=current_dist_key, total=actual_total,
+                                    label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
+                    
+                    # NEW: remember actual total
+                    dist_totals[dist] = actual_total
+                    
+                    # NEW: update the parent LoD row with sum of actual totals
+                    if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
+                        pm.update_total(key=lod_key, total=sum(dist_totals.values()),
+                                        label="LoD vs distance", kind="sweep", parent=mode_key)
+                    
+                    remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
+                    if remaining > 0: bar.update(remaining)
+                    if bar:
+                        bar.close()
 
     # Close remaining distance bars and stop any drainers just in case
     for bar in distance_bars.values():
@@ -2331,6 +2812,19 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         pass
     # DO NOT stop pm here; continue to ISI sweep
 
+    # Filter out empty LoD results to prevent DataFrame errors
+    real_lod_results = [r for r in lod_results if isinstance(r, dict) and 'distance_um' in r and not pd.isna(r.get('distance_um', np.nan))]
+    # More precise failed distance detection for NaN LoDs
+    failed_distances = sorted(
+        int(r['distance_um'])
+        for r in lod_results
+        if (isinstance(r, dict) and 'distance_um' in r and 
+            (('lod_nm' not in r) or pd.isna(r.get('lod_nm'))))
+    )
+
+    if failed_distances:
+        print(f"⚠️  No LoD found at distances: {failed_distances} μm")
+
     # Merge with any prior rows (for a clean sorted CSV at the end)
     if lod_csv.exists():
         prior = pd.read_csv(lod_csv)
@@ -2340,10 +2834,17 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         else:
             df_lod = prior.drop_duplicates(subset=['distance_um'], keep='last').sort_values('distance_um')
     else:
-        df_lod = pd.DataFrame(lod_results).sort_values('distance_um')
+        if real_lod_results:
+            df_lod = pd.DataFrame(real_lod_results).sort_values('distance_um')
+        else:
+            print("⚠️  No LoD points were produced in this run.")
+            df_lod = pd.DataFrame()  # Empty DataFrame with no columns
 
-    _atomic_write_csv(lod_csv, df_lod)
-    print(f"\n✅ LoD vs distance saved to {lod_csv}")
+    if not df_lod.empty:
+        _atomic_write_csv(lod_csv, df_lod)
+        print(f"\n✅ LoD vs distance saved to {lod_csv} ({len(df_lod)} points)")
+    else:
+        print(f"\n⚠️  No valid LoD data to save to {lod_csv}")
     
     # Manual parent update for non-GUI backends
     if not hierarchy_supported:
