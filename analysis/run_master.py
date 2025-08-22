@@ -177,11 +177,11 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
-    # Add AFTER the existing max-ts-for-lod pass-through:
+    if getattr(args, 'analytic_lod_bracket', False):
+        cmd.append("--analytic-lod-bracket")
+    # pass through optional LoD skips/limits:
     if getattr(args, 'max_ts_for_lod', None) is not None:
         cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
-
-    # ADD THESE MISSING LINES:
     if getattr(args, 'max_lod_validation_seeds', None) is not None:
         cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
     if getattr(args, 'max_symbol_duration_s', None) is not None:
@@ -231,11 +231,11 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
-    # Add AFTER the existing max-ts-for-lod pass-through:
+    if getattr(args, 'analytic_lod_bracket', False):
+        cmd.append("--analytic-lod-bracket")
+    # pass through optional LoD skips/limits:
     if getattr(args, 'max_ts_for_lod', None) is not None:
         cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
-
-    # ADD THESE MISSING LINES:
     if getattr(args, 'max_lod_validation_seeds', None) is not None:
         cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
     if getattr(args, 'max_symbol_duration_s', None) is not None:
@@ -280,10 +280,19 @@ def main() -> None:
                    help="Hoeffding screening significance for LoD binary search (pass-through)")
     p.add_argument("--distances", type=str, default="",
                    help="Comma-separated distance grid in µm for LoD (pass-through)")
-    p.add_argument("--lod-num-seeds", type=int, default=None,
-                   help="Use only this many seeds for LoD binary search (pass-through)")
+    p.add_argument("--lod-num-seeds", type=str, default=None,
+                help=("LoD seed schedule. N | min,max | rules like "
+                        "'<=100:6,<=150:8,>150:10' (pass-through)"))
     p.add_argument("--lod-seq-len", type=int, default=None,
-                   help="Override sequence_length during LoD search only (pass-through)")
+                help="Override sequence_length during LoD search only (pass-through)")
+    p.add_argument("--analytic-lod-bracket", action="store_true",
+                help="Use Gaussian SER approximation for tighter LoD bracketing (pass-through)")
+    p.add_argument("--max-lod-validation-seeds", type=int, default=None,
+                help="Cap #seeds for final LoD validation (pass-through)")
+    p.add_argument("--max-symbol-duration-s", type=float, default=None,
+                help="Skip LoD when dynamic Ts exceeds this (seconds; pass-through)")
+    p.add_argument("--max-ts-for-lod", type=float, default=None,
+                help="Optional Ts cutoff to skip LoD at a distance (pass-through)")
     # Reset
     p.add_argument(
         "--reset",
@@ -344,9 +353,10 @@ def main() -> None:
             _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
             
             # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
-            _set_if_default("lod_num_seeds", 8)     # search uses 8 seeds, later validated with full 50
+            _set_if_default("lod_num_seeds", "<=100:6,<=150:8,>150:10")  # distance-aware schedule
             _set_if_default("lod_seq_len", 300)     # search uses 300 symbols/seed
-            
+            _set_if_default("analytic_lod_bracket", True)  # enable analytic bracketing
+
                 # NEW: Add these lines at the end of the IEEE preset:
             _set_if_default("max_lod_validation_seeds", 12)    # Cap expensive validation retries
             _set_if_default("max_symbol_duration_s", 180.0)    # Skip when Ts > 3 minutes

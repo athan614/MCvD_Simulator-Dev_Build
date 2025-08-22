@@ -2342,6 +2342,13 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
     cfg['_analytic_lod_bracket'] = getattr(args, 'analytic_lod_bracket', False)
+    # make LoD skip/limit flags visible to workers via cfg
+    if getattr(args, "max_lod_validation_seeds", None) is not None:
+        cfg["max_lod_validation_seeds"] = int(args.max_lod_validation_seeds)
+    if getattr(args, "max_symbol_duration_s", None) is not None:
+        cfg["max_symbol_duration_s"] = float(args.max_symbol_duration_s)
+    if getattr(args, "max_ts_for_lod", None) is not None:
+        cfg["max_ts_for_lod"] = float(args.max_ts_for_lod)
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
