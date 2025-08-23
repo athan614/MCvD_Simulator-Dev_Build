@@ -177,6 +177,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    if getattr(args, 'lod_validate_seq_len', None) is not None:
+        cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
         cmd.append("--analytic-lod-bracket")
     # pass through optional LoD skips/limits:
@@ -186,6 +188,17 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
     if getattr(args, 'max_symbol_duration_s', None) is not None:
         cmd.extend(["--max-symbol-duration-s", str(args.max_symbol_duration_s)])
+    # Forward optimization parameters if specified
+    if hasattr(args, 'cal_eps_rel') and args.cal_eps_rel != 0.01:
+        cmd.extend(["--cal-eps-rel", str(args.cal_eps_rel)])
+    if hasattr(args, 'cal_patience') and args.cal_patience != 2:
+        cmd.extend(["--cal-patience", str(args.cal_patience)])
+    if hasattr(args, 'cal_min_seeds') and args.cal_min_seeds != 4:
+        cmd.extend(["--cal-min-seeds", str(args.cal_min_seeds)])
+    if hasattr(args, 'cal_min_samples') and args.cal_min_samples != 50:
+        cmd.extend(["--cal-min-samples", str(args.cal_min_samples)])
+    if hasattr(args, 'min_decision_points') and args.min_decision_points != 4:
+        cmd.extend(["--min-decision-points", str(args.min_decision_points)])
 
     # Pass logging controls through to child...
     return cmd
@@ -231,6 +244,8 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    if getattr(args, 'lod_validate_seq_len', None) is not None:
+        cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
         cmd.append("--analytic-lod-bracket")
     # pass through optional LoD skips/limits:
@@ -240,6 +255,17 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--max-lod-validation-seeds", str(args.max_lod_validation_seeds)])
     if getattr(args, 'max_symbol_duration_s', None) is not None:
         cmd.extend(["--max-symbol-duration-s", str(args.max_symbol_duration_s)])
+    # Forward optimization parameters if specified
+    if hasattr(args, 'cal_eps_rel') and args.cal_eps_rel != 0.01:
+        cmd.extend(["--cal-eps-rel", str(args.cal_eps_rel)])
+    if hasattr(args, 'cal_patience') and args.cal_patience != 2:
+        cmd.extend(["--cal-patience", str(args.cal_patience)])
+    if hasattr(args, 'cal_min_seeds') and args.cal_min_seeds != 4:
+        cmd.extend(["--cal-min-seeds", str(args.cal_min_seeds)])
+    if hasattr(args, 'cal_min_samples') and args.cal_min_samples != 50:
+        cmd.extend(["--cal-min-samples", str(args.cal_min_samples)])
+    if hasattr(args, 'min_decision_points') and args.min_decision_points != 4:
+        cmd.extend(["--min-decision-points", str(args.min_decision_points)])
 
     # Pass logging controls through to child...
     return cmd
@@ -285,6 +311,8 @@ def main() -> None:
                         "'<=100:6,<=150:8,>150:10' (pass-through)"))
     p.add_argument("--lod-seq-len", type=int, default=None,
                 help="Override sequence_length during LoD search only (pass-through)")
+    p.add_argument("--lod-validate-seq-len", type=int, default=None,
+                help="Override sequence_length during final LoD validation only (pass-through)")
     p.add_argument("--analytic-lod-bracket", action="store_true",
                 help="Use Gaussian SER approximation for tighter LoD bracketing (pass-through)")
     p.add_argument("--max-lod-validation-seeds", type=int, default=None,
@@ -293,6 +321,17 @@ def main() -> None:
                 help="Skip LoD when dynamic Ts exceeds this (seconds; pass-through)")
     p.add_argument("--max-ts-for-lod", type=float, default=None,
                 help="Optional Ts cutoff to skip LoD at a distance (pass-through)")
+    # Optimization tuning (pass-through to run_final_analysis.py)
+    p.add_argument("--cal-eps-rel", type=float, default=0.01,
+                   help="Adaptive calibration convergence threshold (pass-through)")
+    p.add_argument("--cal-patience", type=int, default=2,
+                   help="Calibration patience before stopping (pass-through)")
+    p.add_argument("--cal-min-seeds", type=int, default=4,
+                   help="Minimum seeds before early stopping (pass-through)")
+    p.add_argument("--cal-min-samples", type=int, default=50,
+                   help="Minimum samples per class for stable thresholds (pass-through)")
+    p.add_argument("--min-decision-points", type=int, default=4,
+                   help="Minimum time points for window guard (pass-through)")
     # Reset
     p.add_argument(
         "--reset",
@@ -349,17 +388,19 @@ def main() -> None:
             # Publication-grade statistical parameters
             _set_if_default("num_seeds", 50)
             _set_if_default("sequence_length", 2000)
-            _set_if_default("target_ci", 0.002)       # Tighter confidence intervals
+            _set_if_default("target_ci", 0.004)       # Updated: align with new default (0.4%)
             _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
             
             # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
             _set_if_default("lod_num_seeds", "<=100:6,<=150:8,>150:10")  # distance-aware schedule
-            _set_if_default("lod_seq_len", 300)     # search uses 300 symbols/seed
+            _set_if_default("lod_seq_len", 250)     # Updated: align with new default (250 symbols/seed)
+            _set_if_default("lod_validate_seq_len", None)  # Updated: use full sequence length for validation
             _set_if_default("analytic_lod_bracket", True)  # enable analytic bracketing
 
-                # NEW: Add these lines at the end of the IEEE preset:
+            # NEW: Add these lines at the end of the IEEE preset:
             _set_if_default("max_lod_validation_seeds", 12)    # Cap expensive validation retries
             _set_if_default("max_symbol_duration_s", 180.0)    # Skip when Ts > 3 minutes
+            _set_if_default("min_ci_seeds", 8)    # Match run_final_analysis.py default
             
             # Avoid infeasible tails: skip LoD when Ts is too large (no physics change)
             if not hasattr(args, 'distances') or args.distances == "":

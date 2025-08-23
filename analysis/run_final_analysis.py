@@ -162,10 +162,22 @@ def get_optimal_workers(mode: str = "optimal") -> int:
 def worker_init():
     if CPU_CONFIG is not None:
         try:
+            # Get current process and available P-cores
             process = psutil.Process()
-            process.cpu_affinity(CPU_CONFIG["p_cores_logical"])
-        except Exception:
-            pass
+            p_cores = CPU_CONFIG["p_cores_logical"]
+            
+            # Cross-platform CPU affinity setting
+            if hasattr(process, 'cpu_affinity'):
+                # Windows/Linux via psutil (preferred method)
+                process.cpu_affinity(p_cores)
+                pinned_cores = process.cpu_affinity()
+                print(f"🎯 Worker {os.getpid()}: P-core affinity set to {pinned_cores}")
+            else:
+                print(f"⚠️  Worker {os.getpid()}: CPU affinity not supported on this platform")
+                
+        except Exception as e:
+            # Graceful degradation - worker continues without affinity
+            print(f"⚠️  Worker {os.getpid()}: P-core affinity failed ({e}), continuing without optimization")
 
 # ============= PERSISTENT PROCESS POOL =============
 class GlobalProcessPool:
@@ -360,8 +372,14 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     cal_cfg = deepcopy(cfg)
     cal_cfg['pipeline']['sequence_length'] = 100
     cal_cfg['pipeline']['enable_isi'] = False
+
     if 'symbol_period_s' in cal_cfg['pipeline']:
-        cal_cfg['detection']['decision_window_s'] = cal_cfg['pipeline']['symbol_period_s']
+        Ts = cal_cfg['pipeline']['symbol_period_s']
+        dt = float(cal_cfg['sim']['dt_s'])
+        min_pts = int(cal_cfg.get('_min_decision_points', 4))
+        min_win = _enforce_min_window(cal_cfg, Ts)
+        cal_cfg['detection']['decision_window_s'] = min_win
+        cal_cfg['pipeline']['time_window_s'] = max(cal_cfg['pipeline'].get('time_window_s', min_win), min_win)
 
     thresholds: Dict[str, Union[float, List[float]]] = {}
 
@@ -384,27 +402,71 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             threshold_mosk = calculate_ml_threshold(mean_D_glu, mean_D_gaba, std_D_glu, std_D_gaba)
             thresholds['mosk_threshold'] = threshold_mosk
 
+    # Adaptive calibration parameters
+    eps = float(cfg.get('_cal_eps_rel', 0.01))
+    patience = int(cfg.get('_cal_patience', 2))
+    min_seeds = int(cfg.get('_cal_min_seeds', 4))
+    max_seeds = int(cfg.get('_cal_max_seeds', len(seeds)))
+    min_per_class = int(cfg.get('_cal_min_samples_per_class', 50))
+
+    def _rel_delta(prev, curr):
+        if prev is None:
+            return float('inf')
+        if isinstance(curr, (list, tuple)):
+            import numpy as np
+            a = np.asarray(prev, dtype=float)
+            b = np.asarray(curr, dtype=float)
+            denom = np.maximum(np.abs(a), 1e-12)
+            return float(np.max(np.abs(b - a) / denom))
+        else:
+            denom = max(abs(prev), 1e-12)
+            return float(abs(curr - prev) / denom)
+
+    # Replace the CSK calibration block (around lines 426-470)
     if mode.startswith("CSK"):
-        M = cfg['pipeline']['csk_levels']
+        M = int(cfg['pipeline']['csk_levels'])
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
         level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
         level_stats: Dict[int, List[float]] = {level: [] for level in range(M)}
-        cal_seeds = seeds[:10] if len(seeds) >= 10 else seeds
-        for level in range(M):
-            for seed in cal_seeds:
-                cal_cfg['pipeline']['random_seed'] = seed
+
+        prev_tau = None
+        streak, used = 0, 0
+        threshold_list = []  # Initialize threshold_list outside the loop
+
+        for seed in seeds[:max_seeds]:
+            used += 1
+            cal_cfg['pipeline']['random_seed'] = seed
+            for level in range(M):
                 result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=100)
-                if result:
+                if result and 'q_values' in result:
                     level_stats[level].extend(result['q_values'])
-        threshold_list: List[float] = []
-        for i in range(M - 1):
-            if level_stats[i] and level_stats[i + 1]:
-                m0, s0 = float(np.mean(level_stats[i])), max(float(np.std(level_stats[i])), 1e-15)
-                m1, s1 = float(np.mean(level_stats[i+1])), max(float(np.std(level_stats[i+1])), 1e-15)
-                threshold_list.append(calculate_ml_threshold(m0, m1, s0, s1))
-        q_eff = get_nt_params(cfg, target_channel)['q_eff_e']
-        threshold_list.sort(reverse=(q_eff < 0))
-        thresholds[f'csk_thresholds_{target_channel.lower()}'] = threshold_list
+
+            # Only check stability if we have enough data
+            if used >= min_seeds and all(len(level_stats[i]) >= min_per_class for i in range(M)):
+                # Recompute thresholds from accumulated stats
+                threshold_list = []
+                for i in range(M - 1):
+                    if level_stats[i] and level_stats[i + 1]:
+                        m0, s0 = float(np.mean(level_stats[i])), max(float(np.std(level_stats[i])), 1e-15)
+                        m1, s1 = float(np.mean(level_stats[i+1])), max(float(np.std(level_stats[i+1])), 1e-15)
+                        threshold_list.append(calculate_ml_threshold(m0, m1, s0, s1))
+                q_eff = get_nt_params(cfg, target_channel)['q_eff_e']
+                threshold_list.sort(reverse=(q_eff < 0))
+
+                delta = _rel_delta(prev_tau, threshold_list)
+                if delta <= eps:
+                    streak += 1
+                    if streak >= patience:
+                        if verbose:
+                            print(f"CSK calibration converged after {used} seeds (delta={delta:.4f})")
+                        break
+                else:
+                    streak = 0
+                prev_tau = threshold_list
+
+        # Use the final threshold list (either from convergence or last iteration)
+        final_threshold_list = prev_tau if prev_tau is not None else threshold_list
+        thresholds[f'csk_thresholds_{target_channel.lower()}'] = final_threshold_list
 
     if mode == "Hybrid":
         stats: Dict[str, List[float]] = {'glu_low': [], 'glu_high': [], 'gaba_low': [], 'gaba_high': []}
@@ -540,6 +602,24 @@ def estimate_isi_overlap_ratio(cfg: Dict[str, Any]) -> float:
         return 0.0
     tail = max(0.0, time_95 - Ts)
     return float(min(1.0, tail / time_95))
+
+def _enforce_min_window(cfg: Dict[str, Any], Ts: float) -> float:
+    """
+    Centralized minimum decision window enforcement.
+    
+    Args:
+        cfg: Configuration dictionary
+        Ts: Symbol period in seconds
+        
+    Returns:
+        Minimum window satisfying all constraints
+    """
+    dt = float(cfg['sim']['dt_s'])
+    min_pts = int(cfg.get('_min_decision_points', 4))
+    # Prefer root-level override when set, else pipeline key, else 0
+    min_win_cfg = float(cfg.get('_min_decision_window_s',
+                          cfg['pipeline'].get('min_decision_window_s', 0.0)))
+    return max(Ts, min_pts * dt, min_win_cfg)
 
 # ============= CSV PERSIST HELPERS (atomic-ish) =============
 def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
@@ -759,9 +839,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--nt-pairs", type=str, default="", help="CSV nt-pairs for CSK sweeps")
     parser.add_argument("--watchdog-secs", type=int, default=1800,
                         help="Soft timeout for seed completion before retry hint (default: 1800s/30min)") 
-    parser.add_argument("--target-ci", type=float, default=0.0,
+    parser.add_argument("--target-ci", type=float, default=0.004,
                         help="If >0, stop adding seeds once Wilson 95% CI half-width <= target. 0 disables.")
-    parser.add_argument("--min-ci-seeds", type=int, default=6,
+    parser.add_argument("--min-ci-seeds", type=int, default=8,
                         help="Minimum seeds required before adaptive CI stopping can trigger.")
     parser.add_argument("--lod-screen-delta", type=float, default=1e-4,
                         help="Hoeffding screening significance (delta) for early-stop LoD tests.")
@@ -771,7 +851,7 @@ def parse_arguments() -> argparse.Namespace:
                         help="Comma-separated distance grid in µm for LoD (e.g., 25,35,45,55,65,75,85,95,105,115,125,150,175,200)")
     parser.add_argument("--lod-num-seeds",
                         type=str,
-                        default=None,
+                        default="<=100:6,<=150:8,>150:10",
                         help=(
                             "LoD seed schedule. Options:\n"
                             "  N                 -> use fixed N seeds for LoD search\n"
@@ -781,8 +861,12 @@ def parse_arguments() -> argparse.Namespace:
                         ))
     parser.add_argument("--lod-seq-len",
                         type=int,
-                        default=None,
+                        default=250,
                         help="If set, temporarily override sequence_length during LoD search only.")
+    parser.add_argument("--lod-validate-seq-len", 
+                        type=int, 
+                        default=None,
+                        help="If set, override sequence_length during final LoD validation only (not search).")
     parser.add_argument("--parallel-modes", type=int, default=1,
                         help=">1 to run MoSK/CSK/Hybrid concurrently (e.g., 3).")
     parser.add_argument("--logdir", default=str((project_root / "results" / "logs")),
@@ -797,13 +881,26 @@ def parse_arguments() -> argparse.Namespace:
                         help="Also keep the display awake (Windows/macOS)")
     parser.add_argument("--max-ts-for-lod", type=float, default=None,
                         help="If set, skip LoD at distances whose dynamic Ts exceeds this (seconds).")
-    parser.add_argument("--max-lod-validation-seeds", type=int, default=None,
+    parser.add_argument("--max-lod-validation-seeds", type=int, default=12,
                         help="Cap the number of seeds used for LoD validation (default: use all seeds).")
     parser.add_argument("--max-symbol-duration-s", type=float, default=None,
                         help="Skip LoD search at distances where symbol period exceeds this limit (seconds).")
     parser.add_argument("--analytic-lod-bracket", action="store_true",
                     help="Use Gaussian SER approximation for tighter LoD bracketing (experimental).")
-    parser.set_defaults(use_ctrl=True)
+    parser.set_defaults(use_ctrl=True, analytic_lod_bracket=True)
+    # Adaptive calibration tuning (Issue 1 optimization)
+    parser.add_argument("--cal-eps-rel", type=float, default=0.01,
+                        help="Adaptive calibration convergence threshold (relative change, default: 0.01)")
+    parser.add_argument("--cal-patience", type=int, default=2,
+                        help="Wait N iterations before stopping convergence (default: 2)")
+    parser.add_argument("--cal-min-seeds", type=int, default=4,
+                        help="Minimum seeds before early stopping can trigger (default: 4)")
+    parser.add_argument("--cal-min-samples", type=int, default=50,
+                        help="Minimum samples per class for stable thresholds (default: 50)")
+    
+    # Window guard tuning (Issue 2 optimization)
+    parser.add_argument("--min-decision-points", type=int, default=4,
+                        help="Minimum time points for window guard (default: 4)")
     args = parser.parse_args()
     
     # Auto-enable sleep inhibition when GUI is requested
@@ -830,8 +927,13 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         dt = cal_cfg['sim']['dt_s']
         detection_window_s = cal_cfg['detection'].get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
         sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
+        
+        # Use deterministic seeding for calibration consistency
+        seed = cal_cfg['pipeline'].get('random_seed', 0)
+        rng = np.random.default_rng(seed)
+        
         for s_tx in tx_symbols:
-            ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, [], cal_cfg, np.random.default_rng())
+            ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, [], cal_cfg, rng)
             n_total_samples = len(ig)
             n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
             if n_detect_samples <= 1:
@@ -906,9 +1008,12 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         # Distance updates: recompute Ts and match window (+ ISI memory)
         if param_name == 'pipeline.distance_um':
             new_symbol_period = calculate_dynamic_symbol_period(cast(float, param_value), cfg_run)
+            dt = float(cfg_run['sim']['dt_s'])
+            min_pts = int(cfg_run.get('_min_decision_points', 4))
+            min_win = _enforce_min_window(cfg_run, new_symbol_period)
             cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
-            cfg_run['pipeline']['time_window_s'] = new_symbol_period
-            cfg_run['detection']['decision_window_s'] = new_symbol_period
+            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
+            cfg_run['detection']['decision_window_s'] = min_win
             if cfg_run['pipeline'].get('enable_isi', False):
                 D_glu = cfg_run['neurotransmitters']['GLU']['D_m2_s']
                 lambda_glu = cfg_run['neurotransmitters']['GLU']['lambda']
@@ -923,9 +1028,12 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             # Update symbol period per the new guard factor, keeping distance fixed
             dist = float(cfg_run['pipeline']['distance_um'])
             new_symbol_period = calculate_dynamic_symbol_period(dist, cfg_run)
+            dt = float(cfg_run['sim']['dt_s'])
+            min_pts = int(cfg_run.get('_min_decision_points', 4))
+            min_win = _enforce_min_window(cfg_run, new_symbol_period)
             cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
-            cfg_run['pipeline']['time_window_s'] = new_symbol_period
-            cfg_run['detection']['decision_window_s'] = new_symbol_period
+            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
+            cfg_run['detection']['decision_window_s'] = min_win
             if cfg_run['pipeline'].get('enable_isi', False):
                 D_glu = cfg_run['neurotransmitters']['GLU']['D_m2_s']
                 lambda_glu = cfg_run['neurotransmitters']['GLU']['lambda']
@@ -934,6 +1042,15 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 guard_factor = float(param_value)
                 isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
                 cfg_run['pipeline']['isi_memory_symbols'] = isi_memory
+
+        # Apply consistent window guard for Nm_per_symbol sweeps (symmetry with distance sweeps)
+        elif param_name == 'pipeline.Nm_per_symbol':
+            # Apply consistent window guard for symmetry
+            dt = float(cfg_run['sim']['dt_s'])
+            min_pts = int(cfg_run.get('_min_decision_points', 4))
+            min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
+            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
+            cfg_run['detection']['decision_window_s'] = min_win
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
@@ -1023,14 +1140,20 @@ def run_sweep(cfg: Dict[str, Any],
             if sweep_param == 'pipeline.distance_um':
                 Ts = calculate_dynamic_symbol_period(cast(float, v), cfg_v)
                 cfg_v['pipeline']['symbol_period_s'] = Ts
-                cfg_v['pipeline']['time_window_s'] = Ts
-                cfg_v['detection']['decision_window_s'] = Ts
+                dt = float(cfg_v['sim']['dt_s'])
+                min_pts = int(cfg_v.get('_min_decision_points', 4))
+                min_win = _enforce_min_window(cfg_v, Ts)
+                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_v['detection']['decision_window_s'] = min_win
             elif sweep_param == 'pipeline.guard_factor':
                 dist = float(cfg_v['pipeline']['distance_um'])
                 Ts = calculate_dynamic_symbol_period(dist, cfg_v)
                 cfg_v['pipeline']['symbol_period_s'] = Ts
-                cfg_v['pipeline']['time_window_s'] = Ts
-                cfg_v['detection']['decision_window_s'] = Ts
+                dt = float(cfg_v['sim']['dt_s'])
+                min_pts = int(cfg_v.get('_min_decision_points', 4))
+                min_win = _enforce_min_window(cfg_v, Ts)
+                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_v['detection']['decision_window_s'] = min_win
             thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds)
 
     # Determine how many seed-jobs remain (for progress accounting)
@@ -1378,6 +1501,14 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
                 cfg_p = deepcopy(cal_cfg)
                 cfg_p['pipeline']['Nm_per_symbol'] = int(nm_probe)
 
+                # NEW: Enforce consistent minimum window (Fix A - minimal, localized)
+                Ts = float(cfg_p['pipeline'].get('symbol_period_s',
+                        calculate_dynamic_symbol_period(float(cfg_p['pipeline']['distance_um']), cfg_p)))
+                min_win = _enforce_min_window(cfg_p, Ts)
+                cfg_p.setdefault('detection', {})
+                cfg_p['pipeline']['time_window_s'] = max(cfg_p['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_p['detection']['decision_window_s'] = min_win
+
                 # thresholds at this Nm (few seeds, cached)
                 th = calibrate_thresholds_cached(cfg_p, seeds[:3])
                 for k, v in th.items():
@@ -1441,7 +1572,11 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
                 # Check if both probes are far from target
                 if ser1 > 10*target_ser and ser2 > 10*target_ser:
                     # Both too high - increase Nm (shift probes up)
-                    probes = [p * 3 for p in probes]
+                    # When both probes are far from target, expand but clamp to [50, 100000]
+                    probes = [max(50, min(100000, p)) for p in [p * 3 for p in probes]]
+                    if all(p == 100000 for p in probes) or all(p == 50 for p in probes):
+                        print("    ⚠️ Analytic probes saturated; aborting analytic bracket.")
+                        break
                     print(f"    🔄 Analytic probes too high ({ser1:.1e}, {ser2:.1e} >> {target_ser:.1e}), expanding up: {probes}")
                     continue
                 elif ser1 < 0.1*target_ser and ser2 < 0.1*target_ser:
@@ -1532,15 +1667,14 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 upper_from_warm = int(mult * warm)
                 upper_from_analytic = int(1.25 * nm_max_analytic)   # optional +25% safety
                 
-                # intersect "warm high" with (padded) analytic high, then cap to the global ceiling
-                nm_max = min(max(nm_max_default, upper_from_warm), upper_from_analytic)
+                # FIXED: respect both caps and the global 100k ceiling
+                nm_max = min(upper_from_warm, upper_from_analytic, nm_max_default)
                 nm_min = max(nm_min, nm_min_analytic)
-                nm_max = min(nm_max, nm_max_default)  # enforce ≤ 100_000
                 
                 print(f"    🔄 Warm + analytic intersect: [{nm_min} - {nm_max}] (capped at 100k)")
         else:
             # Pure warm-start without analytic constraints
-            nm_max = max(nm_max_default, int(mult * warm))
+            nm_max = min(nm_max_default, int(mult * warm))
             print(f"    🔥 Warm-start bracket: [{nm_min} - {nm_max}]")
     
     lod_nm: float = float('nan')
@@ -1554,6 +1688,49 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     
     # Load prior state if resuming
     state = _lod_state_load(mode_name, float(dist_um), use_ctrl) if resume else None
+
+    if state:
+        # 1) Fast exit when a previous run already marked 'done'
+        if state.get("done") and int(state.get("nm_min", 0)) == int(state.get("nm_max", 0)) and int(state.get("nm_min", 0)) > 0:
+            lod_nm = int(state["nm_min"])
+            print(f"    ✓ Resume: LoD already found in previous run → {lod_nm}")
+            return lod_nm, target_ser, 0
+
+        # 2) Try to reconstruct a sane bracket from per-Nm tallies
+        t = state.get("tested", {})
+        if isinstance(t, dict) and t:
+            succ, fail = [], []
+            for k, v in t.items():
+                try:
+                    nm = int(k)
+                    n = int(v.get("n_seen", 0))
+                    kerr = int(v.get("k_err", 0))
+                except Exception:
+                    continue
+                if n <= 0:
+                    continue
+                (succ if (kerr / n) <= target_ser else fail).append(nm)
+
+            succ.sort(); fail.sort()
+            # failure bound below / success bound above -> narrow the bracket
+            if succ and fail:
+                nm_min = max(int(state.get("nm_min", nm_min)), max(fail) + 1)
+                nm_max = min(int(state.get("nm_max", nm_max)), min(succ))
+            elif fail and not succ:
+                nm_min = max(int(state.get("nm_min", nm_min)), max(fail) + 1)
+                nm_max = min(100000, max(int(state.get("nm_max", nm_max)), max(fail) * 2))
+            elif succ and not fail:
+                nm_min = max(50, int(min(succ) * 0.5))
+                nm_max = min(int(state.get("nm_max", nm_max)), min(succ))
+
+        # 3) Guard: never continue with an invalid bracket
+        if nm_min > nm_max:
+            print("    ⚠️  Stale LoD state (nm_min>nm_max). Clearing state and restarting bracket.")
+            _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}})
+            nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
+            nm_max = 100000
+        else:
+            print(f"    ↩️  Resuming LoD search @ {dist_um}μm: range {nm_min}-{nm_max}")
     if state:
         nm_min = int(state.get("nm_min", nm_min))
         nm_max = int(state.get("nm_max", nm_max))
@@ -1692,7 +1869,66 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         if ser <= target_ser:
             lod_nm = nm_mid
             best_ser = ser
-            nm_max = nm_mid - 1
+            
+            # NEW: LoD down-step confirmation accelerator
+            # Try a more aggressive value with minimal seeds for fast screening
+            nm_probe = max(nm_min, int(nm_mid / math.sqrt(2)))  # ~0.7x current
+            if nm_probe < nm_mid and nm_probe >= nm_min:
+                print(f"      [{dist_um}μm|{ctrl_str}] 🚀 Down-step probe: testing Nm={nm_probe} with {min(3, len(seeds))} seeds")
+                
+                # Use minimal seeds for fast screening
+                probe_seeds = seeds[:min(3, len(seeds))]
+                probe_k_err = 0
+                probe_n_seen = 0
+                
+                cfg_probe = deepcopy(cfg_base)
+                cfg_probe['pipeline']['Nm_per_symbol'] = nm_probe
+                for k, v in _get_th(nm_probe).items():
+                    cfg_probe['pipeline'][k] = v
+                
+                for probe_seed in probe_seeds:
+                    # Check cache first
+                    cached_probe = read_seed_cache(mode_name, "lod_search", nm_probe, probe_seed, use_ctrl, cache_tag=cache_tag)
+                    if cached_probe:
+                        probe_k_err += int(cached_probe.get('errors', 0))
+                        probe_n_seen += seq_len
+                    else:
+                        # Run minimal simulation
+                        res_probe = run_param_seed_combo(cfg_probe, 'pipeline.Nm_per_symbol', nm_probe, probe_seed,
+                                                        debug_calibration=False, thresholds_override=_get_th(nm_probe),
+                                                        sweep_name="lod_search", cache_tag=cache_tag)
+                        if res_probe:
+                            probe_k_err += int(res_probe.get('errors', 0))
+                            probe_n_seen += seq_len
+                    
+                    # Early deterministic screen after each seed
+                    total_planned = len(probe_seeds) * seq_len
+                    decide_below, decide_above = _deterministic_screen(probe_k_err, probe_n_seen, total_planned, target_ser)
+                    if decide_below:
+                        # Probe passes! Skip bisection iterations
+                        print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS → skip to Nm={nm_probe}")
+                        lod_nm = nm_probe
+                        nm_max = nm_probe - 1
+                        progress_count += len(probe_seeds)  # Count probe work
+                        break
+                    elif decide_above:
+                        # Probe fails decisively, stick with original nm_mid
+                        print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL → continue bisection")
+                        progress_count += len(probe_seeds)  # Count probe work  
+                        break
+                else:
+                    # All probe seeds completed, check final SER
+                    if probe_n_seen > 0:
+                        probe_ser = probe_k_err / probe_n_seen
+                        if probe_ser <= target_ser:
+                            print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS (SER={probe_ser:.4f}) → skip to Nm={nm_probe}")
+                            lod_nm = nm_probe
+                            nm_max = nm_probe - 1
+                        else:
+                            print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL (SER={probe_ser:.4f}) → continue bisection")
+                        progress_count += len(probe_seeds)
+            
+            nm_max = nm_mid - 1  # Standard bisection update
         else:
             nm_min = nm_mid + 1
             
@@ -1705,10 +1941,22 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                          "last_nm": nm_mid})
 
     # OPTIMIZATION 1: Cap LoD validation retries
-    if math.isnan(lod_nm) and nm_min <= 100000:
-        print(f"    [{dist_um}μm|{ctrl_str}] Final check at Nm={nm_min}")
+    # Only run a single-point validation when the bracket collapsed to one point
+    if math.isnan(lod_nm) and nm_min <= 100000 and nm_min == nm_max:
+        print(f"    [{dist_um}μm|{ctrl_str}] Final validation at Nm={nm_min}")
         cfg_final = deepcopy(cfg_base)
         cfg_final['pipeline']['Nm_per_symbol'] = nm_min
+        
+        # NEW: enforce minimum decision window here
+        Ts = float(cfg_final['pipeline'].get(
+            'symbol_period_s',
+            calculate_dynamic_symbol_period(float(cfg_final['pipeline']['distance_um']), cfg_final)
+        ))
+        min_win = _enforce_min_window(cfg_final, Ts)
+        cfg_final.setdefault('detection', {})
+        cfg_final['pipeline']['time_window_s'] = max(cfg_final['pipeline'].get('time_window_s', 0.0), min_win)
+        cfg_final['detection']['decision_window_s'] = min_win
+        
         cal_seeds = list(range(10))
         thresholds = calibrate_thresholds(cfg_final, cal_seeds, recalibrate=False, save_to_file=True, verbose=False)
         for k, v in thresholds.items():
@@ -1772,16 +2020,38 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
     # Ensure symbol period and decision window are consistent for this distance
     Ts = calculate_dynamic_symbol_period(float(cfg['pipeline']['distance_um']), cfg)
     cfg['pipeline']['symbol_period_s'] = Ts
-    cfg['pipeline']['time_window_s'] = Ts
+    dt = float(cfg['sim']['dt_s'])
+    min_pts = int(cfg.get('_min_decision_points', 4))
+    min_win = _enforce_min_window(cfg, Ts)
+    cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
     cfg.setdefault('detection', {})
-    cfg['detection']['decision_window_s'] = Ts
+    cfg['detection']['decision_window_s'] = min_win
 
     cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
+
+    # NEW: Apply LoD validation sequence length override if specified
+    lod_validate_seq_len = cfg_base.get('_lod_validate_seq_len', None)
+    if lod_validate_seq_len:
+        cfg['pipeline']['sequence_length'] = int(lod_validate_seq_len)
+        print(f"    📏 LoD validation using shorter sequences: {lod_validate_seq_len} symbols/seed")
 
     # Apply thresholds at this exact operating point
     th = calibrate_thresholds_cached(cfg, list(range(10)))
     for k, v in th.items():
         cfg['pipeline'][k] = v
+
+    # NEW: Read adaptive stopping configuration
+    target_ci = float(cfg_base.get('_stage13_target_ci', 0.0))  # reuse runner knob
+    min_ci_seeds = int(cfg_base.get('_stage13_min_ci_seeds', 8))
+
+    def _wilson_halfwidth(k_err: int, n_tot: int, z: float = 1.96) -> float:
+        if n_tot <= 0:
+            return 1.0
+        p = k_err / n_tot
+        denom = 1 + z*z/n_tot
+        center = (p + z*z/(2*n_tot)) / denom
+        rad = z * math.sqrt(p*(1-p)/n_tot + z*z/(4*n_tot*n_tot)) / denom
+        return rad
 
     # Determine bits/symbol
     mode = cfg['pipeline']['modulation']
@@ -1795,18 +2065,33 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
 
     per_seed_rates, per_seed_ser = [], []
     Ts_list = []
+    
+    # NEW: Adaptive stopping variables
+    k_err, n_tot = 0, 0
 
-    for seed in full_seeds:
+    for i, seed in enumerate(full_seeds):
         res = run_single_instance(cfg, seed, attach_isi_meta=True)
         if res is None:
             continue
         L = int(cfg['pipeline']['sequence_length'])
         e = res.get('errors', None)
+        
+        # NEW: Accumulate errors for adaptive stopping
+        if e is not None:
+            k_err += int(e)
+            n_tot += L
+        
         ser_seed = float(res.get('ser', res.get('SER', (e / L) if (e is not None and L > 0) else 1.0)))
         Ts_seed = float(res.get('symbol_period_s', Ts))
         per_seed_rates.append((bpsym / Ts_seed) * (1.0 - ser_seed))
         per_seed_ser.append(ser_seed)
         Ts_list.append(Ts_seed)
+
+        # NEW: Adaptive stop once CI is tight enough (after min seeds)
+        if target_ci > 0 and (i + 1) >= min_ci_seeds:
+            if _wilson_halfwidth(k_err, n_tot) <= target_ci:
+                print(f"    ✓ Early CI stop: {i+1}/{len(full_seeds)} seeds (CI half-width ≤ {target_ci:.3f})")
+                break
 
     if per_seed_rates:
         mean_rate = float(np.mean(per_seed_rates))
@@ -1854,8 +2139,8 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             'lod_nm': float('nan'),
             'ser_at_lod': float('nan'),
             'data_rate_bps': 0.0,
-            'ci_low': float('nan'),
-            'ci_high': float('nan'),
+            'data_rate_ci_low': float('nan'),
+            'data_rate_ci_high': float('nan'),
             'symbol_period_s': Ts_dyn,
             'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
         }
@@ -1869,7 +2154,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
             'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
             'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
-            'actual_progress': 0
+            'actual_progress': 0, 'skipped_reason': f'Ts>{args.max_ts_for_lod}s'
         }
     cfg['pipeline']['symbol_period_s'] = Ts_dyn
     
@@ -1893,10 +2178,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             # Update config with LoD
             cfg['pipeline']['Nm_per_symbol'] = lod_nm
             
-            # Ensure detection window matches Ts
-            cfg['pipeline']['time_window_s'] = cfg['pipeline']['symbol_period_s']
+            # Ensure detection window matches Ts with consistent guard
+            dt = float(cfg['sim']['dt_s'])
+            min_pts = int(cfg.get('_min_decision_points', 4))
+            Ts = cfg['pipeline']['symbol_period_s']
+            min_win = _enforce_min_window(cfg, Ts)
+            cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
             cfg.setdefault('detection', {})
-            cfg['detection']['decision_window_s'] = cfg['pipeline']['symbol_period_s']
+            cfg['detection']['decision_window_s'] = min_win
 
             # Ensure the same thresholds used during LoD search are active here
             cal_seeds = list(range(10))
@@ -2010,12 +2299,17 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         # Re-simulate at the LoD point to collect noise_sigma_I_diff
         cfg_lod = deepcopy(cfg_base)
         cfg_lod['pipeline']['distance_um'] = dist_um
-        # Recompute Ts and decision window for this distance
+        # Recompute Ts and enforce a consistent minimum decision window
         Ts_lod = calculate_dynamic_symbol_period(dist_um, cfg_lod)
-        cfg_lod['pipeline']['symbol_period_s'] = Ts_lod
-        cfg_lod['pipeline']['time_window_s'] = Ts_lod
+
+        dt = float(cfg_lod['sim']['dt_s'])
+        min_pts = int(cfg_lod.get('_min_decision_points', 4))
+        min_win = _enforce_min_window(cfg_lod, Ts_lod)
+
+        cfg_lod['pipeline']['symbol_period_s'] = Ts_lod           # keep the true dynamic Ts
+        cfg_lod['pipeline']['time_window_s'] = max(cfg_lod['pipeline'].get('time_window_s', 0.0), min_win)
         cfg_lod.setdefault('detection', {})
-        cfg_lod['detection']['decision_window_s'] = Ts_lod
+        cfg_lod['detection']['decision_window_s'] = min_win       # <- align
 
         cfg_lod['pipeline']['Nm_per_symbol'] = lod_nm
 
@@ -2047,6 +2341,15 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         done_state = {"done": True, "nm_min": lod_nm, "nm_max": lod_nm}
         _lod_state_save(cfg['pipeline']['modulation'], float(dist_um),
                         bool(cfg['pipeline'].get('use_control_channel', True)), done_state)
+    except Exception:
+        pass
+    
+    # If LoD was not found, remove stale state so the next --resume starts clean
+    try:
+        if (isinstance(lod_nm, float) and (math.isnan(lod_nm) or lod_nm <= 0)) or (isinstance(lod_nm, int) and lod_nm <= 0):
+            p = _lod_state_path(cfg['pipeline']['modulation'], float(dist_um), bool(cfg['pipeline'].get('use_control_channel', True)))
+            if p.exists():
+                p.unlink()
     except Exception:
         pass
     
@@ -2216,7 +2519,10 @@ def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_
         if out_csv.exists() and not df_pair.empty:
             prev = pd.read_csv(out_csv)
             nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in prev.columns else 'pipeline.Nm_per_symbol'
-            combined = pd.concat([prev, df_pair], ignore_index=True).drop_duplicates(subset=[nm_key], keep='last')
+            # Include use_ctrl in deduplication when both states are present
+            combined = pd.concat([prev, df_pair], ignore_index=True)
+            subset = [nm_key] + (['use_ctrl'] if 'use_ctrl' in combined.columns else [])
+            combined = combined.drop_duplicates(subset=subset, keep='last')
             _atomic_write_csv(out_csv, combined)
 
     print("✓ NT-pair sweeps complete; comparative figure will be generated by generate_comparative_plots.py")
@@ -2265,9 +2571,12 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     # NEW: Recompute symbol period and decision window for this distance
                     Ts = calculate_dynamic_symbol_period(d, cfg)
                     cfg['pipeline']['symbol_period_s'] = Ts
-                    cfg['pipeline']['time_window_s'] = Ts
+                    dt = float(cfg['sim']['dt_s'])
+                    min_pts = int(cfg.get('_min_decision_points', 4))
+                    min_win = _enforce_min_window(cfg, Ts)
+                    cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
                     cfg.setdefault('detection', {})
-                    cfg['detection']['decision_window_s'] = Ts
+                    cfg['detection']['decision_window_s'] = min_win  # FIXED: use min_win for consistency
                     
                     # NEW: Calibrate thresholds for this specific (distance, guard_factor) point
                     try:
@@ -2408,6 +2717,16 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
     cfg['_analytic_lod_bracket'] = getattr(args, 'analytic_lod_bracket', False)
+    # Apply CLI optimization parameters to config
+    cfg['_cal_eps_rel'] = args.cal_eps_rel
+    cfg['_cal_patience'] = args.cal_patience  
+    cfg['_cal_min_seeds'] = args.cal_min_seeds
+    cfg['_cal_min_samples_per_class'] = args.cal_min_samples
+    cfg['_min_decision_points'] = args.min_decision_points
+    
+    # NEW: Pass LoD validation sequence length override
+    if getattr(args, 'lod_validate_seq_len', None) is not None:
+        cfg['_lod_validate_seq_len'] = int(args.lod_validate_seq_len)
     # make LoD skip/limit flags visible to workers via cfg
     if getattr(args, "max_lod_validation_seeds", None) is not None:
         cfg["max_lod_validation_seeds"] = int(args.max_lod_validation_seeds)
@@ -2570,8 +2889,11 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             try:
                 Ts = calculate_dynamic_symbol_period(int(d), cfg_d)
                 cfg_d['pipeline']['symbol_period_s'] = Ts
-                cfg_d['pipeline']['time_window_s'] = Ts
-                cfg_d['detection']['decision_window_s'] = Ts
+                dt = float(cfg_d['sim']['dt_s'])
+                min_pts = int(cfg_d.get('_min_decision_points', 4))
+                min_win = _enforce_min_window(cfg_d, Ts)
+                cfg_d['pipeline']['time_window_s'] = max(cfg_d['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_d['detection']['decision_window_s'] = min_win
             except Exception:
                 pass
             

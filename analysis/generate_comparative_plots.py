@@ -86,23 +86,51 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
     markers = {'MoSK': 'o', 'CSK': 's', 'Hybrid': '^'}
     linestyles = {'MoSK': '-', 'CSK': '--', 'Hybrid': '-.'}
 
-    # Panel (a): SER curves with CIs when available
+    # Panel (a): SER curves with CIs when available - CTRL state separation
+    ctrl_styles = {True: '-', False: '--'}      # with-CTRL: solid, no-CTRL: dashed
+    ctrl_labels = {True: '', False: ' (no CTRL)'}  # suffix for no-CTRL
+    
     for mode in ['MoSK', 'CSK', 'Hybrid']:
         if mode in results and 'ser_vs_nm' in results[mode]:
             df = results[mode]['ser_vs_nm'].copy()
             nmcol = _nm_col(df)
             if nmcol and 'ser' in df.columns:
-                df = df.sort_values(nmcol)
-                ax1.loglog(df[nmcol], df['ser'],
-                           color=colors[mode], marker=markers[mode],
-                           linestyle=linestyles[mode], markersize=6, label=mode, linewidth=2,
-                           markerfacecolor='none' if mode == 'CSK' else colors[mode])
-                ci = _get_ci_for_df(df)
-                if ci is not None:
-                    low, high = ci
-                    yerr = np.vstack([df['ser'].to_numpy() - low, high - df['ser'].to_numpy()])
-                    ax1.errorbar(df[nmcol], df['ser'], yerr=yerr,
-                                 fmt='none', ecolor=colors[mode], alpha=0.35, capsize=2)
+                # Check if CTRL state separation is needed
+                if 'use_ctrl' in df.columns and df['use_ctrl'].nunique() > 1:
+                    # Separate plotting by CTRL state
+                    for ctrl_state, grp in df.groupby('use_ctrl'):
+                        if grp.empty:
+                            continue
+                        grp_sorted = grp.sort_values(nmcol)
+                        
+                        ax1.loglog(grp_sorted[nmcol], grp_sorted['ser'],
+                                   color=colors[mode], marker=markers[mode],
+                                   linestyle=ctrl_styles[bool(ctrl_state)], 
+                                   markersize=6, 
+                                   label=f"{mode}{ctrl_labels[bool(ctrl_state)]}", 
+                                   linewidth=2,
+                                   markerfacecolor='none' if mode == 'CSK' else colors[mode],
+                                   alpha=0.9 if ctrl_state else 0.6)  # Fade no-CTRL slightly
+                        
+                        ci = _get_ci_for_df(grp_sorted)
+                        if ci is not None:
+                            low, high = ci
+                            yerr = np.vstack([grp_sorted['ser'].to_numpy() - low, high - grp_sorted['ser'].to_numpy()])
+                            ax1.errorbar(grp_sorted[nmcol], grp_sorted['ser'], yerr=yerr,
+                                         fmt='none', ecolor=colors[mode], alpha=0.25 if ctrl_state else 0.15, capsize=2)
+                else:
+                    # Single CTRL state or no CTRL column - original behavior
+                    df_sorted = df.sort_values(nmcol)
+                    ax1.loglog(df_sorted[nmcol], df_sorted['ser'],
+                               color=colors[mode], marker=markers[mode],
+                               linestyle=linestyles[mode], markersize=6, label=mode, linewidth=2,
+                               markerfacecolor='none' if mode == 'CSK' else colors[mode])
+                    ci = _get_ci_for_df(df_sorted)
+                    if ci is not None:
+                        low, high = ci
+                        yerr = np.vstack([df_sorted['ser'].to_numpy() - low, high - df_sorted['ser'].to_numpy()])
+                        ax1.errorbar(df_sorted[nmcol], df_sorted['ser'], yerr=yerr,
+                                     fmt='none', ecolor=colors[mode], alpha=0.35, capsize=2)
 
     ax1.set_xlabel('Number of Molecules per Symbol (Nm)')
     ax1.set_ylabel('Symbol Error Rate (SER)')
@@ -114,17 +142,38 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
     ax1.axhline(y=0.01, color='k', linestyle=':', alpha=0.6)
     ax1.text(2.2e2, 0.013, 'Target SER = 1%', fontsize=8, alpha=0.8)
 
-    # Panel (b): Hybrid error components
+    # Panel (b): Hybrid error components - ENHANCED with CTRL state separation
     if 'Hybrid' in results and 'ser_vs_nm' in results['Hybrid']:
         dfh = results['Hybrid']['ser_vs_nm']
         nmcol = _nm_col(dfh)
         if nmcol and all(c in dfh.columns for c in ['mosk_ser', 'csk_ser', 'ser']):
-            dfh = dfh.sort_values(nmcol)
-            ax2.loglog(dfh[nmcol], dfh['ser'], 'k-', linewidth=2, label='Total SER', marker='o', markersize=5)
-            ax2.loglog(dfh[nmcol], dfh['mosk_ser'], color=colors['MoSK'], linestyle='--',
-                       linewidth=2, label='MoSK errors', marker='^', markersize=5)
-            ax2.loglog(dfh[nmcol], dfh['csk_ser'], color=colors['CSK'], linestyle='-.',
-                       linewidth=2, label='CSK errors', marker='s', markersize=5)
+            # Check if CTRL state separation is needed
+            if 'use_ctrl' in dfh.columns and dfh['use_ctrl'].nunique() > 1:
+                # Separate plotting by CTRL state
+                for ctrl_state, grp in dfh.groupby('use_ctrl'):
+                    if grp.empty:
+                        continue
+                    g = grp.sort_values(nmcol)
+                    ls = ctrl_styles[bool(ctrl_state)]
+                    suf = ctrl_labels[bool(ctrl_state)]
+                    alpha = 0.9 if ctrl_state else 0.6
+                    
+                    ax2.loglog(g[nmcol], g['ser'], 'k', linestyle=ls, linewidth=2, 
+                            label=f'Total SER{suf}', alpha=alpha, marker='o', markersize=5)
+                    ax2.loglog(g[nmcol], g['mosk_ser'], color=colors['MoSK'], 
+                            linestyle='--' if ls=='-' else ':', linewidth=2, 
+                            label=f'MoSK errors{suf}', marker='^', markersize=5, alpha=alpha)
+                    ax2.loglog(g[nmcol], g['csk_ser'], color=colors['CSK'], 
+                            linestyle='-.', linewidth=2, 
+                            label=f'CSK errors{suf}', marker='s', markersize=5, alpha=alpha)
+            else:
+                # Single CTRL state or no CTRL column - original behavior
+                dfh = dfh.sort_values(nmcol)
+                ax2.loglog(dfh[nmcol], dfh['ser'], 'k-', linewidth=2, label='Total SER', marker='o', markersize=5)
+                ax2.loglog(dfh[nmcol], dfh['mosk_ser'], color=colors['MoSK'], linestyle='--',
+                        linewidth=2, label='MoSK errors', marker='^', markersize=5)
+                ax2.loglog(dfh[nmcol], dfh['csk_ser'], color=colors['CSK'], linestyle='-.',
+                        linewidth=2, label='CSK errors', marker='s', markersize=5)
 
     ax2.set_xlabel('Number of Molecules per Symbol (Nm)')
     ax2.set_ylabel('Error Rate')
@@ -318,6 +367,7 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
     """
     Stage 7: Plot CSK SER vs Nm for multiple neurotransmitter pairs.
     Looks for files named ser_vs_nm_csk_<a>_<b>.csv in results/data.
+    ENHANCED: Now separates CTRL states when both are present.
     """
     files = sorted(data_dir.glob("ser_vs_nm_csk_*_*.csv"))
     if not files:
@@ -331,13 +381,37 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
         if nmcol is None or 'ser' not in df.columns:
             continue
         label = f.stem.replace("ser_vs_nm_csk_", "").replace("_", "–").upper()
-        df = df.sort_values(nmcol)
-        plt.loglog(df[nmcol], df['ser'], label=label, linewidth=2, marker='o', markersize=5)
-        ci = _get_ci_for_df(df)
-        if ci is not None:
-            low, high = ci
-            yerr = np.vstack([df['ser'].to_numpy() - low, high - df['ser'].to_numpy()])
-            plt.errorbar(df[nmcol], df['ser'], yerr=yerr, fmt='none', alpha=0.35, capsize=2)
+        
+        # Check if CTRL state separation is needed
+        if 'use_ctrl' in df.columns and df['use_ctrl'].nunique() > 1:
+            # Separate plotting by CTRL state
+            for ctrl_state, grp in df.groupby('use_ctrl'):
+                if grp.empty:
+                    continue
+                grp = grp.sort_values(nmcol)
+                ls = '-' if ctrl_state else '--'
+                suf = '' if ctrl_state else ' (no CTRL)'
+                alpha = 0.9 if ctrl_state else 0.6
+                
+                plt.loglog(grp[nmcol], grp['ser'], label=f"{label}{suf}", 
+                          linewidth=2, marker='o', markersize=5, linestyle=ls, alpha=alpha)
+                
+                # Add confidence intervals if available
+                ci = _get_ci_for_df(grp)
+                if ci is not None:
+                    low, high = ci
+                    yerr = np.vstack([grp['ser'].to_numpy() - low, high - grp['ser'].to_numpy()])
+                    plt.errorbar(grp[nmcol], grp['ser'], yerr=yerr, fmt='none', 
+                               alpha=0.25 if ctrl_state else 0.15, capsize=2)
+        else:
+            # Single CTRL state or no CTRL column - original behavior
+            df = df.sort_values(nmcol)
+            plt.loglog(df[nmcol], df['ser'], label=label, linewidth=2, marker='o', markersize=5)
+            ci = _get_ci_for_df(df)
+            if ci is not None:
+                low, high = ci
+                yerr = np.vstack([df['ser'].to_numpy() - low, high - df['ser'].to_numpy()])
+                plt.errorbar(df[nmcol], df['ser'], yerr=yerr, fmt='none', alpha=0.35, capsize=2)
 
     plt.xlabel('Number of Molecules per Symbol (Nm)')
     plt.ylabel('Symbol Error Rate (SER)')

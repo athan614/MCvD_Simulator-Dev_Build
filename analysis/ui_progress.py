@@ -219,9 +219,18 @@ class _GuiBackend:
             # update label text
             if row.widget:
                 _, lbl, bar, _ = row.widget
-                lbl.configure(text=self._label_with_stats(key))
+                # Harden against widget destruction races
+                try:
+                    if lbl.winfo_exists():
+                        lbl.configure(text=self._label_with_stats(key))
+                except Exception:  # Covers TclError and others
+                    pass
                 # ensure maximum reflects the new total right away
-                bar.configure(maximum=max(int(row.total), 1))
+                try:
+                    if bar.winfo_exists():
+                        bar.configure(maximum=max(int(row.total), 1))
+                except Exception:
+                    pass
             return
 
         # choose frame by kind
@@ -283,8 +292,17 @@ class _GuiBackend:
             # update widgets
             if row.widget:
                 _, lbl, bar, eta_lbl = row.widget
-                lbl.configure(text=self._label_with_stats(key))
-                bar.configure(value=row.completed, maximum=max(int(row.total),1))
+                # Harden against widget destruction races
+                try:
+                    if lbl.winfo_exists():
+                        lbl.configure(text=self._label_with_stats(key))
+                except Exception:  # Covers TclError and others
+                    pass
+                try:
+                    if bar.winfo_exists():
+                        bar.configure(value=row.completed, maximum=max(int(row.total),1))
+                except Exception:
+                    pass
                 # eta is refreshed by _refresh_etas()
             # Bubble increments to parent(s)
             self._bump_parent(row.parent, inc)
@@ -318,8 +336,17 @@ class _GuiBackend:
         prow.completed = max(0, min(prow.completed + inc, prow.total))
         if prow.widget:
             _, lbl, bar, eta_lbl = prow.widget
-            lbl.configure(text=self._label_with_stats(parent_key))
-            bar.configure(value=prow.completed, maximum=max(int(prow.total),1))
+            # Harden against widget destruction races
+            try:
+                if lbl.winfo_exists():
+                    lbl.configure(text=self._label_with_stats(parent_key))
+            except Exception:  # Covers TclError and others
+                pass
+            try:
+                if bar.winfo_exists():
+                    bar.configure(value=prow.completed, maximum=max(int(prow.total),1))
+            except Exception:
+                pass
         # Recurse upward if there is a grandparent
         self._bump_parent(prow.parent, inc)
 

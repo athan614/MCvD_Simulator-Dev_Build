@@ -121,6 +121,15 @@ pipeline:
   level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
   csk_levels: 2                 # Number of concentration levels for CSK and Hybrid modes
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
+
+  # -------- Advanced Optimization Parameters --------
+  # Adaptive calibration tuning (Issue 1 optimization)
+  _cal_eps_rel: 0.01            # Convergence threshold (1% relative change)
+  _cal_patience: 2              # Wait 2 iterations before stopping
+  _cal_min_seeds: 4             # Minimum seeds before early stopping
+  # Window guard tuning (Issue 2 optimization)  
+  _min_decision_points: 4       # Minimum time points for window guard
+
   channel_spacing_um: 200       # from paper
   # Channel positions relative to organoid center
   channel_positions:
