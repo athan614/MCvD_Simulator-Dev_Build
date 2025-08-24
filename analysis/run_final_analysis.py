@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from html import parser
+from multiprocessing import pool
 import sys
 import json
 import argparse
@@ -301,6 +302,9 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
         cfg['pipeline'].get('guard_factor', 0.0),
         bool(cfg['pipeline'].get('use_control_channel', True)),  # NEW
         _nt_pair_fp(cfg),  # NEW: bind cache to active NT pair
+        # ✅ FIXED: Add combiner and leakage parameters
+        cfg['pipeline'].get('csk_combiner', 'zscore'),
+        cfg['pipeline'].get('csk_leakage_frac', 0.0),
     ]
     return str(hash(tuple(str(p) for p in key_params)))
 
@@ -339,6 +343,7 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     nm = cfg['pipeline'].get('Nm_per_symbol', None)
     lvl = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     tgt = cfg['pipeline'].get('csk_target_channel', '')
+    M   = cfg['pipeline'].get('csk_levels', None)  # 🛠 ADD THIS LINE
     gf  = cfg['pipeline'].get('guard_factor', None)
     parts = [f"thresholds_{mode}", _nt_pair_label(cfg)]
     parts.append(f"pair{_nt_pair_fingerprint(cfg)}")  # NEW: always disambiguate
@@ -347,11 +352,72 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     if nm is not None:   parts.append(f"Nm{nm:.0f}")
     if tgt:              parts.append(f"tgt{tgt}")
     if lvl:              parts.append(f"lvl{lvl}")
+    # 🛠 include CSK M in filename to avoid reusing wrong-length threshold lists
+    if mode.startswith("csk") and M is not None:
+        parts.append(f"M{int(M)}")
     if gf is not None:   parts.append(f"gf{gf:.3g}")
+    # ✅ FIXED: Add combiner and leakage to filename
+    cmb = cfg['pipeline'].get('csk_combiner', 'zscore')
+    parts.append(f"cmb{cmb}")
+    lf = cfg['pipeline'].get('csk_leakage_frac', None)
+    if cmb == 'leakage' and lf is not None:
+        parts.append(f"leak{float(lf):.3g}")
     # Add before the return statement:
     ctrl = 'wctrl' if bool(cfg['pipeline'].get('use_control_channel', True)) else 'noctrl'
     parts.append(ctrl)
     return results_dir / ( "_".join(parts) + ".json" )
+
+def run_sequence_wrapper(cfg: Dict[str, Any], seed: int, attach_isi_meta: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Wrapper around run_sequence to handle configuration validation and threshold management.
+    
+    DEFENSIVE CSK THRESHOLD MANAGEMENT:
+    - Clears stale CSK thresholds unless --resume is active with matching configuration
+    - Ensures threshold provenance matches current (M, target_channel, combiner) triple
+    """
+    from src.pipeline import run_sequence
+    
+    # DEFENSIVE FIX: Clear stale CSK thresholds before simulation
+    if cfg['pipeline']['modulation'].startswith('CSK'):
+        current_M = int(cfg['pipeline'].get('csk_levels', 4))
+        current_target = cfg['pipeline'].get('csk_target_channel', 'GLU')
+        current_combiner = cfg['pipeline'].get('csk_combiner', 'zscore')
+        
+        # Check if we should preserve thresholds (only during --resume with matching config)
+        should_preserve = False
+        
+        # Only check cache if we're in a resume context (detected by presence of cache metadata)
+        if '_resume_active' in cfg and cfg['_resume_active']:
+            # Check if cached thresholds match current configuration
+            threshold_key = f'csk_thresholds_{current_target.lower()}'
+            cached_thresholds = cfg['pipeline'].get(threshold_key, [])
+            
+            if (isinstance(cached_thresholds, list) and 
+                len(cached_thresholds) == (current_M - 1)):
+                # Validate that cache metadata matches current config
+                cache_meta = cfg.get('_threshold_cache_meta', {})
+                if (cache_meta.get('M') == current_M and
+                    cache_meta.get('target_channel') == current_target and
+                    cache_meta.get('combiner') == current_combiner):
+                    should_preserve = True
+        
+        if not should_preserve:
+            # Clear all CSK threshold keys to force recalibration
+            keys_to_clear = [k for k in cfg['pipeline'].keys() if k.startswith('csk_thresholds_')]
+            for key in keys_to_clear:
+                if key in cfg['pipeline']:
+                    del cfg['pipeline'][key]
+                    print(f"🧹 Cleared stale threshold key: {key}")
+            
+            # Also clear any cached metadata
+            if '_threshold_cache_meta' in cfg:
+                del cfg['_threshold_cache_meta']
+    
+    # Store ISI metadata if requested
+    if attach_isi_meta:
+        cfg['collect_isi_metrics'] = True
+    
+    return run_sequence(cfg)
 
 def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False,
                          save_to_file: bool = True, verbose: bool = False) -> Dict[str, Union[float, List[float]]]:
@@ -363,9 +429,36 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
 
     if threshold_file.exists() and not recalibrate and save_to_file:
         try:
-            with open(threshold_file, 'r') as f:
+            with open(threshold_file, 'r', encoding='utf-8') as f:
                 loaded_thresholds = json.load(f)
-                return {k: v for k, v in loaded_thresholds.items()}
+            
+            # 🛡 Enhanced metadata verification for cache compatibility
+            meta = loaded_thresholds.get("__meta__", {})
+            current_combiner = str(cfg['pipeline'].get('csk_combiner', 'zscore'))
+            current_leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
+            cached_combiner = str(meta.get('combiner', 'zscore'))
+            cached_leakage = float(meta.get('leakage_frac', 0.0))
+            
+            # Check combiner/leakage compatibility
+            if current_combiner != cached_combiner:
+                print(f"⚠️  Discarding threshold cache {threshold_file.name} "
+                    f"(combiner mismatch: {cached_combiner} vs {current_combiner}). Recalibrating…")
+            elif abs(current_leakage - cached_leakage) > 1e-9:
+                print(f"⚠️  Discarding threshold cache {threshold_file.name} "
+                    f"(leakage mismatch: {cached_leakage} vs {current_leakage}). Recalibrating…")
+            else:
+                # 🛡 Guard: for CSK, enforce M−1 thresholds
+                if str(cfg['pipeline'].get('modulation', '')).startswith("CSK"):
+                    M = int(cfg['pipeline'].get('csk_levels', 4))
+                    tgt = str(cfg['pipeline'].get('csk_target_channel', 'GLU')).lower()
+                    tau = loaded_thresholds.get(f"csk_thresholds_{tgt}", [])
+                    if not isinstance(tau, list) or len(tau) != (M - 1):
+                        print(f"⚠️  Discarding stale CSK thresholds cache {threshold_file.name} "
+                            f"(len={len(tau) if isinstance(tau, list) else 'NA'} vs M-1={M-1}). Recalibrating…")
+                    else:
+                        return {k: v for k, v in loaded_thresholds.items()}
+                else:
+                    return {k: v for k, v in loaded_thresholds.items()}
         except Exception:
             pass  # fall through to re-calculate
 
@@ -426,7 +519,6 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     if mode.startswith("CSK"):
         M = int(cfg['pipeline']['csk_levels'])
         target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
-        level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
         level_stats: Dict[int, List[float]] = {level: [] for level in range(M)}
 
         prev_tau = None
@@ -467,6 +559,15 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         # Use the final threshold list (either from convergence or last iteration)
         final_threshold_list = prev_tau if prev_tau is not None else threshold_list
         thresholds[f'csk_thresholds_{target_channel.lower()}'] = final_threshold_list
+        
+        # ENHANCEMENT: Store cache metadata for threshold provenance tracking
+        import time
+        cfg['_threshold_cache_meta'] = {
+            'M': M,
+            'target_channel': target_channel,
+            'combiner': cfg['pipeline'].get('csk_combiner', 'zscore'),
+            'timestamp': time.time()
+        }
 
     if mode == "Hybrid":
         stats: Dict[str, List[float]] = {'glu_low': [], 'glu_high': [], 'gaba_low': [], 'gaba_high': []}
@@ -489,8 +590,24 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     if save_to_file:
         try:
             tmp = threshold_file.with_suffix(threshold_file.suffix + ".tmp")
+            payload = {
+                "__meta__": {
+                    "mode": str(cfg['pipeline'].get('modulation')),
+                    "M": int(cfg['pipeline'].get('csk_levels', 0)),
+                    "target": str(cfg['pipeline'].get('csk_target_channel', '')).upper(),
+                    "lvl_scheme": str(cfg['pipeline'].get('csk_level_scheme', 'uniform')),
+                    "combiner": str(cfg['pipeline'].get('csk_combiner', 'zscore')),  # 🛠 ADD THIS LINE
+                    "leakage_frac": float(cfg['pipeline'].get('csk_leakage_frac', 0.0)),  # 🛠 ADD THIS LINE
+                    "Nm": int(cfg['pipeline'].get('Nm_per_symbol', 0)),
+                    "distance_um": int(cfg['pipeline'].get('distance_um', 0)),
+                    "Ts": float(cfg['pipeline'].get('symbol_period_s', 0.0)),
+                    "guard_factor": float(cfg['pipeline'].get('guard_factor', 0.0)),
+                    "use_ctrl": bool(cfg['pipeline'].get('use_control_channel', True)),
+                },
+                **thresholds
+            }
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(thresholds, f, indent=2)
+                json.dump(payload, f, indent=2)
             os.replace(tmp, threshold_file)
         except Exception:
             # Best-effort; calibration can be recomputed if needed
@@ -503,15 +620,32 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
 
     return thresholds
 
-def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int]) -> Dict[str, Union[float, List[float]]]:
+def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False) -> Dict[str, Union[float, List[float]]]:
     """
     Memory + disk cached calibration. Persist JSON so multiple processes/runs reuse it.
     """
     cache_key = get_cache_key(cfg)
+    
+    # If recalibrating, clear both memory and disk cache
+    if recalibrate:
+        # Clear memory cache
+        if cache_key in calibration_cache:
+            del calibration_cache[cache_key]
+        # Clear disk cache
+        threshold_file = _thresholds_filename(cfg)
+        if threshold_file.exists():
+            try:
+                threshold_file.unlink()
+                print(f"🗑️  Cleared threshold cache: {threshold_file.name}")
+            except Exception:
+                pass  # Best effort
+    
+    # Check memory cache first
     if cache_key in calibration_cache:
         return calibration_cache[cache_key]
-    # IMPORTANT: persist to file (save_to_file=True) and do not force recalibration here
-    result = calibrate_thresholds(cfg, seeds, recalibrate=False, save_to_file=True, verbose=False)
+    
+    # Compute thresholds (respecting the recalibrate flag)
+    result = calibrate_thresholds(cfg, seeds, recalibrate=recalibrate, save_to_file=True, verbose=False)
     
     # Bound cache size to prevent memory bloat during long sweeps
     if len(calibration_cache) >= MAX_CACHE_SIZE:
@@ -538,6 +672,8 @@ def check_memory_usage():
 
 def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = preprocess_config(config)
+    
+    # Add missing defaults for optional OECT parameters to prevent KeyError
     if 'oect' not in cfg:
         cfg['oect'] = {
             'gm_S': cfg.get('gm_S', 0.002),
@@ -556,12 +692,20 @@ def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
             'dt_s': cfg.get('dt_s', 0.01),
             'temperature_K': cfg.get('temperature_K', 310.0)
         }
-    if 'binding' not in cfg:
-        cfg['binding'] = cfg.get('binding', {})
-    for key in ['gm_S', 'C_tot_F', 'R_ch_Ohm', 'alpha_H', 'N_c', 'K_d_Hz', 'dt_s', 'temperature_K']:
-        cfg.pop(key, None)
-    if 'detection' not in cfg:
-        cfg['detection'] = {}
+    # Add binding
+    cfg['binding'] = cfg.get('binding', {})
+    
+    # Add extra defaults for pipeline optimization flags
+    cfg['_cal_eps_rel'] = cfg.get('_cal_eps_rel', 0.01)
+    cfg['_cal_patience'] = cfg.get('_cal_patience', 2)
+    
+    # NEW: Add dual-channel CSK configuration defaults
+    cfg['pipeline']['csk_dual_channel'] = cfg['pipeline'].get('csk_dual_channel', True)
+    cfg['pipeline']['csk_combiner'] = cfg['pipeline'].get('csk_combiner', 'zscore')
+    cfg['pipeline']['csk_leakage_frac'] = cfg['pipeline'].get('csk_leakage_frac', 
+                                                            cfg['pipeline'].get('non_specific_binding_factor', 0.0))
+    cfg['pipeline']['csk_store_combiner_meta'] = cfg['pipeline'].get('csk_store_combiner_meta', True)
+    
     return cfg
 
 def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> float:
@@ -675,8 +819,32 @@ def append_row_atomic(csv_path: Path, row: Dict[str, Any], columns: Optional[Lis
     """
     Append a row with a lock + atomic rename. Read *and* write occur under the lock
     to prevent lost updates when multiple processes append concurrently.
+    
+    ENHANCED: Persists CSK configuration triple (M, target_channel, combiner) for plot provenance.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # ✅ Add combiner metadata columns BEFORE creating DataFrame
+    if row.get('modulation', '').startswith('CSK') and row.get('csk_store_combiner_meta', True):
+        if 'combiner' not in row:
+            row['combiner'] = row.get('csk_combiner', 'zscore')
+        if 'sigma_glu' not in row:
+            row['sigma_glu'] = row.get('noise_sigma_glu', np.nan)
+        if 'sigma_gaba' not in row:
+            row['sigma_gaba'] = row.get('noise_sigma_gaba', np.nan)
+        if 'rho_cc' not in row:
+            row['rho_cc'] = row.get('rho_between_channels_after_ctrl', 0.0)
+        if 'leakage_frac' not in row:
+            combiner = row.get('combiner', 'zscore')
+            row['leakage_frac'] = row.get('csk_leakage_frac', 0.0) if combiner == 'leakage' else np.nan
+        
+        # NEW: Add CSK configuration triple for plot provenance
+        if 'csk_levels' not in row:
+            row['csk_levels'] = row.get('csk_levels', row.get('M', 4))
+        if 'csk_target_channel' not in row:
+            row['csk_target_channel'] = row.get('csk_target_channel', 'GLU')
+    
+    # ✅ NOW create DataFrame with complete metadata
     new_row = pd.DataFrame([row])
     if columns is not None:
         new_row = new_row.reindex(columns=columns)
@@ -727,6 +895,14 @@ def _value_key(v):
         return str(int(vf)) if vf.is_integer() else f"{vf:.6g}"
     except Exception:
         return str(v)
+
+# ENHANCEMENT: Export the canonical value key formatter for consistency across modules
+def canonical_value_key(v):
+    """
+    Canonical value key formatter exported for use by other modules.
+    Ensures consistent Nm formatting between cache writers and readers.
+    """
+    return _value_key(v)
 
 # --- Stage 13 helpers: confidence intervals / screening ---
 def _wilson_halfwidth(k: int, n: int, z: float = 1.96) -> float:
@@ -897,6 +1073,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="Minimum seeds before early stopping can trigger (default: 4)")
     parser.add_argument("--cal-min-samples", type=int, default=50,
                         help="Minimum samples per class for stable thresholds (default: 50)")
+    parser.add_argument("--nm-grid", type=str, default="",
+                        help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
+                             "If not provided, uses cfg['Nm_range'] from YAML.")
     
     # Window guard tuning (Issue 2 optimization)
     parser.add_argument("--min-decision-points", type=int, default=4,
@@ -917,6 +1096,9 @@ def parse_arguments() -> argparse.Namespace:
 # ============= CALIBRATION SAMPLES (helper) =============
 def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_symbols: int = 100) -> Optional[Dict[str, Any]]:
     try:
+        # Import the dual-channel helper
+        from src.pipeline import _csk_dual_channel_Q
+        
         cal_cfg = deepcopy(cfg)
         cal_cfg['pipeline']['sequence_length'] = num_symbols
         cal_cfg['disable_progress'] = True
@@ -927,6 +1109,14 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         dt = cal_cfg['sim']['dt_s']
         detection_window_s = cal_cfg['detection'].get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
         sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
+        
+        # Initialize CSK dual-channel parameters with defaults
+        target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'GLU')
+        combiner = cal_cfg['pipeline'].get('csk_combiner', 'zscore')
+        use_dual = bool(cal_cfg['pipeline'].get('csk_dual_channel', True))
+        leakage = float(cal_cfg['pipeline'].get('csk_leakage_frac', 0.0))
+        rho_cc = float(cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
+        rho_cc = max(-1.0, min(1.0, rho_cc))
         
         # Use deterministic seeding for calibration consistency
         seed = cal_cfg['pipeline'].get('random_seed', 0)
@@ -942,19 +1132,40 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             q_glu = float(np.trapezoid((ig - ic)[:n_detect_samples], dx=dt) if use_ctrl else np.trapezoid(ig[:n_detect_samples], dx=dt))
             q_gaba = float(np.trapezoid((ia - ic)[:n_detect_samples], dx=dt) if use_ctrl else np.trapezoid(ia[:n_detect_samples], dx=dt))
             q_glu_values.append(q_glu); q_gaba_values.append(q_gaba)
+        
         for q_glu, q_gaba in zip(q_glu_values, q_gaba_values):
             if mode == "MoSK":
                 D = q_glu / sigma_glu + q_gaba / sigma_gaba
                 decision_stats.append(D)
             elif mode.startswith("CSK"):
-                target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'GLU')
-                Q = q_glu if target_channel == 'GLU' else q_gaba
+                if use_dual:
+                    Q = _csk_dual_channel_Q(
+                        q_glu=q_glu, q_gaba=q_gaba,
+                        sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                        rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
+                        target=target_channel
+                    )
+                else:
+                    # Legacy single-channel
+                    Q = q_glu if target_channel == 'GLU' else q_gaba
                 decision_stats.append(Q)
             elif mode == "Hybrid":
                 mol_type = symbol >> 1
                 Q = q_glu if mol_type == 0 else q_gaba
                 decision_stats.append(Q)
-        return {'q_values': decision_stats, 'sigma_glu': sigma_glu, 'sigma_gaba': sigma_gaba}
+        
+        # Enhanced return with combiner metadata for CSK
+        result = {'q_values': decision_stats, 'sigma_glu': sigma_glu, 'sigma_gaba': sigma_gaba}
+        
+        # Add combiner metadata for CSV traceability if enabled
+        if (mode.startswith('CSK') and 
+            cal_cfg['pipeline'].get('csk_store_combiner_meta', True)):
+            result.update({
+                'combiner': combiner,
+                'rho_cc': rho_cc,
+                'leakage_frac': leakage if combiner == 'leakage' else np.nan
+            })
+        return result
     except Exception:
         return None
 
@@ -988,7 +1199,8 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False,
                          thresholds_override: Optional[Dict[str, Union[float, List[float]]]] = None,
-                         sweep_name: str = "ser_vs_nm", cache_tag: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                         sweep_name: str = "ser_vs_nm", cache_tag: Optional[str] = None,
+                         recalibrate: bool = False) -> Optional[Dict[str, Any]]:
     """Worker for parameter sweep with window match; accepts optional precomputed thresholds."""
     try:
         cfg_run = deepcopy(cfg_base)
@@ -1059,7 +1271,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         elif cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
              param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor']:
             cal_seeds = list(range(10))
-            thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds)
+            thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds, recalibrate)
             for k, v in thresholds.items():
                 cfg_run['pipeline'][k] = v
             if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
@@ -1097,13 +1309,21 @@ def run_sweep(cfg: Dict[str, Any],
               resume: bool,
               debug_calibration: bool = False, 
               cache_tag: Optional[str] = None,
-              pm: Optional[ProgressManager] = None,  # NEW: accept progress manager
-              sweep_key: Optional[Any] = None,  # NEW: for nested updates
-              parent_key: Optional[Any] = None) -> pd.DataFrame:  # NEW: for hierarchical updates
+              pm: Optional[ProgressManager] = None,
+              sweep_key: Optional[Any] = None,
+              parent_key: Optional[Any] = None,
+              recalibrate: bool = False) -> pd.DataFrame:
+    """
+    ENHANCED: Marks resume context for threshold management.
+    """
     """
     Parameter sweep with parallelization; returns aggregated df.
     Writes each completed value's row immediately if persist_csv is given.
     """
+    # Mark resume context for threshold management
+    if resume:
+        cfg['_resume_active'] = True
+    
     pool = global_pool.get_pool()
     # Use provided progress manager or create new one
     local_pm = pm or ProgressManager(progress_mode)
@@ -1154,7 +1374,7 @@ def run_sweep(cfg: Dict[str, Any],
                 min_win = _enforce_min_window(cfg_v, Ts)
                 cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
                 cfg_v['detection']['decision_window_s'] = min_win
-            thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds)
+            thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
 
     # Determine how many seed-jobs remain (for progress accounting)
     # --- NEW: resolve sweep folder early (for seed cache lookups) ---
@@ -1283,7 +1503,7 @@ def run_sweep(cfg: Dict[str, Any],
                 s = seeds_to_run[idx]
                 fut = pool.submit(
                     run_param_seed_combo, cfg, sweep_param, v, s, debug_calibration, thresholds_override,
-                    sweep_name=sweep_folder, cache_tag=cache_tag
+                    sweep_name=sweep_folder, cache_tag=cache_tag, recalibrate=recalibrate
                 )
                 pending.add(fut)
                 fut_seed[fut] = s  # NEW: Track which seed this future handles
@@ -1352,8 +1572,8 @@ def run_sweep(cfg: Dict[str, Any],
                         print(f"        🔄 Retrying seed {seed_r} for {sweep_param}={v}")
                         retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
                         retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
-                                              debug_calibration, thresholds_override,
-                                              sweep_name=sweep_folder, cache_tag=retry_tag)
+                                            debug_calibration, thresholds_override,
+                                            sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate)
                         pending.add(retry_fut)
                         fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
                     continue  # NEW: Skip to next iteration after timeout handling
@@ -2474,7 +2694,7 @@ def _apply_nt_pair(cfg: Dict[str, Any], first: str, second: str) -> Dict[str, An
         cfg_new['pipeline']['csk_target_channel'] = 'GLU'  # measure 'first'
     return cfg_new
 
-def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_values: List[float]) -> None:
+def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_values: List[Union[float, int]]) -> None:
     pairs_arg = (args.nt_pairs or "").strip()
     if not pairs_arg:
         return
@@ -2494,7 +2714,7 @@ def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_
             continue
         # Calibrate for this pair (short, cached)
         cal_seeds = list(range(10))
-        thresholds = calibrate_thresholds_cached(cfg_pair, cal_seeds)
+        thresholds = calibrate_thresholds_cached(cfg_pair, cal_seeds, args.recalibrate)
         for k, v in thresholds.items():
             cfg_pair['pipeline'][k] = v
         out_csv = data_dir / f"ser_vs_nm_csk_{first.lower()}_{second.lower()}.csv"
@@ -2701,7 +2921,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(project_root / "config" / "default.yaml") as f:
+    with open(project_root / "config" / "default.yaml", encoding='utf-8') as f:
         config_base = yaml.safe_load(f)
 
     cfg = preprocess_config_full(config_base)
@@ -2756,7 +2976,19 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     pm.set_status(mode=mode, sweep="SER vs Nm")
 
     # Pre-compute job counts for consistent totals
-    nm_values = [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]
+    # 🛠 CLI override for Nm grid (preserves YAML default behavior)
+    nm_values: List[Union[float, int]]
+    if args.nm_grid.strip():
+        try:
+            nm_values = [int(float(x.strip())) for x in args.nm_grid.split(',') if x.strip()]
+            print(f"📋 Using CLI Nm grid: {nm_values}")
+        except ValueError as e:
+            print(f"⚠️  Invalid --nm-grid format: {args.nm_grid}. Error: {e}")
+            print("   Using YAML default instead.")
+            nm_values = list(cfg.get('Nm_range', [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000]))
+    else:
+        nm_values = list(cfg.get('Nm_range', [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000]))
+        print(f"📋 Using YAML Nm_range: {nm_values}")
     distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
     ser_jobs = len(nm_values) * args.num_seeds
@@ -2829,7 +3061,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         debug_calibration=args.debug_calibration,
         pm=pm,                                # always share one PM
         sweep_key=ser_key if hierarchy_supported else None,
-        parent_key=mode_key if hierarchy_supported else None,
+        parent_key=mode_key if hierarchy_supported else None,  # 🛠️ CHANGE: parent_key -> mode_key
+        recalibrate=args.recalibrate  # 🛠️ ADD THIS LINE
     )
     # advance the aggregate mode bar by however many jobs actually ran
     if ser_bar: ser_bar.close()
@@ -2878,7 +3111,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             distances = [25, 50, 100, 150, 200]
         
         # Use a subset of Nm values for the grid (to keep computation manageable)
-        grid_nm_values = [5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4]  # subset of nm_values
+        grid_nm_values: List[Union[float, int]] = [500, 1000, 1600, 2500, 4000, 6300, 10000] # subset of nm_values
         
         rows = []
         for d in distances:
@@ -3355,9 +3588,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             persist_csv=isi_csv,
             resume=args.resume,
             debug_calibration=args.debug_calibration,
-            pm=pm,                       # share PM
+            pm=pm,
             sweep_key=isi_key if hierarchy_supported else None,
-            parent_key=mode_key if hierarchy_supported else None
+            parent_key=mode_key if hierarchy_supported else None,
+            recalibrate=args.recalibrate  # <-- THIS LINE NEEDS TO BE ADDED
         )
         if isi_bar: isi_bar.close()
         # De-duplicate by (guard_factor, use_ctrl)
@@ -3504,7 +3738,7 @@ def integration_test_noise_correlation() -> None:
         {"rho_cc": 0.7, "description": "Strong cross-channel correlation"},
     ]
     
-    base_config = yaml.safe_load(open(project_root / "config" / "default.yaml"))
+    base_config = yaml.safe_load(open(project_root / "config" / "default.yaml", encoding='utf-8'))
     base_config = preprocess_config_full(base_config)
     
     # Configure test parameters
@@ -3559,6 +3793,9 @@ def integration_test_noise_correlation() -> None:
             print(f"    ❌ Test failed: {e}")
     
     print("🎯 Cross-channel noise correlation integration test completed!\n")
+
+# ENHANCEMENT: Export canonical formatter for use by other modules
+__all__ = ["canonical_value_key"]
 
 if __name__ == "__main__":
     # Windows multiprocessing support

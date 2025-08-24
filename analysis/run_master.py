@@ -170,6 +170,10 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     # NT-pairs (forward for CSK versatility)
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
+    # 🛠 ADD THESE LINES:
+    # Nm grid override (forward sweep parameters)
+    if args.nm_grid:
+        cmd.extend(["--nm-grid", args.nm_grid])
     # Forward new optimization flags
     if args.distances:
         cmd.extend(["--distances", args.distances])
@@ -237,6 +241,10 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     # NT-pairs (forward for CSK versatility)
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
+    # 🛠 ADD THESE LINES:
+    # Nm grid override (forward sweep parameters)
+    if args.nm_grid:
+        cmd.extend(["--nm-grid", args.nm_grid])
     # Forward new optimization flags
     if args.distances:
         cmd.extend(["--distances", args.distances])
@@ -293,6 +301,10 @@ def main() -> None:
                    help="Use cached simulation noise for ONSI calculation in hybrid benchmarks")
     p.add_argument("--nt-pairs", type=str, default="",
                    help="Comma-separated NT pairs for CSK sweeps, e.g. GLU-GABA,GLU-DA")
+    # 🛠 ADD THIS LINE:
+    p.add_argument("--nm-grid", type=str, default="",
+                   help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
+                        "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
     # Performance pass-through
     p.add_argument("--extreme-mode", action="store_true", help="Pass through to run_final_analysis (max P-core threads)")
     p.add_argument("--beast-mode", action="store_true", help="Pass through to run_final_analysis (P-cores minus margin)")
@@ -515,6 +527,8 @@ def main() -> None:
             f"--lod-screen-delta={args.lod_screen_delta}",
         ] + ([f"--preset={args.preset}"] if args.preset else []) +  # NEW: Add preset to flags
             ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
+            # 🛠 ADD THIS LINE:
+            ([f"--nm-grid={args.nm_grid}"] if args.nm_grid else []) +
             (["--recalibrate"] if args.recalibrate else []) +
             (["--extreme-mode"] if args.extreme_mode else (["--beast-mode"] if args.beast_mode else [])) +
             ([f"--max-workers={args.max_workers}"] if args.max_workers is not None else [])

@@ -202,17 +202,12 @@ def finite_burst_concentration(
         t_pos = t_vec[mask]
         
         if len(t_pos) > 0:
-            # Vectorized calculations
-            z = r / np.sqrt(4 * D_eff * t_pos)
-            
-            # Adaptive erfc-skip
-            erfc_term = np.where(z > 5, 0.0, erfc(z))
-            
-            # Apply Green's function
+            # Apply Green's function (pure 3D diffusion + clearance)
             prefactor = Nm / (alpha * (4 * np.pi * D_eff * t_pos) ** 1.5)
             exponential = np.exp(-(r ** 2) / (4 * D_eff * t_pos) - k_clear * t_pos)
             
-            conc[mask] = prefactor * exponential * erfc_term
+            # ✅ FIXED: No erfc term for instantaneous source
+            conc[mask] = prefactor * exponential
     
     # Convert from molecules/m³ to molar
     conc_molar = conc / (AVOGADRO * 1000)
@@ -311,6 +306,9 @@ def finite_burst_concentration_batch(
         diff = term1 - term2
         exp_clear = np.exp(-k_clear * t_2d)
         conc_batch[:, mask_t] = pref * diff * exp_clear
+        
+        # ✅ Convert to molar ONLY for rect path (vectorized calculation)
+        conc_batch /= (AVOGADRO * 1000)
     
     else:
         # For gamma and Dirac, fall back to loop but with pre-allocated arrays
@@ -319,9 +317,7 @@ def finite_burst_concentration_batch(
             conc_batch[i, :] = finite_burst_concentration(
                 Nm_array[i], r_array_vec[i].item(), t_vec, config, nt_type
             )
-    
-    # Convert to molar
-    conc_batch /= (AVOGADRO * 1000)
+        # ✅ NO double conversion - finite_burst_concentration already returns molar
     
     return conc_batch
 
@@ -338,25 +334,8 @@ def finite_burst_concentration_batch_time(
     FULLY VECTORIZED: Batch process multiple molecule releases with different time offsets.
     Now uses 2D broadcasting for rectangular bursts for maximum efficiency.
     
-    Parameters
-    ----------
-    Nm_array : np.ndarray
-        Array of molecule counts for each release
-    r : float
-        Distance from source in meters (same for all)
-    t_vec_base : np.ndarray
-        Base time vector
-    time_offsets : np.ndarray
-        Time offset for each release
-    config : dict
-        Configuration dictionary
-    nt_type : str
-        Neurotransmitter type
-        
-    Returns
-    -------
-    np.ndarray
-        Shape (len(Nm_array), len(t_vec_base)) concentration profiles
+    FIXED: Consistent unit conversion - all calculations in molecules/m³, 
+    convert to molar at single exit point.
     """
     n_releases = len(Nm_array)
     n_times = len(t_vec_base)
@@ -372,7 +351,7 @@ def finite_burst_concentration_batch_time(
     # Calculate effective diffusion coefficient
     D_eff = D / (lam ** 2)
     
-    # Initialize result
+    # Initialize result in molecules/m³
     conc_batch = np.zeros((n_releases, n_times))
     
     if burst_shape == 'rect':
@@ -387,48 +366,50 @@ def finite_burst_concentration_batch_time(
         
         # Skip if no valid times or all Nm are zero
         if not np.any(mask_t) or not np.any(Nm_array > 0):
-            return conc_batch / (AVOGADRO * 1000)
-        
-        # Vectorized prefactor calculation: (n_releases, 1) for broadcasting
-        pref = Nm_array[:, np.newaxis] / (8 * np.pi * alpha * D_eff * r * T_rel)
-        
-        # FULLY VECTORIZED z1 calculation for all releases and times
-        # Use np.where to avoid division by zero
-        sqrt_term1 = np.sqrt(D_eff * np.where(mask_t, t_vec_all, 1.0))
-        z1 = np.where(mask_t, r / (2 * sqrt_term1), np.inf)
-        
-        # Vectorized erfc calculation with adaptive threshold
-        term1 = np.where(mask_t & (z1 <= 4), erfc(z1), 0.0)
-        
-        # FULLY VECTORIZED z2 calculation for t > T_rel
-        mask_after = mask_t & (t_vec_all > T_rel)
-        t_after_rel = t_vec_all - T_rel
-        sqrt_term2 = np.sqrt(D_eff * np.where(mask_after, t_after_rel, 1.0))
-        z2 = np.where(mask_after, r / (2 * sqrt_term2), np.inf)
-        
-        # Vectorized term2 with adaptive threshold
-        term2 = np.where(mask_after & (z2 <= 4), erfc(z2), 0.0)
-        
-        # Final vectorized calculation
-        diff = term1 - term2
-        exp_clear = np.exp(-k_clear * np.where(mask_t, t_vec_all, 0.0))
-        
-        # Apply all terms with masking
-        conc_batch = np.where(mask_t, pref * diff * exp_clear, 0.0)
+            # ✅ FIXED: Early return with zero concentration (already in molecules/m³)
+            # Will be converted to molar at the single exit point below
+            pass  # conc_batch remains zeros, will be converted at end
+        else:
+            # Vectorized prefactor calculation: (n_releases, 1) for broadcasting
+            pref = Nm_array[:, np.newaxis] / (8 * np.pi * alpha * D_eff * r * T_rel)
+            
+            # FULLY VECTORIZED z1 calculation for all releases and times
+            # Use np.where to avoid division by zero
+            sqrt_term1 = np.sqrt(D_eff * np.where(mask_t, t_vec_all, 1.0))
+            z1 = np.where(mask_t, r / (2 * sqrt_term1), np.inf)
+            
+            # Vectorized erfc calculation with adaptive threshold
+            term1 = np.where(mask_t & (z1 <= 4), erfc(z1), 0.0)
+            
+            # FULLY VECTORIZED z2 calculation for t > T_rel
+            mask_after = mask_t & (t_vec_all > T_rel)
+            t_after_rel = t_vec_all - T_rel
+            sqrt_term2 = np.sqrt(D_eff * np.where(mask_after, t_after_rel, 1.0))
+            z2 = np.where(mask_after, r / (2 * sqrt_term2), np.inf)
+            
+            # Vectorized term2 with adaptive threshold
+            term2 = np.where(mask_after & (z2 <= 4), erfc(z2), 0.0)
+            
+            # Final vectorized calculation - result in molecules/m³
+            diff = term1 - term2
+            exp_clear = np.exp(-k_clear * np.where(mask_t, t_vec_all, 0.0))
+            
+            # Apply all terms with masking
+            conc_batch = np.where(mask_t, pref * diff * exp_clear, 0.0)
         
     else:
         # For other burst shapes, use standard function with loop
         for i in range(n_releases):
             if Nm_array[i] > 0:
                 t_vec = t_vec_base + time_offsets[i]
-                conc_batch[i, :] = finite_burst_concentration(
+                conc_result = finite_burst_concentration(
                     Nm_array[i], r, t_vec, config, nt_type
                 )
+                # ✅ FIXED: Convert back to molecules/m³ for consistency
+                conc_batch[i, :] = conc_result * (AVOGADRO * 1000)
     
-    # Convert to molar
-    conc_batch /= (AVOGADRO * 1000)
-    
-    return conc_batch
+    # ✅ FIXED: Single unit conversion point - convert from molecules/m³ to molar
+    return conc_batch / (AVOGADRO * 1000)
 
 
 def burst_profile(*a, **k):

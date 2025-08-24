@@ -42,6 +42,9 @@ sys.path.append(str(project_root))
 
 from src.config_utils import preprocess_config  # noqa: E402
 
+# ENHANCEMENT: Import canonical value key formatter for consistent CSV ↔ cache matching
+from analysis.run_final_analysis import canonical_value_key  # noqa: E402
+
 
 # ---------- small helpers (type-safe plotting & saving) ----------------------
 
@@ -349,12 +352,8 @@ def plot_figure_s5_confusion_matrices(results_dir: Path, save_path: Path, strict
 
     # Helper: canonical value_key (must match analysis/run_final_analysis.py)
     def _value_key(v: object) -> str:
-        try:
-            # Use _f helper for robust float conversion
-            vf = _f(v)
-            return str(int(vf)) if vf.is_integer() else f"{vf:.6g}"
-        except Exception:
-            return str(v)
+        # ENHANCEMENT: Use canonical formatter from run_final_analysis for consistency
+        return canonical_value_key(v)
 
     # Helper: choose target Nm (closest SER to 1%)
     def _choose_nm_for_mode(mode: str, seg: Optional[str] = None) -> Tuple[Optional[float], Optional[bool]]:
@@ -420,6 +419,7 @@ def plot_figure_s5_confusion_matrices(results_dir: Path, save_path: Path, strict
     def _collect_txrx(mode: str, nm: float, use_ctrl: Optional[bool]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Collect tx/rx across seeds for a given Nm, using specified CTRL state.
+        ENHANCEMENT: Includes fallback for Nm formatting mismatches.
         """
         # Determine correct segment based on CTRL state
         if use_ctrl is True:
@@ -432,8 +432,32 @@ def plot_figure_s5_confusion_matrices(results_dir: Path, save_path: Path, strict
         vk = _value_key(nm)
         cache_base = cache_dir / mode.lower() / seg / vk
     
+        # ENHANCEMENT: Fallback logic for Nm formatting mismatches
         if not cache_base.exists():
-            return np.array([]), np.array([])
+            # Look for nearest available Nm within ±10% tolerance
+            parent_dir = cache_dir / mode.lower() / seg
+            if parent_dir.exists():
+                tolerance = 0.1
+                found_match = None
+                for candidate_dir in parent_dir.iterdir():
+                    if candidate_dir.is_dir():
+                        try:
+                            candidate_nm = float(candidate_dir.name)
+                            rel_diff = abs(candidate_nm - nm) / nm
+                            if rel_diff <= tolerance:
+                                found_match = candidate_dir
+                                print(f"⚠️  Cache fallback: Using Nm={candidate_nm:.0f} for requested Nm={nm:.0f} "
+                                      f"(±{rel_diff:.1%} difference)")
+                                break
+                        except (ValueError, ZeroDivisionError):
+                            continue
+                
+                if found_match:
+                    cache_base = found_match
+                else:
+                    return np.array([]), np.array([])
+            else:
+                return np.array([]), np.array([])
     
         tx_all, rx_all = [], []
         for seed_file in cache_base.glob("seed_*.json"):

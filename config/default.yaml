@@ -89,7 +89,7 @@ sim:
 distances_um: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175]  # optimized range (removed 115, 200)
 # High-resolution distance grid (use only if needed)
 # distances_um: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
-Nm_range: [2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5]  # finer resolution
+Nm_range: [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000] # finer resolution
 
 # -------- Detection layer --------
 detection:
@@ -121,6 +121,11 @@ pipeline:
   level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
   csk_levels: 2                 # Number of concentration levels for CSK and Hybrid modes
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
+  # NEW: Dual-channel CSK configuration
+  csk_dual_channel: true          # enable dual-channel CSK
+  csk_combiner: "zscore"          # one of: ["zscore","whitened","leakage"]
+  csk_leakage_frac: 0.0           # fractional mean leakage on the 'other' channel (0–0.2 typical)
+  csk_store_combiner_meta: true   # persist combiner + (σ,ρ) into CSVs
 
   # -------- Advanced Optimization Parameters --------
   # Adaptive calibration tuning (Issue 1 optimization)

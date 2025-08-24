@@ -103,11 +103,20 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                             continue
                         grp_sorted = grp.sort_values(nmcol)
                         
+                        # Enhanced legend with combiner info for CSK
+                        label = mode + ctrl_labels[bool(ctrl_state)]
+                        if mode == 'CSK' and 'combiner' in grp.columns:
+                            combiners = grp['combiner'].dropna().unique()
+                            if len(combiners) == 1:
+                                label += f" ({combiners[0]})"
+                            elif len(combiners) > 1:
+                                label += f" (mixed)"
+                        
                         ax1.loglog(grp_sorted[nmcol], grp_sorted['ser'],
                                    color=colors[mode], marker=markers[mode],
                                    linestyle=ctrl_styles[bool(ctrl_state)], 
                                    markersize=6, 
-                                   label=f"{mode}{ctrl_labels[bool(ctrl_state)]}", 
+                                   label=label, 
                                    linewidth=2,
                                    markerfacecolor='none' if mode == 'CSK' else colors[mode],
                                    alpha=0.9 if ctrl_state else 0.6)  # Fade no-CTRL slightly
@@ -121,9 +130,19 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                 else:
                     # Single CTRL state or no CTRL column - original behavior
                     df_sorted = df.sort_values(nmcol)
+                    
+                    # Enhanced legend with combiner info for CSK
+                    label = mode
+                    if mode == 'CSK' and 'combiner' in df.columns:
+                        combiners = df['combiner'].dropna().unique()
+                        if len(combiners) == 1:
+                            label += f" ({combiners[0]})"
+                        elif len(combiners) > 1:
+                            label += f" (mixed)"
+                    
                     ax1.loglog(df_sorted[nmcol], df_sorted['ser'],
                                color=colors[mode], marker=markers[mode],
-                               linestyle=linestyles[mode], markersize=6, label=mode, linewidth=2,
+                               linestyle=linestyles[mode], markersize=6, label=label, linewidth=2,
                                markerfacecolor='none' if mode == 'CSK' else colors[mode])
                     ci = _get_ci_for_df(df_sorted)
                     if ci is not None:
@@ -381,6 +400,12 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
         if nmcol is None or 'ser' not in df.columns:
             continue
         label = f.stem.replace("ser_vs_nm_csk_", "").replace("_", "–").upper()
+        
+        # ✅ Add combiner info to label
+        if 'combiner' in df.columns:
+            combs = df['combiner'].dropna().unique()
+            if len(combs) == 1:
+                label += f" ({combs[0]})"
         
         # Check if CTRL state separation is needed
         if 'use_ctrl' in df.columns and df['use_ctrl'].nunique() > 1:

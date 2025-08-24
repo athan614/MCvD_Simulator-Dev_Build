@@ -58,6 +58,27 @@ def diagnose_csk_levels():
     print(f"  Distance: {cfg['pipeline']['distance_um']}μm")
     print()
     
+    # Import the dual-channel helper
+    from src.pipeline import _csk_dual_channel_Q, calculate_proper_noise_sigma
+    
+    # Calculate noise parameters once
+    sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, cfg['detection']['decision_window_s'])
+    rho_cc = float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
+    rho_cc = max(-1.0, min(1.0, rho_cc))
+    
+    # Get CSK combiner settings
+    combiner = cfg['pipeline'].get('csk_combiner', 'zscore')
+    use_dual = bool(cfg['pipeline'].get('csk_dual_channel', True))
+    leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
+    target_channel = cfg['pipeline']['csk_target_channel']
+    
+    print(f"  Combiner: {combiner} (dual={use_dual})")
+    print(f"  Target channel: {target_channel}")
+    print(f"  Noise: σ_GLU={sigma_glu:.2e}, σ_GABA={sigma_gaba:.2e}, ρ={rho_cc:+.3f}")
+    if combiner == 'leakage':
+        print(f"  Leakage fraction: {leakage:.3f}")
+    print()
+    
     # Test each symbol level
     rng = np.random.default_rng(42)
     tx_history = []
@@ -72,26 +93,35 @@ def diagnose_csk_levels():
         
         for trial in range(20):
             # Generate currents
-            ig, ia, ic, Nm_actual = _single_symbol_currents(
+            currents_glu, currents_gaba, currents_ctrl, nm_actual = _single_symbol_currents(
                 symbol, tx_history, cfg, rng
             )
             
-            # Calculate charge
-            dt = cfg['sim']['dt_s']
-            n_detect = int(cfg['detection']['decision_window_s'] / dt)
-            q_glu = np.trapezoid((ig - ic)[:n_detect], dx=dt)
-            q_gaba = np.trapezoid((ia - ic)[:n_detect], dx=dt)
+            # Integration
+            q_glu = float(np.trapz(currents_glu, dx=cfg['sim']['dt_s']))
+            q_gaba = float(np.trapz(currents_gaba, dx=cfg['sim']['dt_s']))
             
-            # Store results (using GLU channel as configured)
-            results_per_symbol[symbol]['q_values'].append(q_glu)
-            results_per_symbol[symbol]['nm_actual'].append(Nm_actual)
+            # Compute dual-channel Q
+            if use_dual:
+                Q = _csk_dual_channel_Q(
+                    q_glu=q_glu, q_gaba=q_gaba,
+                    sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                    rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
+                    target=target_channel
+                )
+            else:
+                # Legacy single-channel
+                Q = q_glu if target_channel == 'GLU' else q_gaba
+                
+            results_per_symbol[symbol]['q_values'].append(Q)
+            results_per_symbol[symbol]['nm_actual'].append(nm_actual)
         
         # Statistics for this symbol
         q_values = results_per_symbol[symbol]['q_values']
         nm_values = results_per_symbol[symbol]['nm_actual']
         
         print(f"  Nm actual: mean={np.mean(nm_values):.0f}, std={np.std(nm_values):.0f}")
-        print(f"  Charge Q:  mean={np.mean(q_values):.3e}, std={np.std(q_values):.3e}")
+        print(f"  Q_comb:    mean={np.mean(q_values):.3e}, std={np.std(q_values):.3e}")
         print(f"  Range: [{np.min(q_values):.3e}, {np.max(q_values):.3e}]")
     
     # Check for overlaps
@@ -242,12 +272,16 @@ def diagnose_csk_levels():
     try:
         confusion_matrix = np.zeros((4, 4), dtype=int)
         
+        # Get polarity once before the detection loop
+        q_eff = get_nt_params(cfg, cfg['pipeline']['csk_target_channel'])['q_eff_e']
+        
         for true_symbol in range(4):
             for q in results_per_symbol[true_symbol]['q_values']:
-                # Detect symbol
+                # Detect symbol with polarity-aware threshold ordering
                 detected_symbol = 0
-                for thresh in sorted(thresholds):  # Ascending for positive q_eff
-                    if q > thresh:
+                thr = sorted(thresholds, reverse=(q_eff < 0))
+                for t in thr:
+                    if (q_eff > 0 and q > t) or (q_eff < 0 and q < t):
                         detected_symbol += 1
                     else:
                         break

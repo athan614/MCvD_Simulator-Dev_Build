@@ -35,6 +35,63 @@ def to_int(value):
     else:
         return value
 
+def _csk_dual_channel_Q(
+    q_glu: float, q_gaba: float,
+    sigma_glu: float, sigma_gaba: float,
+    rho_cc: float,
+    combiner: str = "zscore",
+    leakage_frac: float = 0.0,
+    target: str = "GLU"
+) -> float:
+    """
+    Compute dual-channel CSK decision statistic Q_comb = w_t Q_t + w_o Q_o.
+    
+    Args:
+        q_glu, q_gaba: Single-channel charge statistics
+        sigma_glu, sigma_gaba: Noise standard deviations
+        rho_cc: Cross-channel correlation coefficient after CTRL
+        combiner: "zscore", "whitened", or "leakage"
+        leakage_frac: For leakage combiner, fraction of signal on 'other' channel
+        target: "GLU" or "GABA" - which channel carries the primary signal
+    """
+    # Nominal means direction (amplitude-only lives on 'target' axis)
+    # μ = [μ_t, μ_o]; for pure CSK (no leakage): μ = [μ_t, 0]; with leakage: μ_o = leakage_frac * μ_t
+    # Work in "signed" charges (you already use signed q via q_eff in oect path)
+    Qt, Qo = (q_glu, q_gaba) if target == "GLU" else (q_gaba, q_glu)
+    sg_t, sg_o = (sigma_glu, sigma_gaba) if target == "GLU" else (sigma_gaba, sigma_glu)
+    rho = float(np.clip(rho_cc, -0.999, 0.999))
+
+    if combiner == "zscore":
+        # Numerically well-conditioned, scale-free:
+        # Q = (Qt/σt) − ρ * (Qo/σo)
+        return (Qt / max(sg_t, 1e-30)) - rho * (Qo / max(sg_o, 1e-30))
+
+    elif combiner == "whitened":
+        # Fisher LDA for ordered classes; w ∝ Σ^{-1} μ, Σ = [[σt^2, ρσtσo],[ρσtσo, σo^2]]
+        # For pure CSK (μ=[μt,0]), up to scale: w ∝ [1/σt^2, -ρ/(σtσo)].
+        # Implement via the scale-free z-score equivalent for stability:
+        return (Qt / max(sg_t, 1e-30)) - rho * (Qo / max(sg_o, 1e-30))
+
+    elif combiner == "leakage":
+        # General Σ^{-1} μ with μ = [μt, μo] and μo = leakage_frac * μt
+        # Solve w = Σ^{-1} μ up to a common scale (the sign/ordering is what matters).
+        st2, so2 = sg_t*sg_t, sg_o*sg_o
+        s_to = rho * sg_t * sg_o
+        # Inverse of 2x2 Σ
+        det = max(st2*so2 - s_to*s_to, 1e-60)
+        inv00 =  so2 / det
+        inv01 = -s_to / det
+        inv10 = -s_to / det
+        inv11 =  st2 / det
+        mu_t = 1.0
+        mu_o = float(leakage_frac)
+        w_t = inv00 * mu_t + inv01 * mu_o
+        w_o = inv10 * mu_t + inv11 * mu_o
+        return w_t * Qt + w_o * Qo
+
+    else:
+        # Fallback: legacy single-channel behavior
+        return Qt
 
 def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float, symbol_index: int = -1) -> Tuple[float, float]:
     """Calculate physics-based noise sigma (robust implementation)"""
@@ -400,10 +457,6 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Simulate <sequence_length> symbols and compute BER/SEP.
     Detection logic unchanged - the fixes are in signal generation.
     """
-    try:
-        from src.detection import calculate_ml_threshold
-    except ImportError:
-        from .detection import calculate_ml_threshold
         
     mod = cfg['pipeline']['modulation']
     L = cfg['pipeline']['sequence_length']
@@ -481,8 +534,8 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         # Calculate differential charges (Signal - Control)
         sig_glu = (ig - ic) if use_ctrl else ig
         sig_gaba = (ia - ic) if use_ctrl else ia
-        q_glu = np.trapezoid(sig_glu[:n_detect_samples], dx=dt)
-        q_gaba = np.trapezoid(sig_gaba[:n_detect_samples], dx=dt)
+        q_glu = float(np.trapezoid(sig_glu[:n_detect_samples], dx=dt))
+        q_gaba = float(np.trapezoid(sig_gaba[:n_detect_samples], dx=dt))
         
         # sigma_glu, sigma_gaba already available from above
 
@@ -497,28 +550,57 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 stats_gaba.append(decision_stat)
           
         elif mod == 'CSK':
+            # ENHANCED: Dual-channel CSK with configurable combiners
             target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
             M = cfg['pipeline']['csk_levels']
-            if target_channel == 'GLU':
-                Q = q_glu
-                q_eff = q_eff_glu
+            combiner = cfg['pipeline'].get('csk_combiner', 'zscore')
+            use_dual = bool(cfg['pipeline'].get('csk_dual_channel', True))
+            leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
+
+            if use_dual:
+                Q = _csk_dual_channel_Q(
+                    q_glu=q_glu, q_gaba=q_gaba,
+                    sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                    rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
+                    target=target_channel
+                )
             else:
-                Q = q_gaba
-                q_eff = q_eff_gaba
+                # Legacy one-channel
+                Q = q_glu if target_channel == 'GLU' else q_gaba
+
+            # Thresholding remains exactly as you do it today, but on Q (combined)
             thresholds = cfg['pipeline'].get(f'csk_thresholds_{target_channel.lower()}', [])
+            
+            # 🛡 Fail-fast validation: Ensure threshold count matches M-1
+            if not isinstance(thresholds, list) or len(thresholds) != (M - 1):
+                error_msg = (f"CSK thresholds invalid for M={M} (expected {M-1} thresholds, "
+                           f"got {len(thresholds) if isinstance(thresholds, list) else type(thresholds)}). "
+                           f"Target channel: {target_channel}. "
+                           f"Recompute thresholds or run with --recalibrate.")
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            
             s_rx = 0
+            q_eff = q_eff_glu if target_channel == 'GLU' else q_eff_gaba
             for thresh in thresholds:
                 if q_eff > 0:
-                    if Q > thresh: s_rx += 1
-                    else: break
+                    if Q > thresh: 
+                        s_rx += 1
+                    else: 
+                        break
                 else:
-                    if Q < thresh: s_rx += 1
-                    else: break
+                    if Q < thresh: 
+                        s_rx += 1
+                    else: 
+                        break
             rx_symbols[i] = s_rx
-            if s_tx < M/2:
-                stats_glu.append(Q)
-            else:
-                stats_gaba.append(Q)
+            (stats_glu if s_tx < M/2 else stats_gaba).append(Q)
+
+            # Log combiner info once at first symbol (for provenance)
+            if i == 0:
+                logger.info(f"CSK combiner={combiner}, dual={use_dual}, "
+                           f"σ=[{sigma_glu:.2e},{sigma_gaba:.2e}], ρcc={rho_cc:+.2f}, "
+                           f"leakage={leakage:.2f}")
               
         elif mod == 'Hybrid':
             decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba

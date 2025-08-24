@@ -209,14 +209,15 @@ def oect_current(
     nt_params = get_nt_params(cfg, nt)
     q_eff = get_nt_params(cfg, nt)["q_eff_e"] if nt != "CTRL" else 0.0
     
-    # Device parameters
-    gm = cfg['gm_S']
-    C_tot = cfg['C_tot_F']
-    R_ch = cfg['R_ch_Ohm']
-    alpha_H = cfg['alpha_H']
-    N_c = cfg['N_c']
-    K_d = cfg['K_d_Hz']
-    T = cfg.get('temperature_K', 310)
+    # ✅ FIXED: Device parameters - support both nested and flat config
+    oect = cfg.get('oect', cfg)  # Use nested if available, fallback to flat
+    gm = oect['gm_S']
+    C_tot = oect['C_tot_F']
+    R_ch = oect['R_ch_Ohm']
+    alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
+    N_c = oect.get('N_c', cfg.get('N_c'))
+    K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
+    T = cfg.get('temperature_K', 310)  # ✅ Add missing temperature
     
     # Time parameters
     dt = cfg['dt_s']
@@ -286,22 +287,6 @@ def oect_current_batch(
     """
     FULLY VECTORIZED: Process multiple bound site trajectories in batch.
     All noise generation and signal processing done in parallel.
-    
-    Parameters
-    ----------
-    bound_sites_batch : np.ndarray
-        Shape (n_batch, n_time) bound aptamer counts
-    nt : str
-        Neurotransmitter type
-    cfg : dict
-        Configuration
-    seed : int, optional
-        Random seed
-        
-    Returns
-    -------
-    dict
-        Dictionary with arrays of shape (n_batch, n_time)
     """
     n_batch, n_time = bound_sites_batch.shape
     
@@ -315,13 +300,14 @@ def oect_current_batch(
     nt_params = get_nt_params(cfg, nt)
     q_eff = nt_params["q_eff_e"] if nt != "CTRL" else 0.0
     
-    # Device parameters
-    gm = cfg['gm_S']
-    C_tot = cfg['C_tot_F']
-    R_ch = cfg['R_ch_Ohm']
-    alpha_H = cfg['alpha_H']
-    N_c = cfg['N_c']
-    K_d = cfg['K_d_Hz']
+    # ✅ FIXED: Device parameters - support both nested and flat config
+    oect = cfg.get('oect', cfg)  # Use nested if available, fallback to flat
+    gm = oect['gm_S']
+    C_tot = oect['C_tot_F']
+    R_ch = oect['R_ch_Ohm']
+    alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
+    N_c = oect.get('N_c', cfg.get('N_c'))
+    K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
     T = cfg.get('temperature_K', 310)
     
     # Time parameters
