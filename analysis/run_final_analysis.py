@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from html import parser
-from multiprocessing import pool
 import sys
 import json
 import argparse
@@ -40,7 +38,7 @@ try:
     from src.mc_detection.algorithms import calculate_ml_threshold
 except ImportError:
     from src.detection import calculate_ml_threshold
-from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents
+from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents, _csk_dual_channel_Q
 from src.config_utils import preprocess_config
 from src.constants import get_nt_params
 
@@ -274,11 +272,11 @@ def _install_signal_handlers():
 # Maximum calibration cache entries before cleanup (prevent memory bloat)
 MAX_CACHE_SIZE = 50
 
-calibration_cache: Dict[str, Dict[str, Union[float, List[float]]]] = {}
+calibration_cache: Dict[str, Dict[str, Union[float, List[float], str]]] = {}
 
 def get_cache_key(cfg: Dict[str, Any]) -> str:
     def _nt_pair_fp(cfg: Dict[str, Any]) -> str:
-        # compact hash of the GLU/GABA parameter tuples so cache respects pair identity
+        # compact hash of the DA/SERO parameter tuples so cache respects pair identity
         def pick(name: str):
             nt = cfg['neurotransmitters'][name]
             return (
@@ -288,21 +286,35 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
                 float(nt.get('D_m2_s', 0.0)),
                 float(nt.get('lambda', 1.0)),
             )
-        raw = repr((pick('GLU'), pick('GABA'))).encode()
+        raw = repr((pick('DA'), pick('SERO'))).encode()
         return hashlib.sha1(raw).hexdigest()[:8]
+
+    def _qeff_signs(cfg: Dict[str, Any]) -> str:
+        s_da = 1 if float(cfg['neurotransmitters']['DA'].get('q_eff_e', 0.0)) > 0 else -1 if float(cfg['neurotransmitters']['DA'].get('q_eff_e', 0.0)) < 0 else 0
+        s_se = 1 if float(cfg['neurotransmitters']['SERO'].get('q_eff_e', 0.0)) > 0 else -1 if float(cfg['neurotransmitters']['SERO'].get('q_eff_e', 0.0)) < 0 else 0
+        return f"{s_da}:{s_se}"
+
+    # Decision window intended for calibration (will be Ts in calibration)
+    dw = None
+    try:
+        dw = float(cfg.get('detection', {}).get('decision_window_s',
+                   cfg['pipeline'].get('symbol_period_s', float('nan'))))
+    except Exception:
+        dw = cfg['pipeline'].get('symbol_period_s', None)
 
     key_params = [
         cfg['pipeline'].get('modulation'),
         cfg['pipeline'].get('Nm_per_symbol'),
         cfg['pipeline'].get('distance_um'),
         cfg['pipeline'].get('symbol_period_s'),
+        dw,  # NEW: decision_window used in calibration
         cfg['pipeline'].get('csk_levels'),
         cfg['pipeline'].get('csk_target_channel'),
         cfg['pipeline'].get('csk_level_scheme', 'uniform'),
         cfg['pipeline'].get('guard_factor', 0.0),
-        bool(cfg['pipeline'].get('use_control_channel', True)),  # NEW
-        _nt_pair_fp(cfg),  # NEW: bind cache to active NT pair
-        # ✅ FIXED: Add combiner and leakage parameters
+        bool(cfg['pipeline'].get('use_control_channel', True)),
+        _nt_pair_fp(cfg),
+        _qeff_signs(cfg),  # NEW: signs guard
         cfg['pipeline'].get('csk_combiner', 'zscore'),
         cfg['pipeline'].get('csk_leakage_frac', 0.0),
     ]
@@ -313,7 +325,6 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     Build a filename that captures sweep-dependent parameters so we can safely reuse across runs.
     """
     def _nt_pair_fingerprint(cfg):
-        """Generate a stable, unique fingerprint for NT pair based on physical parameters."""
         def pick(nt):
             return (
                 float(nt.get('k_on_M_s', 0.0)),
@@ -322,16 +333,14 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
                 float(nt.get('D_m2_s', 0.0)),
                 float(nt.get('lambda', 1.0)),
             )
-        g = cfg['neurotransmitters']['GLU']
-        b = cfg['neurotransmitters']['GABA']
+        g = cfg['neurotransmitters']['DA']
+        b = cfg['neurotransmitters']['SERO']
         raw = repr((pick(g), pick(b))).encode()
         return hashlib.sha1(raw).hexdigest()[:8]
     
-    # add a short label to disambiguate pairs on disk too
     def _nt_pair_label(cfg):
-        g = cfg['neurotransmitters']['GLU']; b = cfg['neurotransmitters']['GABA']
-        # fall back to hashed label if 'name' is absent
-        name_g = str(g.get('name', 'GLU')); name_b = str(b.get('name', 'GABA'))
+        g = cfg['neurotransmitters']['DA']; b = cfg['neurotransmitters']['SERO']
+        name_g = str(g.get('name', 'DA')); name_b = str(b.get('name', 'SERO'))
         base = f"{name_g}-{name_b}".lower().replace(' ', '')
         return base
 
@@ -343,26 +352,27 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     nm = cfg['pipeline'].get('Nm_per_symbol', None)
     lvl = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     tgt = cfg['pipeline'].get('csk_target_channel', '')
-    M   = cfg['pipeline'].get('csk_levels', None)  # 🛠 ADD THIS LINE
+    M   = cfg['pipeline'].get('csk_levels', None)
     gf  = cfg['pipeline'].get('guard_factor', None)
+    # Decision window intended for calibration
+    win = cfg.get('detection', {}).get('decision_window_s', Ts)
+
     parts = [f"thresholds_{mode}", _nt_pair_label(cfg)]
-    parts.append(f"pair{_nt_pair_fingerprint(cfg)}")  # NEW: always disambiguate
-    if Ts is not None:   parts.append(f"Ts{Ts:.3g}")
-    if dist is not None: parts.append(f"d{dist:.0f}um")
-    if nm is not None:   parts.append(f"Nm{nm:.0f}")
+    parts.append(f"pair{_nt_pair_fingerprint(cfg)}")
+    if Ts is not None:   parts.append(f"Ts{float(Ts):.3g}")
+    if win is not None:  parts.append(f"win{float(win):.3g}")  # NEW
+    if dist is not None: parts.append(f"d{float(dist):.0f}um")
+    if nm is not None:   parts.append(f"Nm{float(nm):.0f}")
     if tgt:              parts.append(f"tgt{tgt}")
     if lvl:              parts.append(f"lvl{lvl}")
-    # 🛠 include CSK M in filename to avoid reusing wrong-length threshold lists
     if mode.startswith("csk") and M is not None:
         parts.append(f"M{int(M)}")
-    if gf is not None:   parts.append(f"gf{gf:.3g}")
-    # ✅ FIXED: Add combiner and leakage to filename
+    if gf is not None:   parts.append(f"gf{float(gf):.3g}")
     cmb = cfg['pipeline'].get('csk_combiner', 'zscore')
     parts.append(f"cmb{cmb}")
     lf = cfg['pipeline'].get('csk_leakage_frac', None)
     if cmb == 'leakage' and lf is not None:
         parts.append(f"leak{float(lf):.3g}")
-    # Add before the return statement:
     ctrl = 'wctrl' if bool(cfg['pipeline'].get('use_control_channel', True)) else 'noctrl'
     parts.append(ctrl)
     return results_dir / ( "_".join(parts) + ".json" )
@@ -370,257 +380,457 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
 def run_sequence_wrapper(cfg: Dict[str, Any], seed: int, attach_isi_meta: bool = False) -> Optional[Dict[str, Any]]:
     """
     Wrapper around run_sequence to handle configuration validation and threshold management.
-    
-    DEFENSIVE CSK THRESHOLD MANAGEMENT:
-    - Clears stale CSK thresholds unless --resume is active with matching configuration
-    - Ensures threshold provenance matches current (M, target_channel, combiner) triple
     """
     from src.pipeline import run_sequence
     
-    # DEFENSIVE FIX: Clear stale CSK thresholds before simulation
     if cfg['pipeline']['modulation'].startswith('CSK'):
         current_M = int(cfg['pipeline'].get('csk_levels', 4))
-        current_target = cfg['pipeline'].get('csk_target_channel', 'GLU')
+        current_target = cfg['pipeline'].get('csk_target_channel', 'DA')
         current_combiner = cfg['pipeline'].get('csk_combiner', 'zscore')
-        
-        # Check if we should preserve thresholds (only during --resume with matching config)
         should_preserve = False
-        
-        # Only check cache if we're in a resume context (detected by presence of cache metadata)
+
         if '_resume_active' in cfg and cfg['_resume_active']:
-            # Check if cached thresholds match current configuration
             threshold_key = f'csk_thresholds_{current_target.lower()}'
             cached_thresholds = cfg['pipeline'].get(threshold_key, [])
-            
             if (isinstance(cached_thresholds, list) and 
                 len(cached_thresholds) == (current_M - 1)):
-                # Validate that cache metadata matches current config
                 cache_meta = cfg.get('_threshold_cache_meta', {})
                 if (cache_meta.get('M') == current_M and
                     cache_meta.get('target_channel') == current_target and
                     cache_meta.get('combiner') == current_combiner):
                     should_preserve = True
-        
+
         if not should_preserve:
-            # Clear all CSK threshold keys to force recalibration
             keys_to_clear = [k for k in cfg['pipeline'].keys() if k.startswith('csk_thresholds_')]
             for key in keys_to_clear:
                 if key in cfg['pipeline']:
                     del cfg['pipeline'][key]
                     print(f"🧹 Cleared stale threshold key: {key}")
-            
-            # Also clear any cached metadata
             if '_threshold_cache_meta' in cfg:
                 del cfg['_threshold_cache_meta']
-    
-    # Store ISI metadata if requested
+
     if attach_isi_meta:
         cfg['collect_isi_metrics'] = True
     
     return run_sequence(cfg)
 
 def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False,
-                         save_to_file: bool = True, verbose: bool = False) -> Dict[str, Union[float, List[float]]]:
+                         save_to_file: bool = True, verbose: bool = False) -> Dict[str, Union[float, List[float], str]]:
     """
-    Calibration with ISI off & window=Ts. Returns thresholds dict.
+    Calibration with ISI off & decision window = Ts (or enforced minimum). Returns thresholds dict.
+    Incorporates robust cache compatibility, finite filtering, and optional early-stop for MoSK/Hybrid.
     """
     mode = cfg['pipeline']['modulation']
     threshold_file = _thresholds_filename(cfg)
 
+    # ---------- small helpers ----------
+    def _fingerprint_nt_pair(c: Dict[str, Any]) -> str:
+        def pick(name: str):
+            nt = c['neurotransmitters'][name]
+            return (
+                float(nt.get('k_on_M_s', 0.0)),
+                float(nt.get('k_off_s', 0.0)),
+                float(nt.get('q_eff_e', 0.0)),
+                float(nt.get('D_m2_s', 0.0)),
+                float(nt.get('lambda', 1.0)),
+            )
+        raw = repr((pick('DA'), pick('SERO'))).encode()
+        return hashlib.sha1(raw).hexdigest()[:8]
+
+    def _qeff_signs(c: Dict[str, Any]) -> Tuple[int, int]:
+        q_da = float(c['neurotransmitters']['DA'].get('q_eff_e', 0.0))
+        q_se = float(c['neurotransmitters']['SERO'].get('q_eff_e', 0.0))
+        s_da = 1 if q_da > 0 else -1 if q_da < 0 else 0
+        s_se = 1 if q_se > 0 else -1 if q_se < 0 else 0
+        return s_da, s_se
+
+    def _clean(vals: List[float]) -> List[float]:
+        out: List[float] = []
+        for x in vals:
+            try:
+                xf = float(x)
+            except Exception:
+                continue
+            if np.isfinite(xf):
+                out.append(xf)
+        return out
+
+    # ---------- try cache unless recalibrate ----------
     if threshold_file.exists() and not recalibrate and save_to_file:
         try:
             with open(threshold_file, 'r', encoding='utf-8') as f:
-                loaded_thresholds = json.load(f)
-            
-            # 🛡 Enhanced metadata verification for cache compatibility
-            meta = loaded_thresholds.get("__meta__", {})
-            current_combiner = str(cfg['pipeline'].get('csk_combiner', 'zscore'))
-            current_leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
-            cached_combiner = str(meta.get('combiner', 'zscore'))
-            cached_leakage = float(meta.get('leakage_frac', 0.0))
-            
-            # Check combiner/leakage compatibility
-            if current_combiner != cached_combiner:
-                print(f"⚠️  Discarding threshold cache {threshold_file.name} "
-                    f"(combiner mismatch: {cached_combiner} vs {current_combiner}). Recalibrating…")
-            elif abs(current_leakage - cached_leakage) > 1e-9:
-                print(f"⚠️  Discarding threshold cache {threshold_file.name} "
-                    f"(leakage mismatch: {cached_leakage} vs {current_leakage}). Recalibrating…")
-            else:
-                # 🛡 Guard: for CSK, enforce M−1 thresholds
-                if str(cfg['pipeline'].get('modulation', '')).startswith("CSK"):
-                    M = int(cfg['pipeline'].get('csk_levels', 4))
-                    tgt = str(cfg['pipeline'].get('csk_target_channel', 'GLU')).lower()
-                    tau = loaded_thresholds.get(f"csk_thresholds_{tgt}", [])
-                    if not isinstance(tau, list) or len(tau) != (M - 1):
-                        print(f"⚠️  Discarding stale CSK thresholds cache {threshold_file.name} "
-                            f"(len={len(tau) if isinstance(tau, list) else 'NA'} vs M-1={M-1}). Recalibrating…")
-                    else:
-                        return {k: v for k, v in loaded_thresholds.items()}
-                else:
-                    return {k: v for k, v in loaded_thresholds.items()}
-        except Exception:
-            pass  # fall through to re-calculate
+                cached = json.load(f)
+            meta = cached.get("__meta__", cached.get("_metadata", {})) or {}
+            if verbose:
+                print(f"📁 Loaded cached thresholds from {threshold_file}")
 
+            # Compatibility checks (invalidate on any mismatch)
+            want_use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+            have_use_ctrl = bool(meta.get('use_ctrl', want_use_ctrl))
+            if have_use_ctrl != want_use_ctrl:
+                if verbose: print("  ↪︎ cache invalid: CTRL mismatch")
+                raise RuntimeError("cache: use_ctrl mismatch")
+
+            # NT pair + q_eff signs
+            if meta.get('nt_pair_fp') != _fingerprint_nt_pair(cfg):
+                if verbose: print("  ↪︎ cache invalid: NT pair fingerprint mismatch")
+                raise RuntimeError("cache: nt_pair_fp mismatch")
+            s_da, s_se = _qeff_signs(cfg)
+            if tuple(meta.get('q_eff_signs', (s_da, s_se))) != (s_da, s_se):
+                if verbose: print("  ↪︎ cache invalid: q_eff sign mismatch")
+                raise RuntimeError("cache: q_eff_signs mismatch")
+
+            # Mode-specific checks
+            if mode.startswith("CSK"):
+                M = int(cfg['pipeline'].get('csk_levels', 4))
+                tgt = str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper()
+                comb = str(cfg['pipeline'].get('csk_combiner', 'zscore'))
+                leak = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
+                if meta.get('M') != M or meta.get('target') != tgt:
+                    if verbose: print("  ↪︎ cache invalid: CSK M/target mismatch")
+                    raise RuntimeError("cache: M/target mismatch")
+                if meta.get('combiner') != comb or abs(float(meta.get('leakage_frac', 0.0)) - leak) > 1e-12:
+                    if verbose: print("  ↪︎ cache invalid: CSK combiner/leakage mismatch")
+                    raise RuntimeError("cache: combiner/leakage mismatch")
+                # enforce M−1 thresholds length
+                key = f"csk_thresholds_{tgt.lower()}"
+                tau = cached.get(key, [])
+                if not isinstance(tau, list) or len(tau) != (M - 1):
+                    if verbose: print("  ↪︎ cache invalid: CSK threshold length mismatch")
+                    raise RuntimeError("cache: csk threshold length mismatch")
+
+            # Window & Ts guard
+            Ts_now = float(cfg['pipeline'].get('symbol_period_s', float('nan')))
+            win_used = float(meta.get('decision_window_used', Ts_now))
+            if not np.isfinite(win_used) or abs(win_used - Ts_now) > 1e-9:
+                if verbose: print("  ↪︎ cache invalid: decision window/Ts mismatch")
+                raise RuntimeError("cache: decision window mismatch")
+
+            # If we get here, cache is acceptable
+            if verbose:
+                for k, v in cached.items():
+                    if k == "__meta__": 
+                        continue
+                    print(f"   {k}: {v if not isinstance(v, list) else f'list[{len(v)}]'}")
+            return {k: v for k, v in cached.items() if k != "_metadata"}  # prefer new __meta__
+        except Exception:
+            # fall through to re-calculate
+            if verbose:
+                print("⚠️  Threshold cache invalid or incompatible — recalibrating…")
+
+    # ---------- clean calibration environment ----------
     cal_cfg = deepcopy(cfg)
-    cal_cfg['pipeline']['sequence_length'] = 100
+    cal_cfg['pipeline']['sequence_length'] = int(cfg.get('_cal_symbols_per_seed', 100))
     cal_cfg['pipeline']['enable_isi'] = False
 
-    if 'symbol_period_s' in cal_cfg['pipeline']:
-        Ts = cal_cfg['pipeline']['symbol_period_s']
-        dt = float(cal_cfg['sim']['dt_s'])
-        min_pts = int(cal_cfg.get('_min_decision_points', 4))
-        min_win = _enforce_min_window(cal_cfg, Ts)
-        cal_cfg['detection']['decision_window_s'] = min_win
-        cal_cfg['pipeline']['time_window_s'] = max(cal_cfg['pipeline'].get('time_window_s', min_win), min_win)
+    # Force decision window = Ts (≥ enforced minimum); also keep time_window ≥ Ts
+    Ts = float(cal_cfg['pipeline']['symbol_period_s'])
+    min_win = _enforce_min_window(cal_cfg, Ts)
+    cal_cfg.setdefault('detection', {})['decision_window_s'] = float(min_win)
+    cal_cfg['pipeline']['time_window_s'] = max(float(cal_cfg['pipeline'].get('time_window_s', 0.0)), float(min_win))
 
-    thresholds: Dict[str, Union[float, List[float]]] = {}
+    thresholds: Dict[str, Union[float, List[float], str]] = {}
 
-    if mode == "MoSK" or mode == "Hybrid":
-        mosk_stats: Dict[str, List[float]] = {'glu': [], 'gaba': []}
-        if mode == "MoSK":
-            symbols_to_check = {0: 'glu', 1: 'gaba'}
-        else:
-            symbols_to_check = {0: 'glu', 1: 'glu', 2: 'gaba', 3: 'gaba'}
-        cal_seeds = seeds[:10] if len(seeds) >= 10 else seeds
-        for symbol, type_key in symbols_to_check.items():
-            for seed in cal_seeds:
-                cal_cfg['pipeline']['random_seed'] = seed
-                result = run_calibration_symbols(cal_cfg, symbol, mode='MoSK' if mode == "MoSK" else mode)
-                if result:
-                    mosk_stats[type_key].extend(result['q_values'])
-        if all(mosk_stats[k] for k in mosk_stats):
-            mean_D_glu = float(np.mean(mosk_stats['glu'])); std_D_glu = max(float(np.std(mosk_stats['glu'])), 1e-15)
-            mean_D_gaba = float(np.mean(mosk_stats['gaba'])); std_D_gaba = max(float(np.std(mosk_stats['gaba'])), 1e-15)
-            threshold_mosk = calculate_ml_threshold(mean_D_glu, mean_D_gaba, std_D_glu, std_D_gaba)
-            thresholds['mosk_threshold'] = threshold_mosk
-
-    # Adaptive calibration parameters
-    eps = float(cfg.get('_cal_eps_rel', 0.01))
-    patience = int(cfg.get('_cal_patience', 2))
-    min_seeds = int(cfg.get('_cal_min_seeds', 4))
-    max_seeds = int(cfg.get('_cal_max_seeds', len(seeds)))
-    min_per_class = int(cfg.get('_cal_min_samples_per_class', 50))
+    # ----- shared ES knobs -----
+    eps          = float(cfg.get('_cal_eps_rel', 0.01))
+    patience     = int(cfg.get('_cal_patience', 2))
+    min_seeds    = int(cfg.get('_cal_min_seeds', 4))
+    max_seeds    = int(cfg.get('_cal_max_seeds', 0)) or len(seeds)
+    min_per_cls  = int(cfg.get('_cal_min_samples_per_class', 50))
+    es_mosk      = bool(cfg.get('_cal_enable_es_mosk', True))
+    es_hybrid    = bool(cfg.get('_cal_enable_es_hybrid', True))
 
     def _rel_delta(prev, curr):
-        if prev is None:
-            return float('inf')
+        if prev is None: return float('inf')
         if isinstance(curr, (list, tuple)):
-            import numpy as np
             a = np.asarray(prev, dtype=float)
             b = np.asarray(curr, dtype=float)
             denom = np.maximum(np.abs(a), 1e-12)
             return float(np.max(np.abs(b - a) / denom))
-        else:
-            denom = max(abs(prev), 1e-12)
-            return float(abs(curr - prev) / denom)
+        denom = max(abs(prev), 1e-12)
+        return float(abs(curr - prev) / denom)
 
-    # Replace the CSK calibration block (around lines 426-470)
+    # ---------- MoSK threshold (also used by Hybrid molecule bit) ----------
+    if mode in ("MoSK", "Hybrid"):
+        mosk_stats: Dict[str, List[float]] = {'da': [], 'sero': []}
+        prev_tau: Optional[float] = None
+        streak = 0
+
+        # Which way should the comparator go? Provide *hints* (non-breaking).
+        s_da, s_se = _qeff_signs(cfg)
+        mosk_dir_hint = ">" if s_da >= s_se else "<"  # heuristic; also provide empirical below
+
+        used = 0
+        for seed in seeds[:max_seeds]:
+            used += 1
+            cal_cfg['pipeline']['random_seed'] = seed
+
+            r_da = run_calibration_symbols(cal_cfg, 0, mode='MoSK')  # DA class
+            r_se = run_calibration_symbols(cal_cfg, 1, mode='MoSK')  # SERO class
+            if r_da and 'q_values' in r_da:
+                mosk_stats['da'].extend(_clean(r_da['q_values']))
+            if r_se and 'q_values' in r_se:
+                mosk_stats['sero'].extend(_clean(r_se['q_values']))
+
+            # Early-stop only when enough data per class
+            if es_mosk and used >= min_seeds and \
+               len(mosk_stats['da']) >= min_per_cls and len(mosk_stats['sero']) >= min_per_cls:
+                m0, s0 = float(np.mean(mosk_stats['da'])), max(float(np.std(mosk_stats['da'])), 1e-15)
+                m1, s1 = float(np.mean(mosk_stats['sero'])), max(float(np.std(mosk_stats['sero'])), 1e-15)
+                tau = float(calculate_ml_threshold(m0, m1, s0, s1))
+                if _rel_delta(prev_tau, tau) <= eps:
+                    streak += 1
+                    if streak >= patience:
+                        if verbose:
+                            print(f"🎯 MoSK calibration converged after {used} seeds (delta≤{eps:.3g})")
+                        prev_tau = tau
+                        break
+                else:
+                    streak = 0
+                prev_tau = tau
+
+        # Final threshold (either converged or all data)
+        if prev_tau is None:
+            if mosk_stats['da'] and mosk_stats['sero']:
+                m0, s0 = float(np.mean(mosk_stats['da'])), max(float(np.std(mosk_stats['da'])), 1e-15)
+                m1, s1 = float(np.mean(mosk_stats['sero'])), max(float(np.std(mosk_stats['sero'])), 1e-15)
+                prev_tau = float(calculate_ml_threshold(m0, m1, s0, s1))
+            else:
+                prev_tau = 0.0  # safe fallback
+                if verbose:
+                    print("⚠️  MoSK calibration collected no finite samples; using 0.0 fallback")
+
+        thresholds['mosk_threshold'] = float(prev_tau)
+
+        # --- NEW: persist MoSK detector metadata so decoding matches calibration ---
+        # Decision statistic used during calibration:
+        thresholds['mosk_statistic'] = 'sign_aware_diff'  # D = (sgn(qeff_DA)*q_da - sgn(qeff_SERO)*q_sero) / sigma_diff
+        thresholds['mosk_direction'] = '>'     # DA wins when stat > threshold
+
+        # Comparator direction hint:
+        # For D as above, symbol-0 (DA) should typically be chosen when D > tau
+        # unless you explicitly inverted the sign definition elsewhere.
+        thresholds['mosk_comparator'] = '>'
+
+        # Persist q_eff signs for sanity/debug
+        try:
+            q_da = float(cfg['neurotransmitters']['DA'].get('q_eff_e', 0.0))
+            q_se = float(cfg['neurotransmitters']['SERO'].get('q_eff_e', 0.0))
+        except Exception:
+            q_da, q_se = 0.0, 0.0
+        thresholds['mosk_decision_meta'] = json.dumps({
+            'qeff_signs': {'DA': (q_da >= 0.0), 'SERO': (q_se >= 0.0)},
+            'normalization': 'sigma_diff'
+        })
+
+        # Also store empirical comparator hint (based on means of D)
+        emp_dir = None
+        if mosk_stats['da'] and mosk_stats['sero']:
+            if float(np.mean(mosk_stats['da'])) > float(np.mean(mosk_stats['sero'])):
+                emp_dir = ">"
+            else:
+                emp_dir = "<"
+        thresholds['mosk_direction_hint'] = mosk_dir_hint
+        thresholds['mosk_direction_empirical'] = emp_dir if emp_dir else mosk_dir_hint
+
+    # ---------- CSK thresholds (adjacent ML; sign‑aware ordering) ----------
     if mode.startswith("CSK"):
-        M = int(cfg['pipeline']['csk_levels'])
-        target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
-        level_stats: Dict[int, List[float]] = {level: [] for level in range(M)}
-
-        prev_tau = None
-        streak, used = 0, 0
-        threshold_list = []  # Initialize threshold_list outside the loop
+        M = int(cfg['pipeline'].get('csk_levels', 4))
+        target_channel = str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper()
+        level_stats: Dict[int, List[float]] = {i: [] for i in range(M)}
+        prev_tau_list: Optional[List[float]] = None
+        streak = 0
+        used = 0
 
         for seed in seeds[:max_seeds]:
             used += 1
             cal_cfg['pipeline']['random_seed'] = seed
             for level in range(M):
-                result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=100)
-                if result and 'q_values' in result:
-                    level_stats[level].extend(result['q_values'])
+                r = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
+                if r and 'q_values' in r:
+                    level_stats[level].extend(_clean(r['q_values']))
 
-            # Only check stability if we have enough data
-            if used >= min_seeds and all(len(level_stats[i]) >= min_per_class for i in range(M)):
-                # Recompute thresholds from accumulated stats
-                threshold_list = []
+            # Only check stability when each class has enough samples
+            if used >= min_seeds and all(len(level_stats[i]) >= min_per_cls for i in range(M)):
+                tau_list: List[float] = []
                 for i in range(M - 1):
-                    if level_stats[i] and level_stats[i + 1]:
-                        m0, s0 = float(np.mean(level_stats[i])), max(float(np.std(level_stats[i])), 1e-15)
-                        m1, s1 = float(np.mean(level_stats[i+1])), max(float(np.std(level_stats[i+1])), 1e-15)
-                        threshold_list.append(calculate_ml_threshold(m0, m1, s0, s1))
-                q_eff = get_nt_params(cfg, target_channel)['q_eff_e']
-                threshold_list.sort(reverse=(q_eff < 0))
+                    a = level_stats[i]; b = level_stats[i + 1]
+                    m0, s0 = float(np.mean(a)), max(float(np.std(a)), 1e-15)
+                    m1, s1 = float(np.mean(b)), max(float(np.std(b)), 1e-15)
+                    tau_list.append(float(calculate_ml_threshold(m0, m1, s0, s1)))
 
-                delta = _rel_delta(prev_tau, threshold_list)
-                if delta <= eps:
+                # Sign‑aware ordering for target channel
+                qeff = float(cfg['neurotransmitters'][target_channel]['q_eff_e'])
+                tau_list.sort(reverse=(qeff < 0))
+
+                if _rel_delta(prev_tau_list, tau_list) <= eps:
                     streak += 1
                     if streak >= patience:
                         if verbose:
-                            print(f"CSK calibration converged after {used} seeds (delta={delta:.4f})")
+                            print(f"🎯 CSK calibration converged after {used} seeds (delta≤{eps:.3g})")
+                        prev_tau_list = tau_list
                         break
                 else:
                     streak = 0
-                prev_tau = threshold_list
+                prev_tau_list = tau_list
 
-        # Use the final threshold list (either from convergence or last iteration)
-        final_threshold_list = prev_tau if prev_tau is not None else threshold_list
-        thresholds[f'csk_thresholds_{target_channel.lower()}'] = final_threshold_list
-        
-        # ENHANCEMENT: Store cache metadata for threshold provenance tracking
-        import time
+        # Final thresholds
+        final_tau = prev_tau_list
+        if final_tau is None:
+            # Compute once from whatever samples we have (may be sparse)
+            tau_list = []
+            ok = True
+            for i in range(M - 1):
+                a = level_stats[i]; b = level_stats[i + 1]
+                if not a or not b:
+                    ok = False
+                    break
+                m0, s0 = float(np.mean(a)), max(float(np.std(a)), 1e-15)
+                m1, s1 = float(np.mean(b)), max(float(np.std(b)), 1e-15)
+                tau_list.append(float(calculate_ml_threshold(m0, m1, s0, s1)))
+            if ok:
+                qeff = float(cfg['neurotransmitters'][target_channel]['q_eff_e'])
+                tau_list.sort(reverse=(qeff < 0))
+                final_tau = tau_list
+            else:
+                final_tau = [0.0] * (M - 1)
+                if verbose:
+                    print("⚠️  CSK calibration incomplete; using 0.0 thresholds")
+
+        thresholds[f'csk_thresholds_{target_channel.lower()}'] = final_tau
+
+        # provenance for resume
         cfg['_threshold_cache_meta'] = {
             'M': M,
             'target_channel': target_channel,
-            'combiner': cfg['pipeline'].get('csk_combiner', 'zscore'),
-            'timestamp': time.time()
+            'combiner': str(cfg['pipeline'].get('csk_combiner', 'zscore'))
         }
 
+    # ---------- Hybrid amplitude thresholds (+ optional early‑stop) ----------
     if mode == "Hybrid":
-        stats: Dict[str, List[float]] = {'glu_low': [], 'glu_high': [], 'gaba_low': [], 'gaba_high': []}
-        symbol_to_type = {0: 'glu_low', 1: 'glu_high', 2: 'gaba_low', 3: 'gaba_high'}
-        cal_seeds = seeds[:30] if len(seeds) >= 30 else seeds
-        for symbol in range(4):
-            for seed in cal_seeds:
-                cal_cfg['pipeline']['random_seed'] = seed
-                result = run_calibration_symbols(cal_cfg, symbol, mode='Hybrid')
-                if result:
-                    stats[symbol_to_type[symbol]].extend(result['q_values'])
-        if all(stats[k] for k in stats):
-            m_gl, s_gl = float(np.mean(stats['glu_low'])), max(float(np.std(stats['glu_low'])), 1e-15)
-            m_gh, s_gh = float(np.mean(stats['glu_high'])), max(float(np.std(stats['glu_high'])), 1e-15)
-            m_bl, s_bl = float(np.mean(stats['gaba_low'])), max(float(np.std(stats['gaba_low'])), 1e-15)
-            m_bh, s_bh = float(np.mean(stats['gaba_high'])), max(float(np.std(stats['gaba_high'])), 1e-15)
-            thresholds['hybrid_threshold_glu'] = calculate_ml_threshold(m_gl, m_gh, s_gl, s_gh)
-            thresholds['hybrid_threshold_gaba'] = calculate_ml_threshold(m_bl, m_bh, s_bl, s_bh)
+        stats: Dict[str, List[float]] = {'da_low': [], 'da_high': [], 'sero_low': [], 'sero_high': []}
+        prev_da_tau: Optional[float] = None
+        prev_se_tau: Optional[float] = None
+        streak_da = 0
+        streak_se = 0
+        used = 0
 
+        for seed in seeds[:max_seeds]:
+            used += 1
+            cal_cfg['pipeline']['random_seed'] = seed
+            for sym in range(4):
+                r = run_calibration_symbols(cal_cfg, sym, mode='Hybrid')
+                if r and 'q_values' in r:
+                    vals = _clean(r['q_values'])
+                    if sym == 0:   stats['da_low'].extend(vals)
+                    elif sym == 1: stats['da_high'].extend(vals)
+                    elif sym == 2: stats['sero_low'].extend(vals)
+                    elif sym == 3: stats['sero_high'].extend(vals)
+
+            if es_hybrid and used >= min_seeds and \
+               min(len(stats['da_low']), len(stats['da_high'])) >= min_per_cls and \
+               min(len(stats['sero_low']), len(stats['sero_high'])) >= min_per_cls:
+                # DA amplitude threshold
+                m_gl, s_gl = float(np.mean(stats['da_low'])),  max(float(np.std(stats['da_low'])), 1e-15)
+                m_gh, s_gh = float(np.mean(stats['da_high'])), max(float(np.std(stats['da_high'])), 1e-15)
+                tau_da = float(calculate_ml_threshold(m_gl, m_gh, s_gl, s_gh))
+                if _rel_delta(prev_da_tau, tau_da) <= eps:
+                    streak_da += 1
+                else:
+                    streak_da = 0
+                prev_da_tau = tau_da
+
+                # SERO amplitude threshold
+                m_sl, s_sl = float(np.mean(stats['sero_low'])),  max(float(np.std(stats['sero_low'])), 1e-15)
+                m_sh, s_sh = float(np.mean(stats['sero_high'])), max(float(np.std(stats['sero_high'])), 1e-15)
+                tau_se = float(calculate_ml_threshold(m_sl, m_sh, s_sl, s_sh))
+                if _rel_delta(prev_se_tau, tau_se) <= eps:
+                    streak_se += 1
+                else:
+                    streak_se = 0
+                prev_se_tau = tau_se
+
+                if streak_da >= patience and streak_se >= patience:
+                    if verbose:
+                        print(f"🎯 Hybrid amplitude thresholds converged after {used} seeds")
+                    break
+
+        # Final thresholds (compute if ES didn't fill them)
+        if prev_da_tau is None or prev_se_tau is None:
+            if all(stats[k] for k in stats):
+                m_gl, s_gl = float(np.mean(stats['da_low'])),  max(float(np.std(stats['da_low'])), 1e-15)
+                m_gh, s_gh = float(np.mean(stats['da_high'])), max(float(np.std(stats['da_high'])), 1e-15)
+                m_sl, s_sl = float(np.mean(stats['sero_low'])),  max(float(np.std(stats['sero_low'])), 1e-15)
+                m_sh, s_sh = float(np.mean(stats['sero_high'])), max(float(np.std(stats['sero_high'])), 1e-15)
+                prev_da_tau = float(calculate_ml_threshold(m_gl, m_gh, s_gl, s_gh))
+                prev_se_tau = float(calculate_ml_threshold(m_sl, m_sh, s_sl, s_sh))
+            else:
+                prev_da_tau = prev_da_tau or 0.0
+                prev_se_tau = prev_se_tau or 0.0
+                if verbose:
+                    print("⚠️  Hybrid calibration incomplete; using 0.0 fallbacks")
+
+        thresholds['hybrid_threshold_da'] = float(prev_da_tau)
+        thresholds['hybrid_threshold_sero'] = float(prev_se_tau)
+
+        # Comparator hints by sign (and empirical if available)
+        s_da, s_se = _qeff_signs(cfg)
+        thresholds['hybrid_direction_da_hint']   = ">" if s_da > 0 else "<" if s_da < 0 else "="
+        thresholds['hybrid_direction_sero_hint'] = ">" if s_se > 0 else "<" if s_se < 0 else "="
+
+    # ---------- persist to disk with rich __meta__ (atomic) ----------
     if save_to_file:
         try:
-            tmp = threshold_file.with_suffix(threshold_file.suffix + ".tmp")
-            payload = {
-                "__meta__": {
-                    "mode": str(cfg['pipeline'].get('modulation')),
-                    "M": int(cfg['pipeline'].get('csk_levels', 0)),
-                    "target": str(cfg['pipeline'].get('csk_target_channel', '')).upper(),
-                    "lvl_scheme": str(cfg['pipeline'].get('csk_level_scheme', 'uniform')),
-                    "combiner": str(cfg['pipeline'].get('csk_combiner', 'zscore')),  # 🛠 ADD THIS LINE
-                    "leakage_frac": float(cfg['pipeline'].get('csk_leakage_frac', 0.0)),  # 🛠 ADD THIS LINE
-                    "Nm": int(cfg['pipeline'].get('Nm_per_symbol', 0)),
-                    "distance_um": int(cfg['pipeline'].get('distance_um', 0)),
-                    "Ts": float(cfg['pipeline'].get('symbol_period_s', 0.0)),
-                    "guard_factor": float(cfg['pipeline'].get('guard_factor', 0.0)),
-                    "use_ctrl": bool(cfg['pipeline'].get('use_control_channel', True)),
-                },
-                **thresholds
+            threshold_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # JSON‑safe thresholds
+            payload: Dict[str, Any] = {}
+            for k, v in thresholds.items():
+                if isinstance(v, np.ndarray):
+                    payload[k] = v.tolist()
+                elif isinstance(v, (np.integer, np.floating)):
+                    payload[k] = float(v)
+                elif isinstance(v, list):
+                    payload[k] = [float(x) if isinstance(x, (np.integer, np.floating)) else x for x in v]
+                else:
+                    payload[k] = v
+
+            # Metadata
+            s_da, s_se = _qeff_signs(cfg)
+            meta = {
+                "mode": str(cfg['pipeline'].get('modulation')),
+                "M": int(cfg['pipeline'].get('csk_levels', 0)),
+                "target": str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper(),
+                "combiner": str(cfg['pipeline'].get('csk_combiner', 'zscore')),
+                "leakage_frac": float(cfg['pipeline'].get('csk_leakage_frac', 0.0)),
+                "Nm": float(cfg['pipeline'].get('Nm_per_symbol', 0.0)),
+                "distance_um": float(cfg['pipeline'].get('distance_um', 0.0)),
+                "Ts": float(Ts),
+                "decision_window_used": float(min_win),
+                "guard_factor": float(cfg['pipeline'].get('guard_factor', 0.0)),
+                "use_ctrl": bool(cfg['pipeline'].get('use_control_channel', True)),
+                "nt_pair_label": f"{cfg['neurotransmitters']['DA'].get('name','DA')}–{cfg['neurotransmitters']['SERO'].get('name','SERO')}",
+                "nt_pair_fp": _fingerprint_nt_pair(cfg),
+                "q_eff_signs": (s_da, s_se),
+                "version": "2.0",
+                "timestamp": time.time()
             }
-            with open(tmp, "w", encoding="utf-8") as f:
+            payload["__meta__"] = meta
+
+            tmp_file = threshold_file.with_suffix('.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2)
-            os.replace(tmp, threshold_file)
-        except Exception:
-            # Best-effort; calibration can be recomputed if needed
-            try:
-                tmp = threshold_file.with_suffix(threshold_file.suffix + ".tmp")
-                if tmp.exists(): 
-                    tmp.unlink()
-            except Exception:
-                pass
+            os.replace(tmp_file, threshold_file)
+
+            if verbose:
+                print(f"💾 Saved thresholds to {threshold_file}")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ Failed to save thresholds: {e}")
 
     return thresholds
 
-def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False) -> Dict[str, Union[float, List[float]]]:
+def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False) -> Dict[str, Union[float, List[float], str]]:
     """
     Memory + disk cached calibration. Persist JSON so multiple processes/runs reuse it.
     """
@@ -628,10 +838,8 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     
     # If recalibrating, clear both memory and disk cache
     if recalibrate:
-        # Clear memory cache
         if cache_key in calibration_cache:
             del calibration_cache[cache_key]
-        # Clear disk cache
         threshold_file = _thresholds_filename(cfg)
         if threshold_file.exists():
             try:
@@ -647,9 +855,8 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     # Compute thresholds (respecting the recalibrate flag)
     result = calibrate_thresholds(cfg, seeds, recalibrate=recalibrate, save_to_file=True, verbose=False)
     
-    # Bound cache size to prevent memory bloat during long sweeps
+    # Bound cache size to prevent memory bloat
     if len(calibration_cache) >= MAX_CACHE_SIZE:
-        # Remove oldest entries (FIFO eviction)
         oldest_keys = list(calibration_cache.keys())[:len(calibration_cache) - MAX_CACHE_SIZE + 1]
         for old_key in oldest_keys:
             del calibration_cache[old_key]
@@ -695,23 +902,33 @@ def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
     # Add binding
     cfg['binding'] = cfg.get('binding', {})
     
-    # Add extra defaults for pipeline optimization flags
-    cfg['_cal_eps_rel'] = cfg.get('_cal_eps_rel', 0.01)
-    cfg['_cal_patience'] = cfg.get('_cal_patience', 2)
-    
-    # NEW: Add dual-channel CSK configuration defaults
+    # ---- Calibration knobs (back‑compatible defaults) ----
+    cfg['_cal_symbols_per_seed']       = int(cfg.get('_cal_symbols_per_seed', 100))
+    cfg['_cal_min_samples_per_class']  = int(cfg.get('_cal_min_samples_per_class', 50))
+    cfg['_cal_min_seeds']              = int(cfg.get('_cal_min_seeds', 4))
+    cfg['_cal_max_seeds']              = int(cfg.get('_cal_max_seeds', 0))  # 0 → resolve to len(seeds) at runtime
+    cfg['_cal_eps_rel']                = float(cfg.get('_cal_eps_rel', 0.01))
+    cfg['_cal_patience']               = int(cfg.get('_cal_patience', 2))
+    cfg['_cal_enable_es_mosk']         = bool(cfg.get('_cal_enable_es_mosk', True))
+    cfg['_cal_enable_es_hybrid']       = bool(cfg.get('_cal_enable_es_hybrid', True))
+
+    # Window guard tuning (existing)
+    cfg['_min_decision_points'] = int(cfg.get('_min_decision_points', 4))
+
+    # NEW: Dual‑channel CSK configuration defaults
     cfg['pipeline']['csk_dual_channel'] = cfg['pipeline'].get('csk_dual_channel', True)
     cfg['pipeline']['csk_combiner'] = cfg['pipeline'].get('csk_combiner', 'zscore')
-    cfg['pipeline']['csk_leakage_frac'] = cfg['pipeline'].get('csk_leakage_frac', 
-                                                            cfg['pipeline'].get('non_specific_binding_factor', 0.0))
+    cfg['pipeline']['csk_leakage_frac'] = cfg['pipeline'].get(
+        'csk_leakage_frac', cfg['pipeline'].get('non_specific_binding_factor', 0.0)
+    )
     cfg['pipeline']['csk_store_combiner_meta'] = cfg['pipeline'].get('csk_store_combiner_meta', True)
     
     return cfg
 
 def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> float:
-    D_glu = cfg['neurotransmitters']['GLU']['D_m2_s']
-    lambda_glu = cfg['neurotransmitters']['GLU']['lambda']
-    D_eff = D_glu / (lambda_glu ** 2)
+    D_da = cfg['neurotransmitters']['DA']['D_m2_s']
+    lambda_da = cfg['neurotransmitters']['DA']['lambda']
+    D_eff = D_da / (lambda_da ** 2)
     time_95 = 3.0 * ((distance_um * 1e-6)**2) / D_eff
     guard_factor = cfg['pipeline'].get('guard_factor', 0.1)
     guard_time = guard_factor * time_95
@@ -738,8 +955,8 @@ def estimate_isi_overlap_ratio(cfg: Dict[str, Any]) -> float:
         return 0.0
     d_um = float(cfg['pipeline']['distance_um'])
     Ts = float(cfg['pipeline'].get('symbol_period_s', 1.0))
-    D = float(cfg['neurotransmitters']['GLU']['D_m2_s'])
-    lam = float(cfg['neurotransmitters']['GLU']['lambda'])
+    D = float(cfg['neurotransmitters']['DA']['D_m2_s'])
+    lam = float(cfg['neurotransmitters']['DA']['lambda'])
     D_eff = D / (lam ** 2)
     time_95 = 3.0 * ((d_um * 1e-6) ** 2) / D_eff
     if time_95 <= 0:
@@ -825,24 +1042,24 @@ def append_row_atomic(csv_path: Path, row: Dict[str, Any], columns: Optional[Lis
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     
     # ✅ Add combiner metadata columns BEFORE creating DataFrame
-    if row.get('modulation', '').startswith('CSK') and row.get('csk_store_combiner_meta', True):
+    if row.get('mode', '').startswith('CSK') and row.get('csk_store_combiner_meta', True):
         if 'combiner' not in row:
-            row['combiner'] = row.get('csk_combiner', 'zscore')
-        if 'sigma_glu' not in row:
-            row['sigma_glu'] = row.get('noise_sigma_glu', np.nan)
-        if 'sigma_gaba' not in row:
-            row['sigma_gaba'] = row.get('noise_sigma_gaba', np.nan)
+            row['combiner'] = row.get('csk_selected_combiner', row.get('csk_combiner', 'zscore'))
+        if 'sigma_da' not in row:
+            row['sigma_da'] = row.get('noise_sigma_da', np.nan)
+        if 'sigma_sero' not in row:
+            row['sigma_sero'] = row.get('noise_sigma_sero', np.nan)
         if 'rho_cc' not in row:
-            row['rho_cc'] = row.get('rho_between_channels_after_ctrl', 0.0)
+            # Note: This should be populated from the config when creating the row
+            # For now, use a fallback or remove if not available
+            row['rho_cc'] = row.get('rho_cc', 0.0)  # Use direct key or default
         if 'leakage_frac' not in row:
             combiner = row.get('combiner', 'zscore')
             row['leakage_frac'] = row.get('csk_leakage_frac', 0.0) if combiner == 'leakage' else np.nan
         
         # NEW: Add CSK configuration triple for plot provenance
-        if 'csk_levels' not in row:
-            row['csk_levels'] = row.get('csk_levels', row.get('M', 4))
-        if 'csk_target_channel' not in row:
-            row['csk_target_channel'] = row.get('csk_target_channel', 'GLU')
+        row.setdefault('csk_levels', row.get('M', 4))
+        row.setdefault('csk_target_channel', 'DA')
     
     # ✅ NOW create DataFrame with complete metadata
     new_row = pd.DataFrame([row])
@@ -1094,6 +1311,74 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 # ============= CALIBRATION SAMPLES (helper) =============
+def _pava_monotone_means(mu: List[float], w: Optional[List[float]] = None) -> List[float]:
+    """Pool-adjacent-violators for nondecreasing means. Returns adjusted means."""
+    import numpy as np
+    
+    if not mu:
+        return []
+    
+    # Convert to numpy for computation but ensure proper types
+    x_array = np.array(mu, dtype=float)
+    if w is None:
+        w_array = np.ones_like(x_array, dtype=float)
+    else:
+        w_array = np.array(w, dtype=float)
+    
+    # Make working copies to avoid assignment type issues
+    x = x_array.copy()
+    w_weights = w_array.copy()
+    
+    # Nondecreasing PAVA
+    i = 0
+    while i < len(x) - 1:
+        if x[i] <= x[i+1] + 1e-15:
+            i += 1
+            continue
+        # merge pools
+        total_w = w_weights[i] + w_weights[i+1]
+        if total_w > 0:
+            merged = (w_weights[i]*x[i] + w_weights[i+1]*x[i+1]) / total_w
+            # Assign to both positions
+            x[i] = merged
+            x[i+1] = merged
+            w_weights[i] = total_w
+            w_weights[i+1] = total_w
+        
+        j = i
+        while j > 0 and x[j-1] > x[j] + 1e-15:
+            total_w = w_weights[j-1] + w_weights[j]
+            if total_w > 0:
+                merged = (w_weights[j-1]*x[j-1] + w_weights[j]*x[j]) / total_w
+                x[j-1] = merged
+                x[j] = merged
+                w_weights[j-1] = total_w
+                w_weights[j] = total_w
+            j -= 1
+        i = max(j, 0)
+    
+    # Convert back to list of floats to match return type
+    return [float(val) for val in x.tolist()]
+
+def _adjacent_threshold_ml(mu0: float, mu1: float, s0: float, s1: float) -> float:
+    try:
+        from src.mc_detection.algorithms import calculate_ml_threshold
+    except ImportError:
+        from src.detection import calculate_ml_threshold
+    return float(calculate_ml_threshold(float(mu0), float(mu1), max(float(s0),1e-15), max(float(s1),1e-15)))
+
+def _adjacent_threshold_map(mu0: float, mu1: float, s0: float, s1: float, p0: float, p1: float) -> float:
+    import numpy as np
+    # ML threshold shifted by log-prior ratio (Gaussian log-likelihoods differ by log p)
+    # Solve t* for unequal variance via numeric adjust around ML; fallback to midpoint.
+    t_ml = _adjacent_threshold_ml(mu0, mu1, s0, s1)
+    # Approximate shift for priors in equal-variance case
+    if abs(s0 - s1) / max(s0, s1) < 1e-3:
+        # equal variance: shift by Δ = (s^2)*log(p1/p0)/(mu1-mu0)
+        if abs(mu1 - mu0) > 1e-15:
+            return float(t_ml + (s0**2) * (np.log(p1/p0)) / (mu1 - mu0))
+    return float(t_ml)
+
 def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_symbols: int = 100) -> Optional[Dict[str, Any]]:
     try:
         # Import the dual-channel helper
@@ -1103,15 +1388,16 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         cal_cfg['pipeline']['sequence_length'] = num_symbols
         cal_cfg['disable_progress'] = True
         tx_symbols = [symbol] * num_symbols
-        q_glu_values: List[float] = []
-        q_gaba_values: List[float] = []
+        q_da_values: List[float] = []
+        q_sero_values: List[float] = []
         decision_stats: List[float] = []
         dt = cal_cfg['sim']['dt_s']
-        detection_window_s = cal_cfg['detection'].get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
-        sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
+        d = cal_cfg.setdefault('detection', {})
+        detection_window_s = d.get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
+        sigma_da, sigma_sero = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
         
         # Initialize CSK dual-channel parameters with defaults
-        target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'GLU')
+        target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'DA')
         combiner = cal_cfg['pipeline'].get('csk_combiner', 'zscore')
         use_dual = bool(cal_cfg['pipeline'].get('csk_dual_channel', True))
         leakage = float(cal_cfg['pipeline'].get('csk_leakage_frac', 0.0))
@@ -1128,34 +1414,57 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
             if n_detect_samples <= 1:
                 continue
+                
+            # Tail-gated integration
+            tail = float(cal_cfg['pipeline'].get('csk_tail_fraction', 1.0))
+            tail = min(max(tail, 0.1), 1.0)
+            i0 = int((1.0 - tail) * n_detect_samples)
+
             use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
-            q_glu = float(np.trapezoid((ig - ic)[:n_detect_samples], dx=dt) if use_ctrl else np.trapezoid(ig[:n_detect_samples], dx=dt))
-            q_gaba = float(np.trapezoid((ia - ic)[:n_detect_samples], dx=dt) if use_ctrl else np.trapezoid(ia[:n_detect_samples], dx=dt))
-            q_glu_values.append(q_glu); q_gaba_values.append(q_gaba)
+            q_da = float(np.trapezoid(((ig - ic) if use_ctrl else ig)[i0:n_detect_samples], dx=dt))
+            q_sero = float(np.trapezoid(((ia - ic) if use_ctrl else ia)[i0:n_detect_samples], dx=dt))
+            
+            q_da_values.append(q_da); q_sero_values.append(q_sero)
         
-        for q_glu, q_gaba in zip(q_glu_values, q_gaba_values):
+        for q_da, q_sero in zip(q_da_values, q_sero_values):
             if mode == "MoSK":
-                D = q_glu / sigma_glu + q_gaba / sigma_gaba
-                decision_stats.append(D)
+                # Get q_eff signs to match runtime logic
+                q_eff_da = float(cal_cfg['neurotransmitters']['DA']['q_eff_e'])
+                q_eff_sero = float(cal_cfg['neurotransmitters']['SERO']['q_eff_e'])
+                sign_da = 1.0 if q_eff_da >= 0 else -1.0
+                sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
+                
+                rho_cc = float(cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
+                sigma_diff = math.sqrt(sigma_da*sigma_da + sigma_sero*sigma_sero - 2.0*rho_cc*sigma_da*sigma_sero)
+                if sigma_diff <= 1e-15:
+                    sigma_diff = 1e-15
+                # Fix: Use sign-aware difference to match runtime
+                D = (sign_da * q_da - sign_sero * q_sero) / sigma_diff
+                decision_stats.append(float(D))
             elif mode.startswith("CSK"):
                 if use_dual:
                     Q = _csk_dual_channel_Q(
-                        q_glu=q_glu, q_gaba=q_gaba,
-                        sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                        q_da=q_da, q_sero=q_sero,
+                        sigma_da=sigma_da, sigma_sero=sigma_sero,
                         rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
                         target=target_channel
                     )
                 else:
                     # Legacy single-channel
-                    Q = q_glu if target_channel == 'GLU' else q_gaba
+                    Q = q_da if target_channel == 'DA' else q_sero
                 decision_stats.append(Q)
             elif mode == "Hybrid":
                 mol_type = symbol >> 1
-                Q = q_glu if mol_type == 0 else q_gaba
+                Q = q_da if mol_type == 0 else q_sero
                 decision_stats.append(Q)
         
         # Enhanced return with combiner metadata for CSK
-        result = {'q_values': decision_stats, 'sigma_glu': sigma_glu, 'sigma_gaba': sigma_gaba}
+        # Keep aux raw charges for flexible combiners
+        aux_q = list(zip(q_da_values, q_sero_values))
+        result = {
+            "q_values": decision_stats,
+            "aux_q": aux_q
+        }
         
         # Add combiner metadata for CSV traceability if enabled
         if (mode.startswith('CSK') and 
@@ -1198,7 +1507,7 @@ def run_single_instance(config: Dict[str, Any], seed: int, attach_isi_meta: bool
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False,
-                         thresholds_override: Optional[Dict[str, Union[float, List[float]]]] = None,
+                         thresholds_override: Optional[Dict[str, Union[float, List[float], str]]] = None,
                          sweep_name: str = "ser_vs_nm", cache_tag: Optional[str] = None,
                          recalibrate: bool = False) -> Optional[Dict[str, Any]]:
     """Worker for parameter sweep with window match; accepts optional precomputed thresholds."""
@@ -1225,11 +1534,11 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             min_win = _enforce_min_window(cfg_run, new_symbol_period)
             cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
             cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run['detection']['decision_window_s'] = min_win
+            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
             if cfg_run['pipeline'].get('enable_isi', False):
-                D_glu = cfg_run['neurotransmitters']['GLU']['D_m2_s']
-                lambda_glu = cfg_run['neurotransmitters']['GLU']['lambda']
-                D_eff = D_glu / (lambda_glu ** 2)
+                D_da = cfg_run['neurotransmitters']['DA']['D_m2_s']
+                lambda_da = cfg_run['neurotransmitters']['DA']['lambda']
+                D_eff = D_da / (lambda_da ** 2)
                 time_95 = 3.0 * ((cast(float, param_value) * 1e-6)**2) / D_eff
                 guard_factor = cfg_run['pipeline'].get('guard_factor', 0.1)
                 isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
@@ -1245,11 +1554,11 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             min_win = _enforce_min_window(cfg_run, new_symbol_period)
             cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
             cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run['detection']['decision_window_s'] = min_win
+            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
             if cfg_run['pipeline'].get('enable_isi', False):
-                D_glu = cfg_run['neurotransmitters']['GLU']['D_m2_s']
-                lambda_glu = cfg_run['neurotransmitters']['GLU']['lambda']
-                D_eff = D_glu / (lambda_glu ** 2)
+                D_da = cfg_run['neurotransmitters']['DA']['D_m2_s']
+                lambda_da = cfg_run['neurotransmitters']['DA']['lambda']
+                D_eff = D_da / (lambda_da ** 2)
                 time_95 = 3.0 * ((dist * 1e-6)**2) / D_eff
                 guard_factor = float(param_value)
                 isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
@@ -1262,7 +1571,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             min_pts = int(cfg_run.get('_min_decision_points', 4))
             min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
             cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run['detection']['decision_window_s'] = min_win
+            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
@@ -1275,7 +1584,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             for k, v in thresholds.items():
                 cfg_run['pipeline'][k] = v
             if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
-                target_ch = cfg_run['pipeline'].get('csk_target_channel', 'GLU').lower()
+                target_ch = cfg_run['pipeline'].get('csk_target_channel', 'DA').lower()
                 key = f'csk_thresholds_{target_ch}'
                 if key in cfg_run['pipeline']:
                     print(f"[DEBUG] CSK Thresholds @ {param_value}: {cfg_run['pipeline'][key]}")
@@ -1342,7 +1651,7 @@ def run_sweep(cfg: Dict[str, Any],
             print(f"↩️  Resume: skipping {len(done)} already-completed values for use_ctrl={desired_ctrl}")
 
     # Pre-calibrate thresholds once per sweep value (hoisted from per-seed)
-    thresholds_map: Dict[Union[float, int], Dict[str, Union[float, List[float]]]] = {}
+    thresholds_map: Dict[Union[float, int], Dict[str, Union[float, List[float], str]]] = {}
     if cfg['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
        sweep_param in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor']:
         cal_seeds = list(range(10))
@@ -1625,8 +1934,8 @@ def run_sweep(cfg: Dict[str, Any],
         all_a: List[float] = []
         all_b: List[float] = []
         for r in results:
-            all_a.extend(cast(List[float], r.get('stats_glu', [])))
-            all_b.extend(cast(List[float], r.get('stats_gaba', [])))
+            all_a.extend(cast(List[float], r.get('stats_da', [])))
+            all_b.extend(cast(List[float], r.get('stats_sero', [])))
         snr_lin = calculate_snr_from_stats(all_a, all_b) if all_a and all_b else 0.0
         snr_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
 
@@ -1638,11 +1947,11 @@ def run_sweep(cfg: Dict[str, Any],
         isi_overlap_mean = float(np.nanmean([float(r.get('isi_overlap_ratio', 0.0)) for r in results]))
 
         # Stage 14: aggregate noise sigmas across seeds
-        ns_glu = [float(r.get('noise_sigma_glu', float('nan'))) for r in results]
-        ns_gaba = [float(r.get('noise_sigma_gaba', float('nan'))) for r in results]
+        ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
+        ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
         ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
-        med_sigma_glu = float(np.nanmedian(ns_glu)) if any(np.isfinite(ns_glu)) else float('nan')
-        med_sigma_gaba = float(np.nanmedian(ns_gaba)) if any(np.isfinite(ns_gaba)) else float('nan')
+        med_sigma_da = float(np.nanmedian(ns_da)) if np.isfinite(ns_da).any() else float('nan')
+        med_sigma_sero = float(np.nanmedian(ns_sero)) if any(np.isfinite(ns_sero)) else float('nan')
         med_sigma_diff = float(np.nanmedian(ns_diff)) if any(np.isfinite(ns_diff)) else float('nan')
 
         row: Dict[str, Any] = {
@@ -1657,9 +1966,10 @@ def run_sweep(cfg: Dict[str, Any],
             'symbol_period_s': symbol_period_s,
             'decision_window_s': decision_window_s,
             'isi_overlap_ratio': isi_overlap_mean,
-            'noise_sigma_glu': med_sigma_glu,           # NEW
-            'noise_sigma_gaba': med_sigma_gaba,         # NEW
+            'noise_sigma_da': med_sigma_da,           # NEW
+            'noise_sigma_sero': med_sigma_sero,         # NEW
             'noise_sigma_I_diff': med_sigma_diff,       # NEW
+            'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),  # NEW: Add rho_cc
             'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),  # persist CTRL flag
             'mode': cfg['pipeline']['modulation'],
         }
@@ -1770,7 +2080,7 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
                         means.append(float(np.mean(level_stats[i])))
                         stds.append(max(1e-15, float(np.std(level_stats[i]))))
                     if len(means) == M:
-                        target_ch = cfg_p['pipeline'].get('csk_target_channel', 'GLU').lower()
+                        target_ch = cfg_p['pipeline'].get('csk_target_channel', 'DA').lower()
                         tau = th.get(f'csk_thresholds_{target_ch}', [])
                         tau = [float(x) for x in (tau if isinstance(tau, list) else [])]
                         if len(tau) == M - 1:
@@ -1960,7 +2270,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     ctrl_str = "CTRL" if use_ctrl else "NoCtrl"
 
     # NEW: Cache thresholds during bisection to reduce calibration overhead
-    th_cache: Dict[int, Dict[str, Union[float, List[float]]]] = {}  # nm -> thresholds dict
+    th_cache: Dict[int, Dict[str, Union[float, List[float], str]]] = {}  # nm -> thresholds dict
     
     def _get_th(nm: int):
         if nm in th_cache:
@@ -2651,7 +2961,7 @@ def _canonical_nt_key(cfg: Dict[str, Any], name: str) -> Optional[str]:
         Canonical key if found, None otherwise
         
     Examples:
-        'glu' -> 'GLU', 'acetylcholine' -> 'ACh', 'DA' -> 'DA'
+        'da' -> 'DA', 'acetylcholine' -> 'ACh', 'DA' -> 'DA'
     """
     nts = cfg.get('neurotransmitters', {})
     
@@ -2664,10 +2974,10 @@ def _canonical_nt_key(cfg: Dict[str, Any], name: str) -> Optional[str]:
     aliases = {
         'ach': 'ACh', 'acetylcholine': 'ACh',
         'da': 'DA', 'dopamine': 'DA', 
-        'glu': 'GLU', 'glutamate': 'GLU',
-        'gaba': 'GABA',  # redundant but explicit
+        'da': 'DA', 'datamate': 'DA',
+        'sero': 'SERO',  # redundant but explicit
         # Add more as needed:
-        'serotonin': '5HT', '5ht': '5HT',
+        'serotonin': 'SERO', 'sero': 'SERO',
         'norepinephrine': 'NE', 'ne': 'NE'
     }
     
@@ -2675,7 +2985,7 @@ def _canonical_nt_key(cfg: Dict[str, Any], name: str) -> Optional[str]:
     return canonical if canonical and canonical in nts else None
 
 def _apply_nt_pair(cfg: Dict[str, Any], first: str, second: str) -> Dict[str, Any]:
-    """Swap underlying molecule dicts into GLU/GABA slots so the tri-channel interface stays stable."""
+    """Swap underlying molecule dicts into DA/SERO slots so the tri-channel interface stays stable."""
     cfg_new = deepcopy(cfg)
     nts = cfg.get('neurotransmitters', {})
     k1 = _canonical_nt_key(cfg, first)
@@ -2683,15 +2993,15 @@ def _apply_nt_pair(cfg: Dict[str, Any], first: str, second: str) -> Dict[str, An
     if k1 is None or k2 is None:
         nts = cfg.get('neurotransmitters', {})
         available = list(nts.keys())
-        aliases = ['ach', 'acetylcholine', 'da', 'dopamine', 'glu', 'glutamate', 'gaba', 'serotonin', '5ht', 'norepinephrine', 'ne']
+        aliases = ['ach', 'acetylcholine', 'da', 'dopamine', 'da', 'datamate', 'sero', 'serotonin', 'sero', 'norepinephrine', 'ne']
         raise ValueError(f"Unknown neurotransmitter key(s): {first}, {second}. "
                         f"Available: {available}. "
                         f"Supported aliases: {aliases}")
 
-    cfg_new['neurotransmitters']['GLU'] = dict(nts[k1])   # first
-    cfg_new['neurotransmitters']['GABA'] = dict(nts[k2])  # second
+    cfg_new['neurotransmitters']['DA'] = dict(nts[k1])   # first
+    cfg_new['neurotransmitters']['SERO'] = dict(nts[k2])  # second
     if cfg_new['pipeline'].get('modulation') == 'CSK':
-        cfg_new['pipeline']['csk_target_channel'] = 'GLU'  # measure 'first'
+        cfg_new['pipeline']['csk_target_channel'] = 'DA'  # measure 'first'
     return cfg_new
 
 def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_values: List[Union[float, int]]) -> None:
@@ -2957,7 +3267,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
-        cfg['pipeline']['csk_target_channel'] = 'GLU'
+        cfg['pipeline']['csk_target_channel'] = 'DA'
         cfg['pipeline']['csk_level_scheme'] = args.csk_level_scheme
         print(f"CSK Configuration: {cfg['pipeline']['csk_levels']} levels, "
               f"{cfg['pipeline']['csk_target_channel']} channel, "
@@ -2985,9 +3295,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         except ValueError as e:
             print(f"⚠️  Invalid --nm-grid format: {args.nm_grid}. Error: {e}")
             print("   Using YAML default instead.")
-            nm_values = list(cfg.get('Nm_range', [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000]))
+            nm_values = list(cfg.get('Nm_range', [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200]))
     else:
-        nm_values = list(cfg.get('Nm_range', [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000]))
+        nm_values = list(cfg.get('Nm_range', [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200]))
         print(f"📋 Using YAML Nm_range: {nm_values}")
     distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
@@ -3427,6 +3737,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 # NEW: increment worker bar by the actual work performed for that distance
                 actual_total = res.get('actual_progress', estimated_per_distance)
                 if hierarchy_supported and wid in worker_bars:
+                    # Update worker bar total to match actual work done
+                    pm.update_total(key=("worker", wid), total=actual_total,
+                                    label=f"Worker {wid:02d}", kind="worker", parent=None)
                     worker_bars[wid].update(actual_total)
                 # NEW: stop the per-distance drainer cleanly
                 try:
@@ -3767,10 +4080,10 @@ def integration_test_noise_correlation() -> None:
             test_config['pipeline']['symbol_period_s'] = detection_window_s
             test_config['pipeline']['time_window_s'] = detection_window_s
             test_config['detection']['decision_window_s'] = detection_window_s
-            sigma_glu, sigma_gaba = calculate_proper_noise_sigma(test_config, detection_window_s)
+            sigma_da, sigma_sero = calculate_proper_noise_sigma(test_config, detection_window_s)
             
             # Manual calculation for verification
-            expected_sigma_diff = math.sqrt(sigma_glu**2 + sigma_gaba**2 - 2*rho_cc_value*sigma_glu*sigma_gaba)
+            expected_sigma_diff = math.sqrt(sigma_da**2 + sigma_sero**2 - 2*rho_cc_value*sigma_da*sigma_sero)
             
             # Test 2: Run short simulation to verify integration
             result = run_sequence(test_config)
@@ -3785,7 +4098,7 @@ def integration_test_noise_correlation() -> None:
                 
             # Test 3: Verify correlation reduces differential noise (when rho_cc > 0)
             if rho_cc_value > 0:
-                independent_sigma = math.sqrt(sigma_glu**2 + sigma_gaba**2)
+                independent_sigma = math.sqrt(sigma_da**2 + sigma_sero**2)
                 noise_reduction = (independent_sigma - actual_sigma_diff) / independent_sigma * 100
                 print(f"    📉 Noise reduction: {noise_reduction:.1f}% vs independent assumption")
                 

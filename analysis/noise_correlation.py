@@ -1,7 +1,7 @@
 """
 Noise correlation analysis utilities for cross-channel correlation effects.
 
-Provides vectorized calculations for residual GLU-GABA correlation after
+Provides vectorized calculations for residual DA-SERO correlation after
 CTRL subtraction and ONSI sensitivity analysis.
 """
 
@@ -9,34 +9,34 @@ import numpy as np
 from typing import Tuple, Union
 
 
-def sigma_I_diff_vec(sigma_glu: Union[float, np.ndarray], 
-                     sigma_gaba: Union[float, np.ndarray], 
+def sigma_I_diff_vec(sigma_da: Union[float, np.ndarray], 
+                     sigma_sero: Union[float, np.ndarray], 
                      rho: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
-    Vectorized σ(I_diff) with residual GLU–GABA correlation rho (can be scalar or ndarray).
+    Vectorized σ(I_diff) with residual DA–SERO correlation rho (can be scalar or ndarray).
     
     Args:
-        sigma_glu: GLU channel noise standard deviation (scalar or array)
-        sigma_gaba: GABA channel noise standard deviation (scalar or array)
+        sigma_da: DA channel noise standard deviation (scalar or array)
+        sigma_sero: SERO channel noise standard deviation (scalar or array)
         rho: Cross-channel correlation coefficient (scalar or array)
         
     Returns:
         Combined differential noise standard deviation (scalar or array)
     """
     rho = np.clip(rho, -1.0, 1.0)
-    var = sigma_glu**2 + sigma_gaba**2 - 2.0 * rho * sigma_glu * sigma_gaba
+    var = sigma_da**2 + sigma_sero**2 - 2.0 * rho * sigma_da * sigma_sero
     return np.sqrt(np.maximum(var, 0.0))  # robust to tiny negatives from rounding
 
 
-def onsi_curve(sigma_glu: float, sigma_gaba: float, 
+def onsi_curve(sigma_da: float, sigma_sero: float, 
                rho_min: float = -0.2, rho_max: float = 0.2, 
                n: int = 201) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns rho_grid, ONSI(ρ) = σ(I_diff; ρ)/σ(I_diff; 0).
     
     Args:
-        sigma_glu: GLU channel noise (arbitrary units)
-        sigma_gaba: GABA channel noise (arbitrary units)
+        sigma_da: DA channel noise (arbitrary units)
+        sigma_sero: SERO channel noise (arbitrary units)
         rho_min: Minimum correlation to test
         rho_max: Maximum correlation to test
         n: Number of points in sweep
@@ -45,8 +45,8 @@ def onsi_curve(sigma_glu: float, sigma_gaba: float,
         Tuple of (rho_values, normalized_noise_values)
     """
     rhos = np.linspace(rho_min, rho_max, n)
-    sigma0_raw = sigma_I_diff_vec(sigma_glu, sigma_gaba, 0.0)
-    sigmas_raw = sigma_I_diff_vec(sigma_glu, sigma_gaba, rhos)
+    sigma0_raw = sigma_I_diff_vec(sigma_da, sigma_sero, 0.0)
+    sigmas_raw = sigma_I_diff_vec(sigma_da, sigma_sero, rhos)
     
     # Ensure both are arrays for consistent return type
     sigma0 = np.asarray(sigma0_raw)
@@ -65,14 +65,14 @@ def onsi_curve_general(sigmas: np.ndarray, w: np.ndarray, rho_cc_grid: np.ndarra
     w = np.asarray(w, dtype=float)
     
     def build_covariance_matrix(rho_gb: float) -> np.ndarray:
-        """Build 3x3 covariance matrix with specified GLU-GABA correlation."""
+        """Build 3x3 covariance matrix with specified DA-SERO correlation."""
         S = np.diag(sig**2)
-        S[0, 1] = S[1, 0] = rho_gb * sig[0] * sig[1]  # GLU-GABA
-        S[0, 2] = S[2, 0] = rho_gc * sig[0] * sig[2]  # GLU-CTRL  
-        S[1, 2] = S[2, 1] = rho_bc * sig[1] * sig[2]  # GABA-CTRL
+        S[0, 1] = S[1, 0] = rho_gb * sig[0] * sig[1]  # DA-SERO
+        S[0, 2] = S[2, 0] = rho_gc * sig[0] * sig[2]  # DA-CTRL  
+        S[1, 2] = S[2, 1] = rho_bc * sig[1] * sig[2]  # SERO-CTRL
         return S
     
-    # Reference noise with no GLU-GABA correlation (with edge-case protection)
+    # Reference noise with no DA-SERO correlation (with edge-case protection)
     cov_matrix_0 = build_covariance_matrix(0.0)
     variance_0 = w @ cov_matrix_0 @ w
     eps = 1e-12  # FIX: Edge-case guard
@@ -91,24 +91,24 @@ def onsi_curve_general(sigmas: np.ndarray, w: np.ndarray, rho_cc_grid: np.ndarra
 
 def optimal_ctrl_weight(cov_matrix: np.ndarray) -> float:
     """
-    Calculate variance-minimizing CTRL weight β* for I_diff = I_GLU - I_GABA - β*I_CTRL.
+    Calculate variance-minimizing CTRL weight β* for I_diff = I_DA - I_SERO - β*I_CTRL.
     
     Args:
-        cov_matrix: 3x3 covariance matrix [GLU, GABA, CTRL]
+        cov_matrix: 3x3 covariance matrix [DA, SERO, CTRL]
         
     Returns:
         Optimal β coefficient
     """
     # Extract relevant covariances
-    cov_ctrl_glu = cov_matrix[2, 0]  # Cov(I_CTRL, I_GLU)
-    cov_ctrl_gaba = cov_matrix[2, 1]  # Cov(I_CTRL, I_GABA)
+    cov_ctrl_da = cov_matrix[2, 0]  # Cov(I_CTRL, I_DA)
+    cov_ctrl_sero = cov_matrix[2, 1]  # Cov(I_CTRL, I_SERO)
     var_ctrl = cov_matrix[2, 2]       # Var(I_CTRL)
     
     if var_ctrl < 1e-12:  # Avoid division by zero
         return 0.0
     
-    # β* = Cov(I_CTRL, I_GLU - I_GABA) / Var(I_CTRL)
-    cov_ctrl_diff = cov_ctrl_glu - cov_ctrl_gaba
+    # β* = Cov(I_CTRL, I_DA - I_SERO) / Var(I_CTRL)
+    cov_ctrl_diff = cov_ctrl_da - cov_ctrl_sero
     beta_star = cov_ctrl_diff / var_ctrl
     
     return float(beta_star)
@@ -116,20 +116,20 @@ def optimal_ctrl_weight(cov_matrix: np.ndarray) -> float:
 def onsi_curve_optimal_ctrl(sigmas: np.ndarray, rho_cc_grid: np.ndarray,
                            rho_gc: float = 0.0, rho_bc: float = 0.0) -> np.ndarray:
     """
-    ONSI with optimal CTRL weighting: I_diff = I_GLU - I_GABA - β*I_CTRL.
+    ONSI with optimal CTRL weighting: I_diff = I_DA - I_SERO - β*I_CTRL.
     """
     def build_cov(rho_gb: float) -> np.ndarray:
         sig = np.asarray(sigmas, dtype=float)
         S = np.diag(sig**2)
-        S[0, 1] = S[1, 0] = rho_gb * sig[0] * sig[1]  # GLU-GABA
-        S[0, 2] = S[2, 0] = rho_gc * sig[0] * sig[2]  # GLU-CTRL  
-        S[1, 2] = S[2, 1] = rho_bc * sig[1] * sig[2]  # GABA-CTRL
+        S[0, 1] = S[1, 0] = rho_gb * sig[0] * sig[1]  # DA-SERO
+        S[0, 2] = S[2, 0] = rho_gc * sig[0] * sig[2]  # DA-CTRL  
+        S[1, 2] = S[2, 1] = rho_bc * sig[1] * sig[2]  # SERO-CTRL
         return S
     
     # Edge-case protection constant
     eps = 1e-12
     
-    # Reference: optimal CTRL with no GLU-GABA correlation
+    # Reference: optimal CTRL with no DA-SERO correlation
     cov_0 = build_cov(0.0)
     beta_0 = optimal_ctrl_weight(cov_0)
     w_0 = np.array([1.0, -1.0, -beta_0])

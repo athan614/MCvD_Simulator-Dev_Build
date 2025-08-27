@@ -195,7 +195,7 @@ def _get_csv_ser_at_nm(mode: str, nm: float, data_dir: Path, tolerance: float = 
 def plot_figure_s3_constellation(results_dir: Path, save_path: Path) -> None:
     """
     Generate Figure S3: Constellation diagrams for all modulation schemes.
-    Shows decision space (q_GLU vs q_GABA) with transmitted symbols marked.
+    Shows decision space (q_DA vs q_SERO) with transmitted symbols marked.
     Currently illustrative; data-driven points will replace these later.
     """
     _ensure_figdir(save_path)
@@ -211,8 +211,8 @@ def plot_figure_s3_constellation(results_dir: Path, save_path: Path) -> None:
             ax.text(0.5, 0.5, f"No data for {mode}",
                     ha='center', va='center', transform=ax.transAxes)
             ax.set_title(f"{mode} Constellation")
-            ax.set_xlabel(r'$q_{\mathrm{GLU}}$ (nC)')
-            ax.set_ylabel(r'$q_{\mathrm{GABA}}$ (nC)')
+            ax.set_xlabel(r'$q_{\mathrm{DA}}$ (nC)')
+            ax.set_ylabel(r'$q_{\mathrm{SERO}}$ (nC)')
             ax.grid(True, alpha=0.3)
             continue
 
@@ -220,38 +220,38 @@ def plot_figure_s3_constellation(results_dir: Path, save_path: Path) -> None:
         rng = np.random.default_rng(42)
 
         if mode == 'MoSK':
-            # GLU vs GABA binary classes
-            q_glu_0 = _as_float1d(rng.normal(1.0, 0.2, 120))
-            q_gaba_0 = _as_float1d(rng.normal(0.0, 0.2, 120))
-            q_glu_1 = _as_float1d(rng.normal(0.0, 0.2, 120))
-            q_gaba_1 = _as_float1d(rng.normal(1.0, 0.2, 120))
-            ax.scatter(q_glu_0, q_gaba_0, c='tab:blue', alpha=0.5, label='Symbol 0 (GLU)', s=30)
-            ax.scatter(q_glu_1, q_gaba_1, c='tab:red', alpha=0.5, label='Symbol 1 (GABA)', s=30)
+            # DA vs SERO binary classes
+            q_da_0 = _as_float1d(rng.normal(1.0, 0.2, 120))
+            q_sero_0 = _as_float1d(rng.normal(0.0, 0.2, 120))
+            q_da_1 = _as_float1d(rng.normal(0.0, 0.2, 120))
+            q_sero_1 = _as_float1d(rng.normal(1.0, 0.2, 120))
+            ax.scatter(q_da_0, q_sero_0, c='tab:blue', alpha=0.5, label='Symbol 0 (DA)', s=30)
+            ax.scatter(q_da_1, q_sero_1, c='tab:red', alpha=0.5, label='Symbol 1 (SERO)', s=30)
             # Decision boundary (y = x)
             x = np.linspace(-0.5, 1.5, 100, dtype=float)
             ax.plot(_as_float1d(x), _as_float1d(x), 'k--', alpha=0.5, label='Decision boundary')
 
         elif mode == 'CSK':
-            # 4 amplitude levels on GLU
+            # 4 amplitude levels on DA
             for level in range(4):
-                q_glu = _as_float1d(rng.normal(level / 3.0, 0.15, 60))
-                q_gaba = _as_float1d(rng.normal(0.0, 0.1, 60))
-                ax.scatter(q_glu, q_gaba, alpha=0.5, label=f'Level {level}', s=30)
+                q_da = _as_float1d(rng.normal(level / 3.0, 0.15, 60))
+                q_sero = _as_float1d(rng.normal(0.0, 0.1, 60))
+                ax.scatter(q_da, q_sero, alpha=0.5, label=f'Level {level}', s=30)
 
         else:  # Hybrid (2 bits: molecule bit + amplitude bit)
             symbols = [(0, 0), (0, 1), (1, 0), (1, 1)]
             colors = ['tab:blue', 'tab:cyan', 'tab:red', 'tab:orange']
             for (mol, amp), color in zip(symbols, colors):
-                if mol == 0:  # GLU
-                    q_glu = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
-                    q_gaba = _as_float1d(rng.normal(0.0, 0.1, 60))
-                else:        # GABA
-                    q_glu = _as_float1d(rng.normal(0.0, 0.1, 60))
-                    q_gaba = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
-                ax.scatter(q_glu, q_gaba, c=color, alpha=0.5, label=f'Symbol {mol}{amp}', s=30)
+                if mol == 0:  # DA
+                    q_da = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
+                    q_sero = _as_float1d(rng.normal(0.0, 0.1, 60))
+                else:        # SERO
+                    q_da = _as_float1d(rng.normal(0.0, 0.1, 60))
+                    q_sero = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
+                ax.scatter(q_da, q_sero, c=color, alpha=0.5, label=f'Symbol {mol}{amp}', s=30)
 
-        ax.set_xlabel(r'$q_{\mathrm{GLU}}$ (nC)')
-        ax.set_ylabel(r'$q_{\mathrm{GABA}}$ (nC)')
+        ax.set_xlabel(r'$q_{\mathrm{DA}}$ (nC)')
+        ax.set_ylabel(r'$q_{\mathrm{SERO}}$ (nC)')
         ax.set_title(f'({chr(97 + idx)}) {mode} Constellation')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
@@ -598,7 +598,7 @@ def plot_figure_s5_confusion_matrices(results_dir: Path, save_path: Path, strict
         n_classes = int(cm.shape[0])
         ax.set_xticks(np.arange(n_classes))
         ax.set_yticks(np.arange(n_classes))
-        labels = ['GLU', 'GABA'] if n_classes == 2 else [f'S{i}' for i in range(n_classes)]
+        labels = ['DA', 'SERO'] if n_classes == 2 else [f'S{i}' for i in range(n_classes)]
         ax.set_xticklabels(labels)
         ax.set_yticklabels(labels)
         for i in range(n_classes):

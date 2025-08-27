@@ -208,10 +208,10 @@ def mean_binding(
     
     # Use literature-realistic defaults if values are zero/missing
     if k_on == 0 or k_off == 0:
-        if nt == 'GLU':
+        if nt == 'DA':
             k_on_eff = 1e5
             k_off = 0.5
-        elif nt == 'GABA':
+        elif nt == 'SERO':
             k_on_eff = 5e4
             k_off = 1.0
         else:
@@ -407,6 +407,6 @@ def default_params():
     """Returns default parameters (unchanged)"""
     return {
         'N_apt': 4e8,
-        'GLU': {'k_on_M_s': 5e4, 'k_off_s': 1.5, 'q_eff_e': 0.6},
-        'GABA': {'k_on_M_s': 3e4, 'k_off_s': 0.9, 'q_eff_e': 0.2},
+        'DA': {'k_on_M_s': 5e4, 'k_off_s': 1.5, 'q_eff_e': 0.6},
+        'SERO': {'k_on_M_s': 3e4, 'k_off_s': 0.9, 'q_eff_e': 0.2},
     }

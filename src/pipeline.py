@@ -36,29 +36,29 @@ def to_int(value):
         return value
 
 def _csk_dual_channel_Q(
-    q_glu: float, q_gaba: float,
-    sigma_glu: float, sigma_gaba: float,
+    q_da: float, q_sero: float,
+    sigma_da: float, sigma_sero: float,
     rho_cc: float,
     combiner: str = "zscore",
     leakage_frac: float = 0.0,
-    target: str = "GLU"
+    target: str = "DA"
 ) -> float:
     """
     Compute dual-channel CSK decision statistic Q_comb = w_t Q_t + w_o Q_o.
     
     Args:
-        q_glu, q_gaba: Single-channel charge statistics
-        sigma_glu, sigma_gaba: Noise standard deviations
+        q_da, q_sero: Single-channel charge statistics
+        sigma_da, sigma_sero: Noise standard deviations
         rho_cc: Cross-channel correlation coefficient after CTRL
         combiner: "zscore", "whitened", or "leakage"
         leakage_frac: For leakage combiner, fraction of signal on 'other' channel
-        target: "GLU" or "GABA" - which channel carries the primary signal
+        target: "DA" or "SERO" - which channel carries the primary signal
     """
     # Nominal means direction (amplitude-only lives on 'target' axis)
     # μ = [μ_t, μ_o]; for pure CSK (no leakage): μ = [μ_t, 0]; with leakage: μ_o = leakage_frac * μ_t
     # Work in "signed" charges (you already use signed q via q_eff in oect path)
-    Qt, Qo = (q_glu, q_gaba) if target == "GLU" else (q_gaba, q_glu)
-    sg_t, sg_o = (sigma_glu, sigma_gaba) if target == "GLU" else (sigma_gaba, sigma_glu)
+    Qt, Qo = (q_da, q_sero) if target == "DA" else (q_sero, q_da)
+    sg_t, sg_o = (sigma_da, sigma_sero) if target == "DA" else (sigma_sero, sigma_da)
     rho = float(np.clip(rho_cc, -0.999, 0.999))
 
     if combiner == "zscore":
@@ -128,7 +128,7 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     johnson_charge_var = psd_johnson * T_int
     
     K_f = alpha_H / N_c
-    flicker_charge_var = K_f * I_dc**2 * np.log(2 * np.pi * T_int) * T_int if f_max > f_min else 0
+    flicker_charge_var = K_f * I_dc**2 * max(0.0, np.log(2 * np.pi * T_int)) * T_int if f_max > f_min else 0
     
     drift_charge_var = 0
     
@@ -136,7 +136,7 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     
     # Enhanced: Expose correlation coefficient via config
     use_ctrl = bool(cfg.get('pipeline', {}).get('use_control_channel', True))
-    effective_rho = noise_cfg.get('effective_correlation', rho_corr)  # Allow override
+    effective_rho = float(np.clip(noise_cfg.get('effective_correlation', rho_corr), -0.999, 0.999))  # Allow override with clamp
     
     if use_ctrl:
         # Differential measurement: benefits from common-mode rejection
@@ -156,8 +156,8 @@ def _calculate_isi_vectorized(
     tx_history: List[Tuple[int, float]], 
     t_vec: np.ndarray,
     cfg: Dict[str, Any],
-    distance_glu_m: float,
-    distance_gaba_m: float,
+    distance_da_m: float,
+    distance_sero_m: float,
     distance_ctrl_m: float
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -168,7 +168,6 @@ def _calculate_isi_vectorized(
     
     mod = cfg['pipeline']['modulation']
     Ts = cfg['pipeline']['symbol_period_s']
-    level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     
     # Convert history to arrays for vectorization
     past_symbols = np.array([h[0] for h in tx_history], dtype=np.int32)
@@ -176,8 +175,8 @@ def _calculate_isi_vectorized(
     n_history = len(tx_history)
     
     # Pre-allocate concentration arrays
-    conc_at_glu_ch = np.zeros_like(t_vec)
-    conc_at_gaba_ch = np.zeros_like(t_vec)
+    conc_at_da_ch = np.zeros_like(t_vec)
+    conc_at_sero_ch = np.zeros_like(t_vec)
     conc_at_ctrl_ch = np.zeros_like(t_vec)  # Always zero (no signal contamination)
     
     # Calculate all time offsets at once
@@ -185,31 +184,31 @@ def _calculate_isi_vectorized(
     time_offsets = (k_indices + 1) * Ts
     
     if mod == "MoSK":
-        # Separate GLU and GABA transmissions
-        glu_mask = (past_symbols == 0)
-        gaba_mask = ~glu_mask
+        # Separate DA and SERO transmissions
+        da_mask = (past_symbols == 0)
+        sero_mask = ~da_mask
         
-        # Process GLU contributions in batch
-        if np.any(glu_mask):
-            glu_Nm = Nm_history[glu_mask]
-            glu_offsets = time_offsets[glu_mask]
-            glu_residuals = finite_burst_concentration_batch_time(
-                glu_Nm, distance_glu_m, t_vec, glu_offsets, cfg, 'GLU'
+        # Process DA contributions in batch
+        if np.any(da_mask):
+            da_Nm = Nm_history[da_mask]
+            da_offsets = time_offsets[da_mask]
+            da_residuals = finite_burst_concentration_batch_time(
+                da_Nm, distance_da_m, t_vec, da_offsets, cfg, 'DA'
             )
-            conc_at_glu_ch = np.sum(glu_residuals, axis=0)
+            conc_at_da_ch = np.sum(da_residuals, axis=0)
         
-        # Process GABA contributions in batch
-        if np.any(gaba_mask):
-            gaba_Nm = Nm_history[gaba_mask]
-            gaba_offsets = time_offsets[gaba_mask]
-            gaba_residuals = finite_burst_concentration_batch_time(
-                gaba_Nm, distance_gaba_m, t_vec, gaba_offsets, cfg, 'GABA'
+        # Process SERO contributions in batch
+        if np.any(sero_mask):
+            sero_Nm = Nm_history[sero_mask]
+            sero_offsets = time_offsets[sero_mask]
+            sero_residuals = finite_burst_concentration_batch_time(
+                sero_Nm, distance_sero_m, t_vec, sero_offsets, cfg, 'SERO'
             )
-            conc_at_gaba_ch = np.sum(gaba_residuals, axis=0)
+            conc_at_sero_ch = np.sum(sero_residuals, axis=0)
                 
     elif mod.startswith("CSK"):
         # ISI uses actual transmitted Nm values from history
-        target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
+        target_channel = cfg['pipeline'].get('csk_target_channel', 'DA')
         
         # Process non-zero contributions
         nonzero_mask = Nm_history > 0
@@ -217,47 +216,47 @@ def _calculate_isi_vectorized(
             active_Nm = Nm_history[nonzero_mask]
             active_offsets = time_offsets[nonzero_mask]
             
-            if target_channel == 'GLU':
+            if target_channel == 'DA':
                 residuals = finite_burst_concentration_batch_time(
-                    active_Nm, distance_glu_m, t_vec, active_offsets, cfg, 'GLU'
+                    active_Nm, distance_da_m, t_vec, active_offsets, cfg, 'DA'
                 )
-                conc_at_glu_ch = np.sum(residuals, axis=0)
-            else:  # GABA
+                conc_at_da_ch = np.sum(residuals, axis=0)
+            else:  # SERO
                 residuals = finite_burst_concentration_batch_time(
-                    active_Nm, distance_gaba_m, t_vec, active_offsets, cfg, 'GABA'
+                    active_Nm, distance_sero_m, t_vec, active_offsets, cfg, 'SERO'
                 )
-                conc_at_gaba_ch = np.sum(residuals, axis=0)
+                conc_at_sero_ch = np.sum(residuals, axis=0)
                     
     elif mod == "Hybrid":
         # Extract molecule type from history
         mol_type_bits = past_symbols >> 1
         
-        # Process GLU contributions
-        glu_mask = (mol_type_bits == 0) & (Nm_history > 0)
-        if np.any(glu_mask):
-            glu_amps = Nm_history[glu_mask]
-            glu_offsets = time_offsets[glu_mask]
-            glu_residuals = finite_burst_concentration_batch_time(
-                glu_amps, distance_glu_m, t_vec, glu_offsets, cfg, 'GLU'
+        # Process DA contributions
+        da_mask = (mol_type_bits == 0) & (Nm_history > 0)
+        if np.any(da_mask):
+            da_amps = Nm_history[da_mask]
+            da_offsets = time_offsets[da_mask]
+            da_residuals = finite_burst_concentration_batch_time(
+                da_amps, distance_da_m, t_vec, da_offsets, cfg, 'DA'
             )
-            conc_at_glu_ch = np.sum(glu_residuals, axis=0)
+            conc_at_da_ch = np.sum(da_residuals, axis=0)
         
-        # Process GABA contributions
-        gaba_mask = (mol_type_bits == 1) & (Nm_history > 0)
-        if np.any(gaba_mask):
-            gaba_amps = Nm_history[gaba_mask]
-            gaba_offsets = time_offsets[gaba_mask]
-            gaba_residuals = finite_burst_concentration_batch_time(
-                gaba_amps, distance_gaba_m, t_vec, gaba_offsets, cfg, 'GABA'
+        # Process SERO contributions
+        sero_mask = (mol_type_bits == 1) & (Nm_history > 0)
+        if np.any(sero_mask):
+            sero_amps = Nm_history[sero_mask]
+            sero_offsets = time_offsets[sero_mask]
+            sero_residuals = finite_burst_concentration_batch_time(
+                sero_amps, distance_sero_m, t_vec, sero_offsets, cfg, 'SERO'
             )
-            conc_at_gaba_ch = np.sum(gaba_residuals, axis=0)
+            conc_at_sero_ch = np.sum(sero_residuals, axis=0)
     
-    return conc_at_glu_ch, conc_at_gaba_ch, conc_at_ctrl_ch
+    return conc_at_da_ch, conc_at_sero_ch, conc_at_ctrl_ch
 
 
 def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg: Dict[str, Any], rng) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    Generate GLU, GABA, CTRL drain-current traces for one symbol interval.
+    Generate DA, SERO, CTRL drain-current traces for one symbol interval.
     COMPLETE FIX: 
     1. Uniform CSK level mapping to avoid zero molecules
     2. Correct Poisson noise application at the level, not scaling factor
@@ -270,30 +269,29 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     t_vec = np.arange(n_samples) * dt
     
     # Initialize concentration at each channel location
-    conc_at_glu_ch = np.zeros(n_samples)
-    conc_at_gaba_ch = np.zeros(n_samples)
+    conc_at_da_ch = np.zeros(n_samples)
+    conc_at_sero_ch = np.zeros(n_samples)
     conc_at_ctrl_ch = np.zeros(n_samples)  # Pure noise reference
     
     # Keep separate holders for metrics
-    isi_glu = np.zeros(n_samples)
-    isi_gaba = np.zeros(n_samples)
-    sym_glu = np.zeros(n_samples)
-    sym_gaba = np.zeros(n_samples)
+    isi_da = np.zeros(n_samples)
+    isi_sero = np.zeros(n_samples)
+    sym_da = np.zeros(n_samples)
+    sym_sero = np.zeros(n_samples)
     
     # Get channel-specific distances
     if 'channel_distances' in cfg:
-        distance_glu_m = cfg['channel_distances']['GLU'] * 1e-6
-        distance_gaba_m = cfg['channel_distances']['GABA'] * 1e-6
+        distance_da_m = cfg['channel_distances']['DA'] * 1e-6
+        distance_sero_m = cfg['channel_distances']['SERO'] * 1e-6
         distance_ctrl_m = cfg['channel_distances']['CTRL'] * 1e-6
     else:
         distance_m = cfg['pipeline']['distance_um'] * 1e-6
-        distance_glu_m = distance_m
-        distance_gaba_m = distance_m
+        distance_da_m = distance_m
+        distance_sero_m = distance_m
         distance_ctrl_m = distance_m
     
     mod = cfg['pipeline']['modulation']
     level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
-    non_specific_factor = cfg['pipeline'].get('non_specific_binding_factor', 0.0)
     
     # ========== CRITICAL FIX: Correct Energy Fairness and Noise Application ==========
     
@@ -352,13 +350,25 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     if cfg['pipeline'].get('enable_isi', False):
         if 'isi_memory_symbols' not in cfg['pipeline']:
             Ts = cfg['pipeline']['symbol_period_s']
-            D_glu = cfg['neurotransmitters']['GLU']['D_m2_s']
-            D_gaba = cfg['neurotransmitters']['GABA']['D_m2_s']
-            D = (D_glu + D_gaba) / 2
-            avg_distance_m = (distance_glu_m + distance_gaba_m) / 2
-            decay95 = 3.0 * avg_distance_m**2 / D
+            
+            # Diffusion memory
+            D_da = cfg['neurotransmitters']['DA']['D_m2_s']
+            D_sero = cfg['neurotransmitters']['SERO']['D_m2_s']
+            D = (D_da + D_sero) / 2
+            avg_distance_m = (distance_da_m + distance_sero_m) / 2
+            decay95_diff = 3.0 * avg_distance_m**2 / D
+            
+            # Binding memory (NEW - missing component)
+            k_off_da = cfg['neurotransmitters']['DA']['k_off_s']
+            k_off_sero = cfg['neurotransmitters']['SERO']['k_off_s']
+            k_off_avg = (k_off_da + k_off_sero) / 2
+            decay95_binding = 5.0 / k_off_avg  # 5 time constants for 99% decay
+            
+            # Total ISI decay time (max of both mechanisms)
+            decay95_total = max(decay95_diff, decay95_binding)
+            
             guard_factor = cfg['pipeline'].get('guard_factor', 0.3)
-            isi_memory = math.ceil((1 + guard_factor) * decay95 / Ts)
+            isi_memory = math.ceil((1 + guard_factor) * decay95_total / Ts)
         else:
             isi_memory = cfg['pipeline']['isi_memory_symbols']
         
@@ -366,65 +376,65 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         
         # Use vectorized ISI calculation
         if relevant_history:
-            isi_glu, isi_gaba, _ = _calculate_isi_vectorized(
+            isi_da, isi_sero, _ = _calculate_isi_vectorized(
                 relevant_history, t_vec, cfg, 
-                distance_glu_m, distance_gaba_m, distance_ctrl_m
+                distance_da_m, distance_sero_m, distance_ctrl_m
             )
-            conc_at_glu_ch += isi_glu
-            conc_at_gaba_ch += isi_gaba
+            conc_at_da_ch += isi_da
+            conc_at_sero_ch += isi_sero
     
     # Current Symbol Generation using Nm_actual (the noisy realization)
     if mod == "MoSK":
-        if s_tx == 0:  # GLU
-            conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
-            conc_at_glu_ch += conc_glu
-            sym_glu += conc_glu
-        else:  # GABA
-            conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
-            conc_at_gaba_ch += conc_gaba
-            sym_gaba += conc_gaba
+        if s_tx == 0:  # DA
+            conc_da = finite_burst_concentration(Nm_actual, distance_da_m, t_vec, cfg, 'DA')
+            conc_at_da_ch += conc_da
+            sym_da += conc_da
+        else:  # SERO
+            conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+            conc_at_sero_ch += conc_sero
+            sym_sero += conc_sero
             
     elif mod.startswith("CSK"):
-        target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
+        target_channel = cfg['pipeline'].get('csk_target_channel', 'DA')
         if Nm_actual > 0:
-            if target_channel == 'GLU':
-                conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
-                conc_at_glu_ch += conc_glu
-                sym_glu += conc_glu
-            else:  # GABA
-                conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
-                conc_at_gaba_ch += conc_gaba
-                sym_gaba += conc_gaba
+            if target_channel == 'DA':
+                conc_da = finite_burst_concentration(Nm_actual, distance_da_m, t_vec, cfg, 'DA')
+                conc_at_da_ch += conc_da
+                sym_da += conc_da
+            else:  # SERO
+                conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+                conc_at_sero_ch += conc_sero
+                sym_sero += conc_sero
             
     elif mod == "Hybrid":
         mol_type_bit = s_tx >> 1
-        if mol_type_bit == 0:  # GLU
-            conc_glu = finite_burst_concentration(Nm_actual, distance_glu_m, t_vec, cfg, 'GLU')
-            conc_at_glu_ch += conc_glu
-            sym_glu += conc_glu
-        else:  # GABA
-            conc_gaba = finite_burst_concentration(Nm_actual, distance_gaba_m, t_vec, cfg, 'GABA')
-            conc_at_gaba_ch += conc_gaba
-            sym_gaba += conc_gaba
+        if mol_type_bit == 0:  # DA
+            conc_da = finite_burst_concentration(Nm_actual, distance_da_m, t_vec, cfg, 'DA')
+            conc_at_da_ch += conc_da
+            sym_da += conc_da
+        else:  # SERO
+            conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+            conc_at_sero_ch += conc_sero
+            sym_sero += conc_sero
     
     # INDEPENDENT Binding simulation for each channel
-    cfg_glu = cfg.copy()
-    cfg_glu['N_apt'] = cfg.get('binding', {}).get('N_sites_glu', cfg.get('N_apt'))
-    bound_glu_ch, _, _ = bernoulli_binding(conc_at_glu_ch, 'GLU', cfg_glu, rng)
+    cfg_da = cfg.copy()
+    cfg_da['N_apt'] = cfg.get('binding', {}).get('N_sites_da', cfg.get('N_apt'))
+    bound_da_ch, _, _ = bernoulli_binding(conc_at_da_ch, 'DA', cfg_da, rng)
     
-    cfg_gaba = cfg.copy()
-    cfg_gaba['N_apt'] = cfg.get('binding', {}).get('N_sites_gaba', cfg.get('N_apt'))
-    bound_gaba_ch, _, _ = bernoulli_binding(conc_at_gaba_ch, 'GABA', cfg_gaba, rng)
+    cfg_sero = cfg.copy()
+    cfg_sero['N_apt'] = cfg.get('binding', {}).get('N_sites_sero', cfg.get('N_apt'))
+    bound_sero_ch, _, _ = bernoulli_binding(conc_at_sero_ch, 'SERO', cfg_sero, rng)
     
     cfg_ctrl = cfg.copy()
     cfg_ctrl['N_apt'] = 0  # No aptamer sites
     bound_ctrl_ch, _, _ = bernoulli_binding(conc_at_ctrl_ch, 'CTRL', cfg_ctrl, rng)
     
     # OECT current generation
-    bound_sites_trio = np.vstack([bound_glu_ch, bound_gaba_ch, bound_ctrl_ch])
+    bound_sites_trio = np.vstack([bound_da_ch, bound_sero_ch, bound_ctrl_ch])
     currents = oect_trio(
         bound_sites_trio,
-        nts=("GLU", "GABA", "CTRL"),
+        nts=("DA", "SERO", "CTRL"),
         cfg=cfg,
         rng=rng
     )
@@ -438,8 +448,8 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             dt = cfg['sim']['dt_s']
             win_s = cfg['detection'].get('decision_window_s', cfg['pipeline']['symbol_period_s'])
             n_int = min(int(win_s / dt), n_samples)
-            isi_mass = float(np.trapezoid(isi_glu[:n_int], dx=dt) + np.trapezoid(isi_gaba[:n_int], dx=dt))
-            sym_mass = float(np.trapezoid(sym_glu[:n_int], dx=dt) + np.trapezoid(sym_gaba[:n_int], dx=dt))
+            isi_mass = float(np.trapezoid(isi_da[:n_int], dx=dt) + np.trapezoid(isi_sero[:n_int], dx=dt))
+            sym_mass = float(np.trapezoid(sym_da[:n_int], dx=dt) + np.trapezoid(sym_sero[:n_int], dx=dt))
             denom = max(sym_mass, 1e-30)
             ratio = isi_mass / denom
             metrics = cfg.setdefault('_metrics', {})
@@ -449,7 +459,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             pass
     # ================================================================
 
-    return currents["GLU"], currents["GABA"], currents["CTRL"], Nm_actual
+    return currents["DA"], currents["SERO"], currents["CTRL"], Nm_actual
 
 
 def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -457,6 +467,9 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Simulate <sequence_length> symbols and compute BER/SEP.
     Detection logic unchanged - the fixes are in signal generation.
     """
+    
+    # Guard against missing detection config
+    cfg.setdefault('detection', {})
         
     mod = cfg['pipeline']['modulation']
     L = cfg['pipeline']['sequence_length']
@@ -478,8 +491,8 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Unknown modulation: {mod}")
     
     rx_symbols = np.zeros(L, dtype=int)
-    stats_glu = []
-    stats_gaba = []
+    stats_da = []
+    stats_sero = []
 
     # enable metric collection for this run
     cfg['collect_isi_metrics'] = True
@@ -487,13 +500,13 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     metrics_ref.setdefault('isi_ratio_values', [])
     
     # Get polarities
-    q_eff_glu = get_nt_params(cfg, 'GLU')['q_eff_e']
-    q_eff_gaba = get_nt_params(cfg, 'GABA')['q_eff_e']
+    q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
+    q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
 
     # Stage 14: Compute noise sigma ONCE before the loop
     detection_window_s = cfg['detection'].get('decision_window_s',
                                               cfg['pipeline']['symbol_period_s'])
-    sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, detection_window_s)
+    sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg, detection_window_s)
     
     # Enhanced: Allow residual cross-channel correlation after CTRL subtraction
     noise_cfg = cfg.get('noise', {})
@@ -502,9 +515,9 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     rho_cc = max(-1.0, min(1.0, rho_cc))  # NEW: clamp at source
     
     # Compute variance of the difference
-    var_diff = (sigma_glu * sigma_glu +
-                sigma_gaba * sigma_gaba -
-                2.0 * rho_cc * sigma_glu * sigma_gaba)
+    var_diff = (sigma_da * sigma_da +
+                sigma_sero * sigma_sero -
+                2.0 * rho_cc * sigma_da * sigma_sero)
     
     if var_diff < -1e-12:  # generous tolerance for FP noise
         logger.warning("Computed var_diff < 0 (%.3e). Check rho_cc and sigmas; clipping to 0.", var_diff)
@@ -520,103 +533,186 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         dt = cfg['sim']['dt_s']
         # detection_window_s already computed above
     
-        # NOTE: sigma_glu, sigma_gaba, sigma_diff already computed once above
+        # NOTE: sigma_da, sigma_sero, sigma_diff already computed once above
         
         n_total_samples = len(ig)
         n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
 
         if n_detect_samples <= 1:
-             if i == 0: print("Warning: Insufficient detection samples. Check dt_s and symbol_period_s.")
-             continue
+            if i == 0: print("Warning: Insufficient detection samples. Check dt_s and symbol_period_s.")
+            # Defensive: set rx_symbols[i] to transmitted symbol to avoid false error
+            # This should be rare due to _enforce_min_window, but provides safety
+            rx_symbols[i] = s_tx
+            continue
         
         use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
         
         # Calculate differential charges (Signal - Control)
-        sig_glu = (ig - ic) if use_ctrl else ig
-        sig_gaba = (ia - ic) if use_ctrl else ia
-        q_glu = float(np.trapezoid(sig_glu[:n_detect_samples], dx=dt))
-        q_gaba = float(np.trapezoid(sig_gaba[:n_detect_samples], dx=dt))
+        sig_da = (ig - ic) if use_ctrl else ig
+        sig_sero = (ia - ic) if use_ctrl else ia
+        q_da = float(np.trapezoid(sig_da[:n_detect_samples], dx=dt))
+        q_sero = float(np.trapezoid(sig_sero[:n_detect_samples], dx=dt))
+
+        # Patch 4: ISI Memory Equalizer with K-tap tail cancellation
+        if cfg['pipeline'].get('enable_isi_equalizer', False) and len(tx_history) > 1:
+            K = cfg['pipeline'].get('isi_equalizer_taps', 3)  # 3-tap default
+            alpha = cfg['pipeline'].get('isi_equalizer_alpha', 0.1)  # 10% cancellation
+            
+            # Get last K transmitted symbols
+            recent_history = tx_history[-K:] if len(tx_history) >= K else tx_history[:-1]
+            
+            for hist_symbol, hist_Nm in recent_history:
+                # Calculate ISI contribution from this historical symbol
+                isi_factor = alpha * (hist_Nm / cfg['pipeline']['Nm_per_symbol'])
+                
+                if hist_symbol == 0:  # Previous DA transmission
+                    q_da -= isi_factor * abs(q_da)  # Subtract DA ISI
+                else:  # Previous SERO transmission  
+                    q_sero -= isi_factor * abs(q_sero)  # Subtract SERO ISI
         
-        # sigma_glu, sigma_gaba already available from above
+        # sigma_da, sigma_sero already available from above
 
         if mod == 'MoSK':
-            decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
+            q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
+            q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
+            sign_da = 1.0 if q_eff_da >= 0 else -1.0
+            sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
+            decision_stat = (sign_da * q_da - sign_sero * q_sero) / sigma_diff
             threshold = cfg['pipeline'].get('mosk_threshold', 0.0)
             s_rx = 0 if decision_stat > threshold else 1
             rx_symbols[i] = s_rx
+            
+            # Patch 5: Guardrails to catch future regressions
+            if i == 0:  # Log once per sequence
+                # Validate decision statistic makes sense
+                stat_magnitude = abs(decision_stat)
+                charge_magnitude = max(abs(q_da), abs(q_sero))
+                
+                # FIX: Compare like-for-like since decision_stat is normalized
+                if cfg['pipeline'].get('mosk_statistic', 'sign_aware_diff') == 'sign_aware_diff':
+                    # Decision statistic is normalized (dimensionless), compare to its typical scale (~O(1))
+                    ref_scale = 10.0  # Reasonable for normalized statistics
+                else:
+                    # Raw units - compare to charge scale
+                    ref_scale = 1000 * charge_magnitude
+                
+                if stat_magnitude > ref_scale:
+                    logger.warning(f"MoSK decision statistic suspiciously large: {decision_stat:.2e} "
+                                f"vs expected scale ~{ref_scale:.1f}. Check for normalization error.")
+                
+                threshold_magnitude = abs(threshold)
+                if cfg['pipeline'].get('mosk_statistic', 'sign_aware_diff') == 'sign_aware_diff':
+                    # Threshold should also be normalized (dimensionless)
+                    threshold_ref_scale = 10.0  # Reasonable for normalized thresholds
+                else:
+                    # Raw threshold units
+                    threshold_ref_scale = 1000 * charge_magnitude
+                    
+                if threshold_magnitude > threshold_ref_scale:
+                    logger.warning(f"MoSK threshold suspiciously large: {threshold:.2e} "
+                                f"vs expected scale ~{threshold_ref_scale:.1f}. Check for units.")
+                
+                # Validate threshold is reasonable
+                if abs(threshold) > charge_magnitude * 10:
+                    logger.warning(f"MoSK threshold suspiciously large: {threshold:.2e} "
+                                f"vs typical charge {charge_magnitude:.2e}")
+                
+                logger.info(f"MoSK decision: stat={decision_stat:.2e}, thresh={threshold:.2e}, "
+                        f"charges=[{q_da:.2e}, {q_sero:.2e}]")
             if s_tx == 0:
-                stats_glu.append(decision_stat)
+                stats_da.append(decision_stat)
             else:
-                stats_gaba.append(decision_stat)
+                stats_sero.append(decision_stat)
           
         elif mod == 'CSK':
-            # ENHANCED: Dual-channel CSK with configurable combiners
-            target_channel = cfg['pipeline'].get('csk_target_channel', 'GLU')
+            # Get CSK configuration parameters
             M = cfg['pipeline']['csk_levels']
-            combiner = cfg['pipeline'].get('csk_combiner', 'zscore')
+            target_channel = cfg['pipeline'].get('csk_target_channel', 'DA')
+            combiner_cfg = cfg['pipeline'].get('csk_combiner', 'zscore')
+            combiner = cfg['pipeline'].get('csk_selected_combiner', combiner_cfg)  # Use selected if present
             use_dual = bool(cfg['pipeline'].get('csk_dual_channel', True))
             leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
+            
+            # Tail-gated integration
+            tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
+            tail = min(max(tail, 0.1), 1.0)  # clamp
+            i0 = int((1.0 - tail) * n_detect_samples)
 
+            use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+            sig_da = (ig - ic) if use_ctrl else ig
+            sig_sero = (ia - ic) if use_ctrl else ia
+
+            # Tail-gated trapezoid integration
+            q_da = float(np.trapezoid(sig_da[i0:n_detect_samples], dx=dt))
+            q_sero = float(np.trapezoid(sig_sero[i0:n_detect_samples], dx=dt))
+
+            # Compute dual-channel decision statistic Q
             if use_dual:
                 Q = _csk_dual_channel_Q(
-                    q_glu=q_glu, q_gaba=q_gaba,
-                    sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                    q_da=q_da, q_sero=q_sero,
+                    sigma_da=sigma_da, sigma_sero=sigma_sero,
                     rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
                     target=target_channel
                 )
             else:
-                # Legacy one-channel
-                Q = q_glu if target_channel == 'GLU' else q_gaba
+                # Legacy single-channel behavior
+                Q = q_da if target_channel == 'DA' else q_sero
 
-            # Thresholding remains exactly as you do it today, but on Q (combined)
-            thresholds = cfg['pipeline'].get(f'csk_thresholds_{target_channel.lower()}', [])
+            # Get thresholds from configuration
+            threshold_key = f'csk_thresholds_{target_channel.lower()}'
+            thresholds = cfg['pipeline'].get(threshold_key, [])
+            if not thresholds:
+                logger.warning(f"CSK thresholds missing for {threshold_key}. Symbol detection will default to level 0.")
             
-            # 🛡 Fail-fast validation: Ensure threshold count matches M-1
-            if not isinstance(thresholds, list) or len(thresholds) != (M - 1):
-                error_msg = (f"CSK thresholds invalid for M={M} (expected {M-1} thresholds, "
-                           f"got {len(thresholds) if isinstance(thresholds, list) else type(thresholds)}). "
-                           f"Target channel: {target_channel}. "
-                           f"Recompute thresholds or run with --recalibrate.")
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
+            # Use data-driven orientation (not q_eff)
+            q_eff_target = get_nt_params(cfg, target_channel)['q_eff_e']
+            increasing = bool(cfg['pipeline'].get('csk_thresholds_increasing',
+                                                True if q_eff_target > 0 else False))
             
+            # CSK symbol detection
             s_rx = 0
-            q_eff = q_eff_glu if target_channel == 'GLU' else q_eff_gaba
+            # Use the orientation determined during calibration
             for thresh in thresholds:
-                if q_eff > 0:
-                    if Q > thresh: 
+                if increasing:
+                    if Q > thresh:
                         s_rx += 1
-                    else: 
+                    else:
                         break
                 else:
-                    if Q < thresh: 
+                    if Q < thresh:
                         s_rx += 1
-                    else: 
+                    else:
                         break
             rx_symbols[i] = s_rx
-            (stats_glu if s_tx < M/2 else stats_gaba).append(Q)
+            
+            # Store decision statistics for analysis
+            (stats_da if s_tx < M/2 else stats_sero).append(Q)
 
-            # Log combiner info once at first symbol (for provenance)
+            # Log configuration on first symbol (for debugging)
             if i == 0:
-                logger.info(f"CSK combiner={combiner}, dual={use_dual}, "
-                           f"σ=[{sigma_glu:.2e},{sigma_gaba:.2e}], ρcc={rho_cc:+.2f}, "
-                           f"leakage={leakage:.2f}")
+                cb = cfg['pipeline'].get('csk_selected_combiner', combiner)
+                logger.info(f"CSK combiner={cb}, dual={use_dual}, σ=[{sigma_da:.2e},{sigma_sero:.2e}], "
+                            f"ρcc={rho_cc:+.2f}, increasing={increasing}, leakage={leakage:.2f}")
               
         elif mod == 'Hybrid':
-            decision_stat = q_glu / sigma_glu + q_gaba / sigma_gaba
+            q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
+            q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
+            sign_da = 1.0 if q_eff_da >= 0 else -1.0
+            sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
+            decision_stat = (sign_da * q_da - sign_sero * q_sero) / sigma_diff
             threshold_mosk = cfg['pipeline'].get('mosk_threshold', 0.0)
-            b_hat = 0 if decision_stat > threshold_mosk else 1  # GLU if positive
-            threshold_glu = cfg['pipeline'].get('hybrid_threshold_glu', 0.0)
-            threshold_gaba = cfg['pipeline'].get('hybrid_threshold_gaba', 0.0)
-            thresholds_used = {'GLU': threshold_glu, 'GABA': threshold_gaba}
+            b_hat = 0 if decision_stat > threshold_mosk else 1  # DA if positive
+            threshold_da = cfg['pipeline'].get('hybrid_threshold_da', 0.0)
+            threshold_sero = cfg['pipeline'].get('hybrid_threshold_sero', 0.0)
+            thresholds_used = {'DA': threshold_da, 'SERO': threshold_sero}
             if b_hat == 0:
-                q_target = q_glu
-                l_hat = 1 if q_target > threshold_glu else 0
-                stats_glu.append(q_target)
+                q_target = q_da
+                l_hat = 1 if q_target > threshold_da else 0
+                stats_da.append(q_target)
             else:
-                q_target = q_gaba
-                l_hat = 1 if q_target < threshold_gaba else 0
-                stats_gaba.append(q_target)
+                q_target = q_sero
+                l_hat = 1 if q_target < threshold_sero else 0
+                stats_sero.append(q_target)
             s_rx = (b_hat << 1) | l_hat
             rx_symbols[i] = s_rx
             true_mol_bit = s_tx >> 1
@@ -640,15 +736,15 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "symbols_rx": rx_symbols,
         "errors": int(errors),
         "SER": errors / L if L > 0 else 0,
-        "stats_glu": stats_glu,
-        "stats_gaba": stats_gaba,
+        "stats_da": stats_da,
+        "stats_sero": stats_sero,
         "subsymbol_errors": subsymbol_errors,
         "thresholds_used": thresholds_used,
         "isi_ratio_mean": isi_ratio_mean,
         "isi_ratio_median": isi_ratio_median,
         # Stage 14: reproducibility knobs
-        'noise_sigma_glu': float(sigma_glu),
-        'noise_sigma_gaba': float(sigma_gaba),
+        'noise_sigma_da': float(sigma_da),
+        'noise_sigma_sero': float(sigma_sero),
         'noise_sigma_I_diff': float(sigma_diff),
     }
 

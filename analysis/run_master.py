@@ -300,7 +300,7 @@ def main() -> None:
     p.add_argument("--realistic-onsi", action="store_true",
                    help="Use cached simulation noise for ONSI calculation in hybrid benchmarks")
     p.add_argument("--nt-pairs", type=str, default="",
-                   help="Comma-separated NT pairs for CSK sweeps, e.g. GLU-GABA,GLU-DA")
+                   help="Comma-separated NT pairs for CSK sweeps, e.g. DA-5HT,DA-DA")
     # 🛠 ADD THIS LINE:
     p.add_argument("--nm-grid", type=str, default="",
                    help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "

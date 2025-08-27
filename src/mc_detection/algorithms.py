@@ -41,15 +41,15 @@ def integrate_current(i_t: np.ndarray, dt: float, win_s: float) -> float:
 
 
 # ------------------------------------------------------------------
-#  MoSK detector (GLU vs GABA) - Implements Eq. (39)
+#  MoSK detector (DA vs SERO) - Implements Eq. (39)
 # ------------------------------------------------------------------
-def detect_mosk(i_glu: np.ndarray,
-                i_gaba: np.ndarray,
+def detect_mosk(i_da: np.ndarray,
+                i_sero: np.ndarray,
                 i_ctrl: np.ndarray,
                 cfg: Dict[str, Any],
                 use_differential: bool = True) -> int:
     """
-    Optimized MoSK detection: distinguish between glutamate and GABA.
+    Optimized MoSK detection: distinguish between datamate and SERO.
     
     Implements improved decision rule with adaptive thresholds and better integration.
     """
@@ -58,33 +58,33 @@ def detect_mosk(i_glu: np.ndarray,
     
     if use_differential:
         # Differential currents
-        i_diff_glu = i_glu - i_ctrl
-        i_diff_gaba = i_gaba - i_ctrl
+        i_diff_da = i_da - i_ctrl
+        i_diff_sero = i_sero - i_ctrl
     else:
         # Direct currents (for comparison)
-        i_diff_glu = i_glu
-        i_diff_gaba = i_gaba
+        i_diff_da = i_da
+        i_diff_sero = i_sero
     
     # OPTIMIZED: Better integration method
-    n_int = min(int(win / dt), len(i_diff_glu))
+    n_int = min(int(win / dt), len(i_diff_da))
     if n_int <= 0:
-        return 1  # Default to GABA
+        return 1  # Default to SERO
     
     # Use trapezoidal integration for better accuracy
-    q_glu = np.trapezoid(i_diff_glu[:n_int], dx=dt)
-    q_gaba = np.trapezoid(i_diff_gaba[:n_int], dx=dt)
+    q_da = np.trapezoid(i_diff_da[:n_int], dx=dt)
+    q_sero = np.trapezoid(i_diff_sero[:n_int], dx=dt)
     
     # OPTIMIZED: Adaptive noise estimation for better decision making
-    noise_var_glu = max(float(np.var(np.diff(i_diff_glu[:n_int])) / 2), 1e-24)
-    noise_var_gaba = max(float(np.var(np.diff(i_diff_gaba[:n_int])) / 2), 1e-24)
+    noise_var_da = max(float(np.var(np.diff(i_diff_da[:n_int])) / 2), 1e-24)
+    noise_var_sero = max(float(np.var(np.diff(i_diff_sero[:n_int])) / 2), 1e-24)
     
     # OPTIMIZED: ML-optimal decision with noise weighting
-    sigma_glu = np.sqrt(noise_var_glu)
-    sigma_gaba = np.sqrt(noise_var_gaba)
+    sigma_da = np.sqrt(noise_var_da)
+    sigma_sero = np.sqrt(noise_var_sero)
     
     # Improved decision statistic with noise normalization (signed, no abs—handles depletion/enhancement)
-    test_stat = q_glu / sigma_glu - q_gaba / sigma_gaba  # Negative q_glu large → positive test_stat for GLU
-    # Return 0 for GLU (test_stat > 0), 1 for GABA (test_stat < 0)
+    test_stat = q_da / sigma_da - q_sero / sigma_sero  # Negative q_da large → positive test_stat for DA
+    # Return 0 for DA (test_stat > 0), 1 for SERO (test_stat < 0)
     return int(test_stat < 0)
 
 # ------------------------------------------------------------------
@@ -227,21 +227,21 @@ def detect_csk_mary(i_ch: np.ndarray,
 # ------------------------------------------------------------------
 #  Analytical BER/SEP calculations
 # ------------------------------------------------------------------
-def ber_mosk_analytic(snr_glu: Union[float, np.ndarray], 
-                     snr_gaba: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+def ber_mosk_analytic(snr_da: Union[float, np.ndarray], 
+                     snr_sero: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
     Analytical BER for MoSK using Eq. (40).
     
-    Pe = Q(|μ_I,diff,Glu - μ_I,diff,GABA| / sqrt(σ²_I,diff,Glu + σ²_I,diff,GABA))
+    Pe = Q(|μ_I,diff,Glu - μ_I,diff,SERO| / sqrt(σ²_I,diff,Glu + σ²_I,diff,SERO))
     
     For equal noise powers and symmetric signals, this simplifies to standard form.
     
     Parameters
     ----------
-    snr_glu : float or array
-        SNR for glutamate channel (linear scale)
-    snr_gaba : float or array
-        SNR for GABA channel (linear scale)
+    snr_da : float or array
+        SNR for datamate channel (linear scale)
+    snr_sero : float or array
+        SNR for SERO channel (linear scale)
         
     Returns
     -------
@@ -249,8 +249,8 @@ def ber_mosk_analytic(snr_glu: Union[float, np.ndarray],
         Bit error rate
     """
     # For symmetric case with equal noise
-    # SNR_effective = (SNR_GLU + SNR_GABA) / 2
-    snr_eff = (snr_glu + snr_gaba) / 2
+    # SNR_effective = (SNR_DA + SNR_SERO) / 2
+    snr_eff = (snr_da + snr_sero) / 2
     
     # Q-function = 0.5 * erfc(x/sqrt(2))
     return 0.5 * erfc(np.sqrt(snr_eff) / np.sqrt(2))
@@ -498,8 +498,8 @@ def monte_carlo_detection(
 def default_params():
     return {
         'N_apt': 4e8,
-        'GLU': {'k_on_M_s': 5e4, 'k_off_s': 1.5, 'q_eff_e': 0.6},
-        'GABA': {'k_on_M_s': 3e4, 'k_off_s': 0.9, 'q_eff_e': 0.2},
+        'DA': {'k_on_M_s': 5e4, 'k_off_s': 1.5, 'q_eff_e': 0.6},
+        'SERO': {'k_on_M_s': 3e4, 'k_off_s': 0.9, 'q_eff_e': 0.2},
     }
 
 

@@ -37,8 +37,8 @@ cfg["oect"]["gm_S"] = cfg.get("gm_S", 0.002)
 cfg["oect"]["C_tot_F"] = cfg.get("C_tot_F", 1.8e-8)
 
 # ensure minimal neurotransmitter table for q_eff lookup
-cfg["neurotransmitters"] = {"GLU": {"q_eff_e": 0.6},
-                            "GABA": {"q_eff_e": 0.2}}
+cfg["neurotransmitters"] = {"DA": {"q_eff_e": 0.6},
+                            "SERO": {"q_eff_e": 0.2}}
 
 # Ensure realistic baseline drain current (5 mA) for noise magnitude
 cfg["oect"]["I_dc_A"] = cfg["oect"].get("I_dc_A", 5e-3)
@@ -51,7 +51,7 @@ def zero_sites(n):
 def test_correlation_matrix():
     """Test that pairwise correlations match target ±0.05."""
     n = 8192
-    traces = oect_trio(zero_sites(n), ("GLU","GABA","CTRL"), cfg, rng)
+    traces = oect_trio(zero_sites(n), ("DA","SERO","CTRL"), cfg, rng)
     fs = 1 / cfg["sim"]["dt_s"]
 
     # Band-pass 10 mHz – 0.2 Hz to focus on correlated 1/f & drift noise
@@ -60,8 +60,8 @@ def test_correlation_matrix():
         return signal.sosfiltfilt(sos, x)
 
     band_traces = np.vstack([
-        bandpass(traces["GLU"],  fs),
-        bandpass(traces["GABA"], fs),
+        bandpass(traces["DA"],  fs),
+        bandpass(traces["SERO"], fs),
         bandpass(traces["CTRL"], fs)
     ])
 
@@ -78,9 +78,9 @@ def test_psd_reduction():
     n = 8192
     dt = cfg["sim"]["dt_s"]
     fs = 1/dt
-    tr = oect_trio(zero_sites(n), ("GLU","GABA","CTRL"), cfg, rng)
-    f, Pxx_g = signal.welch(tr["GLU"], fs=fs, nperseg=1024)
-    _, Pxx_d = signal.welch(tr["GLU"]-tr["CTRL"], fs=fs, nperseg=1024)
+    tr = oect_trio(zero_sites(n), ("DA","SERO","CTRL"), cfg, rng)
+    f, Pxx_g = signal.welch(tr["DA"], fs=fs, nperseg=1024)
+    _, Pxx_d = signal.welch(tr["DA"]-tr["CTRL"], fs=fs, nperseg=1024)
     idx = np.argmin(abs(f-0.05))
     red_db = 10*np.log10(Pxx_g[idx] / Pxx_d[idx])
     # Theoretical maximum with simple subtraction: 10·log10[1/(2(1-ρ))].

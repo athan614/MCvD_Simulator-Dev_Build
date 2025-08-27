@@ -440,7 +440,7 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
 
     plt.xlabel('Number of Molecules per Symbol (Nm)')
     plt.ylabel('Symbol Error Rate (SER)')
-    plt.title('CSK-4 Versatility: SER across Neurotransmitter Pairs')
+    plt.title('DA–SERO CSK-4 Performance')
     plt.grid(True, which="both", ls="--", alpha=0.3)
     plt.axhline(0.01, color='k', ls=':', alpha=0.6)
     plt.legend(ncol=2)

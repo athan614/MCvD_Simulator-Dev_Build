@@ -359,7 +359,7 @@ def _compute_onsi_from_cache(
     Read ONSI from cached simulation data for realistic noise statistics.
     
     Cache field compatibility notes:
-    - Current runner writes: stats_glu, stats_gaba (raw statistics)
+    - Current runner writes: stats_da, stats_sero (raw statistics)
     - Future Stage 14 will write: noise_sigma, sigma_I_diff (processed noise)
     - This function tries multiple fallback strategies for robustness
     """
@@ -427,7 +427,7 @@ def _compute_onsi_from_cache(
                         # Extract noise and signal from cached results
                         # TODO: Stage 14 will standardize these field names
                         # For now, try multiple possible field names
-                        sigma_fields = ['noise_sigma', 'sigma_I_diff', 'std_glu', 'std_gaba']
+                        sigma_fields = ['noise_sigma', 'sigma_I_diff', 'std_da', 'std_sero']
                         delta_fields = ['signal_delta', 'delta_I_diff', 'mean_diff']
                         
                         sigma_val = None
@@ -444,14 +444,14 @@ def _compute_onsi_from_cache(
                                 break
                         
                         # If we don't have direct noise/signal, try to compute from stats
-                        if sigma_val is None and 'stats_glu' in data and 'stats_gaba' in data:
-                            stats_glu = np.array(data['stats_glu'])
-                            stats_gaba = np.array(data['stats_gaba'])
-                            if len(stats_glu) > 0 and len(stats_gaba) > 0:
+                        if sigma_val is None and 'stats_da' in data and 'stats_sero' in data:
+                            stats_da = np.array(data['stats_da'])
+                            stats_sero = np.array(data['stats_sero'])
+                            if len(stats_da) > 0 and len(stats_sero) > 0:
                                 # Combined standard deviation
-                                diff_stats = np.array(stats_glu) - np.array(stats_gaba)
+                                diff_stats = np.array(stats_da) - np.array(stats_sero)
                                 sigma_val = float(np.std(diff_stats))
-                                delta_val = float(abs(np.mean(stats_glu) - np.mean(stats_gaba)))
+                                delta_val = float(abs(np.mean(stats_da) - np.mean(stats_sero)))
                         
                         if sigma_val is not None and delta_val is not None:
                             sigma_measured.append(sigma_val)

@@ -50,7 +50,7 @@ def _load_cfg() -> dict:
     cfg.setdefault("noise", {})
     cfg["noise"].setdefault("rho_correlated", 0.9)
     cfg.setdefault("neurotransmitters", {
-        "GLU": {"q_eff_e": -1.0}, "GABA": {"q_eff_e": +1.0}, "CTRL": {"q_eff_e": 0.0}
+        "DA": {"q_eff_e": -1.0}, "SERO": {"q_eff_e": +1.0}, "CTRL": {"q_eff_e": 0.0}
     })
     return cfg
 
@@ -70,7 +70,7 @@ def _atomic_save(fig, outpath: Path):
 
 
 def fig_differential_psd(cfg: dict):
-    """Before/after CTRL subtraction on a noise-only GLU trace."""
+    """Before/after CTRL subtraction on a noise-only DA trace."""
     apply_ieee_style()
     dt = float(cfg["sim"]["dt_s"])
     fs = 1.0 / dt
@@ -82,18 +82,18 @@ def fig_differential_psd(cfg: dict):
 
     # Bound sites = 0 → signal=0; still get thermal/flicker/drift noise
     zeros = np.zeros(n)
-    bound_sites = np.vstack([zeros, zeros, zeros])  # GLU, GABA, CTRL
-    nts = ("GLU", "GABA", "CTRL")
+    bound_sites = np.vstack([zeros, zeros, zeros])  # DA, SERO, CTRL
+    nts = ("DA", "SERO", "CTRL")
 
     trio = oect_mod.oect_trio(bound_sites, nts, cfg, rng, rho=cfg["noise"]["rho_correlated"])
-    i_glu, i_ctrl = trio["GLU"], trio["CTRL"]
+    i_da, i_ctrl = trio["DA"], trio["CTRL"]
 
-    # PSD before subtraction (GLU alone) vs after subtraction (GLU-CTRL)
-    f1, p_glu = _psd(i_glu, fs)
-    f2, p_diff = _psd(i_glu - i_ctrl, fs)
+    # PSD before subtraction (DA alone) vs after subtraction (DA-CTRL)
+    f1, p_da = _psd(i_da, fs)
+    f2, p_diff = _psd(i_da - i_ctrl, fs)
 
     fig, ax = plt.subplots(figsize=(6.8, 4.4))
-    ax.loglog(f1, p_glu, label="Before subtraction", lw=1.8)
+    ax.loglog(f1, p_da, label="Before subtraction", lw=1.8)
     ax.loglog(f2, p_diff, label="After subtraction", lw=1.8)
 
     # Light shading for very‑low‑frequency "drift band"
@@ -110,7 +110,7 @@ def fig_differential_psd(cfg: dict):
 
 
 def fig_noise_budget(cfg: dict):
-    """Thermal / 1/f / 1/f² components for one (GLU) pixel."""
+    """Thermal / 1/f / 1/f² components for one (DA) pixel."""
     apply_ieee_style()
     dt = float(cfg["sim"]["dt_s"])
     fs = 1.0 / dt
@@ -118,7 +118,7 @@ def fig_noise_budget(cfg: dict):
     n = int(T / dt)
 
     zeros = np.zeros(n)
-    out = oect_mod.oect_current(zeros, "GLU", cfg, seed=456)  # returns dict of components
+    out = oect_mod.oect_current(zeros, "DA", cfg, seed=456)  # returns dict of components
 
     fT, pT = _psd(out["thermal"], fs)
     fF, pF = _psd(out["flicker"], fs)
@@ -143,7 +143,7 @@ def fig_noise_budget(cfg: dict):
     ax.set_ylim(1e-30, 1e-20)
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("PSD (A²/Hz)")
-    ax.set_title("OECT Pixel Noise Budget (GLU channel)")
+    ax.set_title("OECT Pixel Noise Budget (DA channel)")
     ax.grid(True, which="both", ls="--", alpha=0.25)
     ax.legend(loc="best")
 

@@ -118,8 +118,8 @@ def verify_propagation_delays(config: Dict[str, Any]) -> Dict[str, Any]:
     Verify the propagation delays reported in the manuscript.
     
     The paper reports:
-    - GLU: 6.3s at 100 μm
-    - GABA: 4.7s at 100 μm
+    - DA: 6.3s at 100 μm
+    - SERO: 4.7s at 100 μm
     
     This function checks if these values are consistent with the model.
     
@@ -140,14 +140,14 @@ def verify_propagation_delays(config: Dict[str, Any]) -> Dict[str, Any]:
     distance_m = 100e-6  # 100 μm
     
     # Calculate for both neurotransmitters
-    for nt_type in ['GLU', 'GABA']:
+    for nt_type in ['DA', 'SERO']:
         metrics = calculate_propagation_metrics(
             config, Nm, distance_m, nt_type
         )
         
         results[nt_type] = {
             'calculated_delay_s': metrics['time_to_peak_s'],
-            'reported_delay_s': 6.3 if nt_type == 'GLU' else 4.7,
+            'reported_delay_s': 6.3 if nt_type == 'DA' else 4.7,
             'peak_concentration_M': metrics['peak_concentration_M'],
             'characteristic_diffusion_time_s': metrics['t_diff_characteristic_s'],
             'delay_factor': metrics['delay_factor']

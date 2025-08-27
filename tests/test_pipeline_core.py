@@ -99,8 +99,8 @@ def test_mosk_ser_low():
     
     # Set channel distances to match notebook
     cfg['channel_distances'] = {
-        'GLU': 100.0,
-        'GABA': 100.0,
+        'DA': 100.0,
+        'SERO': 100.0,
         'CTRL': 100.0
     }
     
@@ -144,8 +144,8 @@ def test_mosk_ser_low():
     
     # Check aptamer counts
     if 'binding' in cfg:
-        print(f"GLU aptamers: {cfg['binding'].get('N_sites_glu', 'not set')}")
-        print(f"GABA aptamers: {cfg['binding'].get('N_sites_gaba', 'not set')}")
+        print(f"DA aptamers: {cfg['binding'].get('N_sites_da', 'not set')}")
+        print(f"SERO aptamers: {cfg['binding'].get('N_sites_sero', 'not set')}")
         print(f"CTRL aptamers: {cfg['binding'].get('N_sites_ctrl', 'not set')}")
     
     # Check CTRL neurotransmitter params
@@ -182,17 +182,17 @@ def test_mosk_ser_low():
     print(f"RX symbol distribution: 0s={np.sum(rx_symbols==0)}, 1s={np.sum(rx_symbols==1)}")
     
     # Check decision statistics
-    if 'stats_glu' in res and 'stats_gaba' in res:
-        if len(res['stats_glu']) > 0:
-            print(f"GLU stats range: [{np.min(res['stats_glu']):.3e}, {np.max(res['stats_glu']):.3e}]")
-            print(f"GLU stats mean: {np.mean(res['stats_glu']):.3e}")
-        if len(res['stats_gaba']) > 0:
-            print(f"GABA stats range: [{np.min(res['stats_gaba']):.3e}, {np.max(res['stats_gaba']):.3e}]")
-            print(f"GABA stats mean: {np.mean(res['stats_gaba']):.3e}")
+    if 'stats_da' in res and 'stats_sero' in res:
+        if len(res['stats_da']) > 0:
+            print(f"DA stats range: [{np.min(res['stats_da']):.3e}, {np.max(res['stats_da']):.3e}]")
+            print(f"DA stats mean: {np.mean(res['stats_da']):.3e}")
+        if len(res['stats_sero']) > 0:
+            print(f"SERO stats range: [{np.min(res['stats_sero']):.3e}, {np.max(res['stats_sero']):.3e}]")
+            print(f"SERO stats mean: {np.mean(res['stats_sero']):.3e}")
         
         # Check separation
-        if len(res['stats_glu']) > 0 and len(res['stats_gaba']) > 0:
-            separation = abs(np.mean(res['stats_glu']) - np.mean(res['stats_gaba']))
+        if len(res['stats_da']) > 0 and len(res['stats_sero']) > 0:
+            separation = abs(np.mean(res['stats_da']) - np.mean(res['stats_sero']))
             print(f"Mean separation: {separation:.3e}")
     
     # Check key parameters

@@ -44,7 +44,7 @@ def _load_cfg() -> dict:
     cfg.setdefault("pipeline", {}).setdefault("symbol_period_s", 20.0)
     cfg["pipeline"].setdefault("modulation", "MoSK")
     cfg["pipeline"].setdefault("use_control_channel", True)
-    cfg.setdefault("neurotransmitters", {"GLU": {"q_eff_e": -1.0}, "GABA": {"q_eff_e": 1.0}})
+    cfg.setdefault("neurotransmitters", {"DA": {"q_eff_e": -1.0}, "SERO": {"q_eff_e": 1.0}})
     return cfg
 
 
@@ -69,82 +69,82 @@ def main() -> None:
     Nm0 = float(cfg.get("pipeline", {}).get("Nm_per_symbol", 1e4))
     history: List[Tuple[int, float]] = [(1, Nm0*0.9), (0, Nm0*0.8), (1, Nm0*1.1)]  # (symbol, Nm)
 
-    # Current symbol: GLU (0) vs GABA (1) for MoSK
+    # Current symbol: DA (0) vs SERO (1) for MoSK
     # Concentration at each channel (with/without ISI)
     def conc_at_channels(s_tx: int, Nm: float):
-        conc_glu = finite_burst_concentration(Nm, 100e-6, t, cfg, "GLU")
-        conc_gaba = finite_burst_concentration(Nm, 100e-6, t, cfg, "GABA")
+        conc_da = finite_burst_concentration(Nm, 100e-6, t, cfg, "DA")
+        conc_sero = finite_burst_concentration(Nm, 100e-6, t, cfg, "SERO")
         # ISI contribution: reuse the same finite burst with negative time shifts (−k*Ts)
-        conc_glu_isi = conc_glu.copy()*0
-        conc_gaba_isi = conc_gaba.copy()*0
+        conc_da_isi = conc_da.copy()*0
+        conc_sero_isi = conc_sero.copy()*0
         for k, (sym, Nm_hist) in enumerate(history, start=1):
             tau = k*Ts
             if sym == 0:
-                conc_glu_isi += finite_burst_concentration(Nm_hist, 100e-6, t + tau, cfg, "GLU")
+                conc_da_isi += finite_burst_concentration(Nm_hist, 100e-6, t + tau, cfg, "DA")
             else:
-                conc_gaba_isi += finite_burst_concentration(Nm_hist, 100e-6, t + tau, cfg, "GABA")
+                conc_sero_isi += finite_burst_concentration(Nm_hist, 100e-6, t + tau, cfg, "SERO")
         # Place current symbol on the right channel
-        conc_glu_tot = conc_glu + (conc_glu_isi if s_tx == 0 else conc_glu_isi)
-        conc_gaba_tot = conc_gaba + (conc_gaba_isi if s_tx == 1 else conc_gaba_isi)
+        conc_da_tot = conc_da + (conc_da_isi if s_tx == 0 else conc_da_isi)
+        conc_sero_tot = conc_sero + (conc_sero_isi if s_tx == 1 else conc_sero_isi)
         conc_ctrl = np.zeros_like(t)  # control has no signal
-        return conc_glu_tot, conc_gaba_tot, conc_ctrl, conc_glu, conc_gaba
+        return conc_da_tot, conc_sero_tot, conc_ctrl, conc_da, conc_sero
 
     Nm = Nm0
-    cG_w, cB_w, cC_w, cG_no, cB_no = conc_at_channels(0, Nm)  # GLU symbol
+    cG_w, cB_w, cC_w, cG_no, cB_no = conc_at_channels(0, Nm)  # DA symbol
 
     # --- Binding means (deterministic) for cleaner depiction
-    bG_w = mean_binding(cG_w, "GLU", cfg)
-    bB_w = mean_binding(cB_w, "GABA", cfg)
+    bG_w = mean_binding(cG_w, "DA", cfg)
+    bB_w = mean_binding(cB_w, "SERO", cfg)
     bC_w = np.zeros_like(bG_w)
 
-    bG_no = mean_binding(cG_no, "GLU", cfg)
-    bB_no = mean_binding(cB_no, "GABA", cfg)
+    bG_no = mean_binding(cG_no, "DA", cfg)
+    bB_no = mean_binding(cB_no, "SERO", cfg)
 
     # --- OECT currents (use 'signal' mapping only for clarity)
-    iG_w = oect_current(bG_w, "GLU", cfg, seed=11)["signal"]
-    iB_w = oect_current(bB_w, "GABA", cfg, seed=12)["signal"]
+    iG_w = oect_current(bG_w, "DA", cfg, seed=11)["signal"]
+    iB_w = oect_current(bB_w, "SERO", cfg, seed=12)["signal"]
     iC_w = oect_current(bC_w, "CTRL", cfg, seed=13)["signal"]
 
-    iG_no = oect_current(bG_no, "GLU", cfg, seed=21)["signal"]
-    iB_no = oect_current(bB_no, "GABA", cfg, seed=22)["signal"]
+    iG_no = oect_current(bG_no, "DA", cfg, seed=21)["signal"]
+    iB_no = oect_current(bB_no, "SERO", cfg, seed=22)["signal"]
 
     # --- Decision distributions (reuse runner helper for q-values across seeds)
     #     This ensures perfect consistency with “official” detection statistics.
     cal = run_calibration_symbols(cfg, symbol=0, mode="MoSK", num_symbols=300)
-    q_glu = np.array(cal["q_values"]) if cal and "q_values" in cal else np.zeros(1)
+    q_da = np.array(cal["q_values"]) if cal and "q_values" in cal else np.zeros(1)
     cal2 = run_calibration_symbols(cfg, symbol=1, mode="MoSK", num_symbols=300)
-    q_gaba = np.array(cal2["q_values"]) if cal2 and "q_values" in cal2 else np.zeros(1)
+    q_sero = np.array(cal2["q_values"]) if cal2 and "q_values" in cal2 else np.zeros(1)
 
     # --- Plot panel
     fig = plt.figure(figsize=(7.0, 9.4))
     gs = fig.add_gridspec(6, 1, hspace=0.5)
 
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(t, cG_w, label="GLU at GLU-CH (with ISI)")
-    ax1.plot(t, cB_w, label="GABA at GABA-CH (with ISI)")
-    ax1.plot(t, cG_no, "--", alpha=0.5, label="GLU at GLU-CH (no ISI)")
-    ax1.plot(t, cB_no, "--", alpha=0.5, label="GABA at GABA-CH (no ISI)")
+    ax1.plot(t, cG_w, label="DA at DA-CH (with ISI)")
+    ax1.plot(t, cB_w, label="SERO at SERO-CH (with ISI)")
+    ax1.plot(t, cG_no, "--", alpha=0.5, label="DA at DA-CH (no ISI)")
+    ax1.plot(t, cB_no, "--", alpha=0.5, label="SERO at SERO-CH (no ISI)")
     ax1.set_ylabel("Concentration [nM]"); ax1.set_title("Concentration with ISI")
     ax1.grid(True, ls="--", alpha=0.25); ax1.legend(fontsize=7, ncol=2)
 
     ax2 = fig.add_subplot(gs[1, 0])
-    ax2.plot(t, bG_w, label="GLU-CH (with ISI)")
-    ax2.plot(t, bB_w, label="GABA-CH (with ISI)")
-    ax2.plot(t, bG_no, "--", alpha=0.6, label="GLU-CH (no ISI)")
-    ax2.plot(t, bB_no, "--", alpha=0.6, label="GABA-CH (no ISI)")
+    ax2.plot(t, bG_w, label="DA-CH (with ISI)")
+    ax2.plot(t, bB_w, label="SERO-CH (with ISI)")
+    ax2.plot(t, bG_no, "--", alpha=0.6, label="DA-CH (no ISI)")
+    ax2.plot(t, bB_no, "--", alpha=0.6, label="SERO-CH (no ISI)")
     ax2.set_ylabel("Bound sites"); ax2.set_title("Aptamer occupancy with ISI")
     ax2.grid(True, ls="--", alpha=0.25); ax2.legend(fontsize=7, ncol=2)
 
     ax3 = fig.add_subplot(gs[2, 0])
-    ax3.plot(t, iG_w*1e9, label="GLU-CH (with ISI)")
-    ax3.plot(t, iB_w*1e9, label="GABA-CH (with ISI)")
+    ax3.plot(t, iG_w*1e9, label="DA-CH (with ISI)")
+    ax3.plot(t, iB_w*1e9, label="SERO-CH (with ISI)")
     ax3.set_ylabel("Current [nA]"); ax3.set_title("OECT currents (signal paths)")
     ax3.grid(True, ls="--", alpha=0.25); ax3.legend(fontsize=7)
 
     ax4 = fig.add_subplot(gs[3, 0])
     # Decision distributions via KDE
-    if len(q_glu) > 5 and len(q_gaba) > 5:
-        for vec, lab in [(q_glu, "GLU sent"), (q_gaba, "GABA sent")]:
+    if len(q_da) > 5 and len(q_sero) > 5:
+        for vec, lab in [(q_da, "DA sent"), (q_sero, "SERO sent")]:
             kde = gaussian_kde(vec)
             xs = np.linspace(np.quantile(vec, 0.01), np.quantile(vec, 0.99), 300)
             ax4.plot(xs, kde(xs), label=lab)
@@ -155,16 +155,16 @@ def main() -> None:
         ax4.text(0.5, 0.5, "Not enough q-values", transform=ax4.transAxes, ha="center")
 
     ax5 = fig.add_subplot(gs[4, 0])
-    ax5.plot(t, (iG_w - iC_w)*1e9, label="GLU-CH − CTRL (with ISI)")
-    ax5.plot(t, (iB_w - iC_w)*1e9, label="GABA-CH − CTRL (with ISI)")
-    ax5.plot(t, (iG_no - 0)*1e9, "--", alpha=0.6, label="GLU-CH (no ISI)")
-    ax5.plot(t, (iB_no - 0)*1e9, "--", alpha=0.6, label="GABA-CH (no ISI)")
+    ax5.plot(t, (iG_w - iC_w)*1e9, label="DA-CH − CTRL (with ISI)")
+    ax5.plot(t, (iB_w - iC_w)*1e9, label="SERO-CH − CTRL (with ISI)")
+    ax5.plot(t, (iG_no - 0)*1e9, "--", alpha=0.6, label="DA-CH (no ISI)")
+    ax5.plot(t, (iB_no - 0)*1e9, "--", alpha=0.6, label="SERO-CH (no ISI)")
     ax5.set_ylabel("Differential current [nA]")
     ax5.set_title("Differential measurement: ISI vs no‑ISI")
     ax5.grid(True, ls="--", alpha=0.25); ax5.legend(fontsize=7, ncol=2)
 
     ax6 = fig.add_subplot(gs[5, 0])
-    ax6.plot(t, (iG_w*1e9), label="GLU-CH raw (GLU sent)")
+    ax6.plot(t, (iG_w*1e9), label="DA-CH raw (DA sent)")
     ax6.plot(t, ((iG_w - iC_w)*1e9), label="Differential (reduced noise)")
     ax6.set_ylabel("Current [nA]"); ax6.set_xlabel("Time [s]")
     ax6.set_title("Noise Reduction via Differential Measurement")

@@ -109,7 +109,7 @@ def oect_trio(bound_sites_trio: np.ndarray,
               rng: np.random.Generator,
               rho: Optional[float] = None) -> Dict[str, np.ndarray]:
     """
-    Return correlated drain-current traces for GLU, GABA, CTRL.
+    Return correlated drain-current traces for DA, SERO, CTRL.
     
     VECTORIZED: Optimized noise generation using batch FFT operations.
     """
@@ -174,7 +174,7 @@ def oect_trio(bound_sites_trio: np.ndarray,
         thermal = rng.normal(scale=thermal_scale, size=(3, n))
 
     # VECTORIZED: Signal current calculation (let q_eff handle sign; no forced -)
-    q_eff_array = np.array([cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts])  # e.g., -1.0 for GLU, +1.0 for GABA
+    q_eff_array = np.array([cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts])  # e.g., -1.0 for DA, +1.0 for SERO
     signal = gm * q_eff_array[:, np.newaxis] * ELEMENTARY_CHARGE * bound_sites_trio / C_tot  # q_eff dictates sign
     
     # Total current
@@ -409,8 +409,8 @@ def oect_impulse_response(
 
 
 def differential_channels(
-    i_glu: np.ndarray,
-    i_gaba: np.ndarray,
+    i_da: np.ndarray,
+    i_sero: np.ndarray,
     i_ctrl: np.ndarray,
     rho: float
 ) -> Dict[str, Any]:
@@ -420,19 +420,19 @@ def differential_channels(
     VECTORIZED: Already uses numpy operations efficiently.
     """
     # Vectorized differential calculation
-    diff_glu = i_glu - i_ctrl
-    diff_gaba = i_gaba - i_ctrl
+    diff_da = i_da - i_ctrl
+    diff_sero = i_sero - i_ctrl
     
     # Vectorized correlation calculation
-    current_matrix = np.vstack([i_glu, i_gaba, i_ctrl])
+    current_matrix = np.vstack([i_da, i_sero, i_ctrl])
     corr_matrix = np.corrcoef(current_matrix)
-    rho_glu_ctrl = corr_matrix[0, 2]
-    rho_gaba_ctrl = corr_matrix[1, 2]
-    rho_achieved = np.mean([rho_glu_ctrl, rho_gaba_ctrl])
+    rho_da_ctrl = corr_matrix[0, 2]
+    rho_sero_ctrl = corr_matrix[1, 2]
+    rho_achieved = np.mean([rho_da_ctrl, rho_sero_ctrl])
     
     return {
-        'diff_glu': diff_glu,
-        'diff_gaba': diff_gaba,
+        'diff_da': diff_da,
+        'diff_sero': diff_sero,
         'rho_achieved': rho_achieved
     }
 

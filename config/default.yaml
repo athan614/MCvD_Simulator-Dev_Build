@@ -7,36 +7,35 @@ detection_bandwidth_Hz: 100      # Detection bandwidth (not sampling rate!)
 
 # -------- Neurotransmitter-specific parameters ----
 neurotransmitters:
-  GLU: #p-type OECT
-    D_m2_s: 7.6e-10
-    lambda: 1.6                  # CORRECTED: Consistent with literature (was 1.7)
-    k_on_M_s: 1e5               # High on-rate for strong binding (was 1e5)
-    k_off_s: 0.01              # Low off for K_d=0.1 nM (was 0.5)
-    q_eff_e: 1.0                # Higher effective charge (was 1.5)
-  GABA: #DOPAMINE, GABA IS PLACEHOLDER NAME FOR CODE FUNCTIONALITY, n-type OECT
-    D_m2_s: 6.0e-10             # CORRECTED: Same as GLU for consistency
-    lambda: 1.6                 # CORRECTED: Consistent with GLU (was 1.5)
-    k_on_M_s: 1e5               # High on-rate for strong binding (was 5e4)
-    k_off_s: 0.01              # Low off for K_d=0.1 nM (was 1.0)
-    q_eff_e: -1.0                # Higher effective charge (was 1.0)
-  CTRL:
-    k_on_M_s: 0                 # no binding
-    k_off_s: 0                  # CORRECTED: Weaker binding (was 3.0)
-    q_eff_e: 0                  # Smaller charge effect
-    D_m2_s: 7.6e-10             # Same as GLU (for diffusion calculations)
-    lambda: 1.6                 # CORRECTED: Same tortuosity as GLU (was 1.7)
   DA:
-    D_m2_s: 6.0e-10
+    name: "Dopamine (DA)"
+    # Binding (Kd ~150 nM → choose kon=1e5 -> koff=1.5e-2 s^-1)
+    k_on_M_s: 1e5
+    k_off_s: 0.01
+    # Transport
+    D_m2_s: 4.9e-10          # aqueous; in tissue your model uses D/λ^2
     lambda: 1.6
-    k_on_M_s: 5.0e4
-    k_off_s: 0.05
-    q_eff_e: -1.0
-  ACh:
-    D_m2_s: 7.0e-10
+    # Device coupling (keep opposite sign vs. SERO to preserve dual-channel separation)
+    q_eff_e: -0.35
+
+  SERO:
+    name: "Serotonin (5-HT)"
+    # Binding (Kd ~30 nM → choose kon=1e5 -> koff=3.0e-3 s^-1)
+    k_on_M_s: 1e5
+    k_off_s: 0.01
+    # Transport (typical small aromatic amine)
+    D_m2_s: 5.3e-10
     lambda: 1.6
-    k_on_M_s: 8.0e4
-    k_off_s: 0.02
-    q_eff_e: +1.0
+    # Device coupling (opposite sign to DA)
+    q_eff_e: 0.35
+
+  CTRL:
+    name: "Control"
+    k_on_M_s: 0.0
+    k_off_s: 0.0
+    D_m2_s: 4.9e-10
+    lambda: 1.6
+    q_eff_e: 0.0
 
 # -------- Geometry --------
 gate_area_m2: 4e-8              # 200x200 μm²
@@ -74,7 +73,7 @@ noise:
   N_c: 4.5e11                   # CORRECTED: Literature standard
   effective_correlation: 0.9        # Override for noise calculations
   detection_bandwidth_Hz: 100       # Override detection bandwidth
-  rho_between_channels_after_ctrl: 0.0  # NEW: Cross-channel correlation after CTRL subtraction
+  rho_between_channels_after_ctrl: 0.8  # NEW: Cross-channel correlation after CTRL subtraction  
 
 # -------- Simulation window --------
 monte_carlo_trials: 10000
@@ -89,7 +88,7 @@ sim:
 distances_um: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175]  # optimized range (removed 115, 200)
 # High-resolution distance grid (use only if needed)
 # distances_um: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
-Nm_range: [200, 500, 1000, 1600, 2500, 4000, 6300, 10000, 16000, 25000] # finer resolution
+Nm_range: [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200] # finer resolution
 
 # -------- Detection layer --------
 detection:
@@ -114,12 +113,12 @@ pipeline:
   random_seed: 2025
   modulation: "MoSK"            # Options: "MoSK", "CSK", "Hybrid"
   enable_isi: True              # Master switch for the Inter-Symbol Interference model
-  isi_memory: 2                 # Default memory (will be made dynamic in analysis script)
+  isi_memory: 5                 # Default memory (will be made dynamic in analysis script)
   guard_factor: 0.2             # 20% guard time (Reduced from 0.3)
   lod_nm_min: 50                # New flexible lower bound for LoD search
-  csk_target_channel: "GLU"     # Defines the molecule used for the pure CSK scheme
+  csk_target_channel: "DA"     # Defines the molecule used for the pure CSK scheme
   level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
-  csk_levels: 2                 # Number of concentration levels for CSK and Hybrid modes
+  csk_levels: 4                 # Number of concentration levels for CSK and Hybrid modes
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
   # NEW: Dual-channel CSK configuration
   csk_dual_channel: true          # enable dual-channel CSK
@@ -129,10 +128,13 @@ pipeline:
 
   # -------- Advanced Optimization Parameters --------
   # Adaptive calibration tuning (Issue 1 optimization)
-  _cal_eps_rel: 0.01            # Convergence threshold (1% relative change)
-  _cal_patience: 2              # Wait 2 iterations before stopping
-  _cal_min_seeds: 4             # Minimum seeds before early stopping
-  # Window guard tuning (Issue 2 optimization)  
+  _cal_eps_rel: 0.01              # 1% convergence threshold
+  _cal_patience: 2                # Wait 2 iterations before stopping
+  _cal_min_seeds: 4               # Minimum seeds before early stopping
+  _cal_min_samples_per_class: 50  # Minimum samples per class
+  _cal_enable_es_mosk: true       # Enable early stopping for MoSK
+  _cal_enable_es_hybrid: true     # Enable early stopping for Hybrid
+  # Window guard tuning (Issue 2 optimization)
   _min_decision_points: 4       # Minimum time points for window guard
 
   channel_spacing_um: 200       # from paper

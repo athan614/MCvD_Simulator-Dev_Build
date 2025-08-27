@@ -25,22 +25,22 @@ from src.pipeline import run_sequence
 from analysis.run_final_analysis import calculate_dynamic_symbol_period
 
 def test_mosk_detection(config):
-    """Test MoSK detector distinguishes GLU from GABA (if standalone function exists)."""
+    """Test MoSK detector distinguishes DA from SERO (if standalone function exists)."""
     dt = config['dt_s']
     n_samples = int(0.5 / dt)  # 0.5s window
     
-    # GLU stronger than GABA
-    i_glu = np.full(n_samples, 2e-9)   # 2 nA
-    i_gaba = np.full(n_samples, 1e-9)  # 1 nA
+    # DA stronger than SERO
+    i_da = np.full(n_samples, 2e-9)   # 2 nA
+    i_sero = np.full(n_samples, 1e-9)  # 1 nA
     i_ctrl = np.full(n_samples, 0.1e-9)  # Small control current
     
-    assert n_samples == len(i_glu)  # sanity guard
+    assert n_samples == len(i_da)  # sanity guard
     
-    # Should detect GLU (return 0)
-    assert detect_mosk(i_glu, i_gaba, i_ctrl, config) == 0
+    # Should detect DA (return 0)
+    assert detect_mosk(i_da, i_sero, i_ctrl, config) == 0
     
-    # Swap currents - should detect GABA (return 1)
-    assert detect_mosk(i_gaba, i_glu, i_ctrl, config) == 1
+    # Swap currents - should detect SERO (return 1)
+    assert detect_mosk(i_sero, i_da, i_ctrl, config) == 1
 
 
 def test_tri_channel_mosk_detection(config):
@@ -72,28 +72,28 @@ def test_tri_channel_mosk_detection(config):
     assert result['SER'] < 0.2, f"SER {result['SER']:.2%} too high for MoSK"
     
     # Check that stats are collected
-    assert 'stats_glu' in result
-    assert 'stats_gaba' in result
+    assert 'stats_da' in result
+    assert 'stats_sero' in result
     
-    # Stats should be decision statistics (q_glu - q_gaba)
-    # When GLU is sent (tx=0), stats should be positive
-    # When GABA is sent (tx=1), stats should be negative
+    # Stats should be decision statistics (q_da - q_sero)
+    # When DA is sent (tx=0), stats should be positive
+    # When SERO is sent (tx=1), stats should be negative
     tx_symbols = result['symbols_tx']
-    stats_glu = result['stats_glu']
-    stats_gaba = result['stats_gaba']
+    stats_da = result['stats_da']
+    stats_sero = result['stats_sero']
     
-    # Count of stats should match number of GLU/GABA transmissions
-    n_glu_sent = sum(1 for s in tx_symbols if s == 0)
-    n_gaba_sent = sum(1 for s in tx_symbols if s == 1)
+    # Count of stats should match number of DA/SERO transmissions
+    n_da_sent = sum(1 for s in tx_symbols if s == 0)
+    n_sero_sent = sum(1 for s in tx_symbols if s == 1)
     
-    assert len(stats_glu) == n_glu_sent, "Stats count mismatch for GLU"
-    assert len(stats_gaba) == n_gaba_sent, "Stats count mismatch for GABA"
+    assert len(stats_da) == n_da_sent, "Stats count mismatch for DA"
+    assert len(stats_sero) == n_sero_sent, "Stats count mismatch for SERO"
     
     # Average stats should have correct sign
-    if stats_glu:  # If any GLU was sent
-        assert np.mean(stats_glu) > 0, "GLU stats should be positive on average"
-    if stats_gaba:  # If any GABA was sent
-        assert np.mean(stats_gaba) < 0, "GABA stats should be negative on average"
+    if stats_da:  # If any DA was sent
+        assert np.mean(stats_da) > 0, "DA stats should be positive on average"
+    if stats_sero:  # If any SERO was sent
+        assert np.mean(stats_sero) < 0, "SERO stats should be negative on average"
 
 
 def test_csk_binary_detection(config):
@@ -120,8 +120,8 @@ def test_tri_channel_csk_detection(config):
     cfg['pipeline']['random_seed'] = 42
     cfg['pipeline']['enable_isi'] = True        # keep ISI on
     cfg['pipeline']['csk_levels'] = 4  # 4-level CSK (0, 1, 2, 3)
-    cfg['pipeline']['csk_target_channel'] = 'GLU'  # Which channel to use for CSK
-    cfg['pipeline']['csk_thresholds_glu'] = [-1e-9, 0, 1e-9]  # 3 thresholds for 4 levels
+    cfg['pipeline']['csk_target_channel'] = 'DA'  # Which channel to use for CSK
+    cfg['pipeline']['csk_thresholds_da'] = [-1e-9, 0, 1e-9]  # 3 thresholds for 4 levels
 
     # <- new block ------------------------------------------------------------
     dist = cfg['pipeline']['distance_um']        # 100 µm by default
@@ -143,8 +143,8 @@ def test_tri_channel_csk_detection(config):
     assert all(0 <= s < 4 for s in result['symbols_rx']), "RX symbols out of range"
     
     # Stats should be collected for the target channel
-    assert 'stats_glu' in result
-    assert len(result['stats_glu']) == 100, "Should have stats for all symbols"
+    assert 'stats_da' in result
+    assert len(result['stats_da']) == 100, "Should have stats for all symbols"
 
 
 def test_tri_channel_hybrid_detection(config):
@@ -157,8 +157,8 @@ def test_tri_channel_hybrid_detection(config):
     cfg['pipeline']['random_seed'] = 42
     
     # Need to set thresholds for Hybrid
-    cfg['pipeline']['hybrid_threshold_glu'] = 0  # Example threshold
-    cfg['pipeline']['hybrid_threshold_gaba'] = 0  # Example threshold
+    cfg['pipeline']['hybrid_threshold_da'] = 0  # Example threshold
+    cfg['pipeline']['hybrid_threshold_sero'] = 0  # Example threshold
     
     # Run a sequence
     result = run_sequence(cfg)
@@ -235,13 +235,13 @@ def test_detection_performance_comparison(config):
     # Test CSK (binary)
     cfg['pipeline']['modulation'] = 'CSK'
     cfg['pipeline']['csk_levels'] = 2
-    cfg['pipeline']['csk_target_channel'] = 'GLU'
-    cfg['pipeline']['csk_thresholds_glu'] = [0]  # Single threshold for binary
+    cfg['pipeline']['csk_target_channel'] = 'DA'
+    cfg['pipeline']['csk_thresholds_da'] = [0]  # Single threshold for binary
     results['CSK-2'] = run_sequence(cfg)
     
     # Test CSK (4-level)
     cfg['pipeline']['csk_levels'] = 4
-    cfg['pipeline']['csk_thresholds_glu'] = [-1e-9, 0, 1e-9]  # 3 thresholds
+    cfg['pipeline']['csk_thresholds_da'] = [-1e-9, 0, 1e-9]  # 3 thresholds
     results['CSK-4'] = run_sequence(cfg)
     
     # Compare SER
@@ -259,7 +259,7 @@ def test_snr_calculation(config):
     # Parameters
     gm = config['gm_S']
     C_tot = config['C_tot_F']
-    q_eff = config['neurotransmitters']['GLU']['q_eff_e']
+    q_eff = config['neurotransmitters']['DA']['q_eff_e']
     
     # Bound aptamer counts
     mu_signal = 1e6    # 1 million bound

@@ -53,10 +53,10 @@ def generate_latex_table():
             "title": "Binding Parameters",
             "data": [
                 ("Aptamer Sites ($N_{apt}$)", format_value(binding_params['N_apt'])),
-                ("$k_{on,GLU}$", format_value(binding_params['GLU']['k_on_M_s'], "M$^{-1}$s$^{-1}$")),
-                ("$k_{off,GLU}$", format_value(binding_params['GLU']['k_off_s'], "s$^{-1}$")),
-                ("$k_{on,GABA}$", format_value(binding_params['GABA']['k_on_M_s'], "M$^{-1}$s$^{-1}$")),
-                ("$k_{off,GABA}$", format_value(binding_params['GABA']['k_off_s'], "s$^{-1}$")),
+                ("$k_{on,DA}$", format_value(binding_params['DA']['k_on_M_s'], "M$^{-1}$s$^{-1}$")),
+                ("$k_{off,DA}$", format_value(binding_params['DA']['k_off_s'], "s$^{-1}$")),
+                ("$k_{on,SERO}$", format_value(binding_params['SERO']['k_on_M_s'], "M$^{-1}$s$^{-1}$")),
+                ("$k_{off,SERO}$", format_value(binding_params['SERO']['k_off_s'], "s$^{-1}$")),
             ]
         },
     ]

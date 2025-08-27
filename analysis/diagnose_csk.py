@@ -34,7 +34,7 @@ def diagnose_csk_levels():
     # Configure for CSK
     cfg['pipeline']['modulation'] = 'CSK'
     cfg['pipeline']['csk_levels'] = 4
-    cfg['pipeline']['csk_target_channel'] = 'GLU'
+    cfg['pipeline']['csk_target_channel'] = 'DA'
     cfg['pipeline']['csk_level_scheme'] = 'uniform'
     cfg['pipeline']['Nm_per_symbol'] = 10000
     cfg['pipeline']['distance_um'] = 50
@@ -62,7 +62,7 @@ def diagnose_csk_levels():
     from src.pipeline import _csk_dual_channel_Q, calculate_proper_noise_sigma
     
     # Calculate noise parameters once
-    sigma_glu, sigma_gaba = calculate_proper_noise_sigma(cfg, cfg['detection']['decision_window_s'])
+    sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg, cfg['detection']['decision_window_s'])
     rho_cc = float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
     rho_cc = max(-1.0, min(1.0, rho_cc))
     
@@ -74,7 +74,7 @@ def diagnose_csk_levels():
     
     print(f"  Combiner: {combiner} (dual={use_dual})")
     print(f"  Target channel: {target_channel}")
-    print(f"  Noise: σ_GLU={sigma_glu:.2e}, σ_GABA={sigma_gaba:.2e}, ρ={rho_cc:+.3f}")
+    print(f"  Noise: σ_DA={sigma_da:.2e}, σ_SERO={sigma_sero:.2e}, ρ={rho_cc:+.3f}")
     if combiner == 'leakage':
         print(f"  Leakage fraction: {leakage:.3f}")
     print()
@@ -93,25 +93,25 @@ def diagnose_csk_levels():
         
         for trial in range(20):
             # Generate currents
-            currents_glu, currents_gaba, currents_ctrl, nm_actual = _single_symbol_currents(
+            currents_da, currents_sero, currents_ctrl, nm_actual = _single_symbol_currents(
                 symbol, tx_history, cfg, rng
             )
             
             # Integration
-            q_glu = float(np.trapz(currents_glu, dx=cfg['sim']['dt_s']))
-            q_gaba = float(np.trapz(currents_gaba, dx=cfg['sim']['dt_s']))
+            q_da = float(np.trapz(currents_da, dx=cfg['sim']['dt_s']))
+            q_sero = float(np.trapz(currents_sero, dx=cfg['sim']['dt_s']))
             
             # Compute dual-channel Q
             if use_dual:
                 Q = _csk_dual_channel_Q(
-                    q_glu=q_glu, q_gaba=q_gaba,
-                    sigma_glu=sigma_glu, sigma_gaba=sigma_gaba,
+                    q_da=q_da, q_sero=q_sero,
+                    sigma_da=sigma_da, sigma_sero=sigma_sero,
                     rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
                     target=target_channel
                 )
             else:
                 # Legacy single-channel
-                Q = q_glu if target_channel == 'GLU' else q_gaba
+                Q = q_da if target_channel == 'DA' else q_sero
                 
             results_per_symbol[symbol]['q_values'].append(Q)
             results_per_symbol[symbol]['nm_actual'].append(nm_actual)

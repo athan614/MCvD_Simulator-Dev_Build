@@ -58,9 +58,9 @@ def fig_concentration_profiles(cfg: dict):
     Nm_small = 3e3
     dists = [50e-6, 100e-6, 200e-6]
 
-    # (A) GLU/GABA – rect burst; (B) same – gamma burst
+    # (A) DA/SERO – rect burst; (B) same – gamma burst
     fig, axes = plt.subplots(2, 2, figsize=(9.8, 6.0))
-    for j, (nt, title) in enumerate([("GLU", "GLU"), ("GABA", "GABA")]):
+    for j, (nt, title) in enumerate([("DA", "DA"), ("SERO", "SERO")]):
         for i, dist in enumerate(dists):
             cfg_rect = {**cfg, "burst_shape": "rect"}
             c_rect = transport_mod.finite_burst_concentration(Nm_small, dist, t, cfg_rect, nt)
@@ -86,7 +86,7 @@ def fig_concentration_profiles(cfg: dict):
 
     # Normalized shapes (overlay): small inset figure
     fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.8, 4.0))
-    for nt, ax in [("GLU", ax1), ("GABA", ax2)]:
+    for nt, ax in [("DA", ax1), ("SERO", ax2)]:
         c = transport_mod.finite_burst_concentration(Nm_small, 100e-6, t, cfg, nt)
         ax.plot(t, c/np.max(c))
         ax.axhline(0.5, color="0.5", ls=":", lw=1.0)
@@ -111,16 +111,16 @@ def fig_distance_scaling(cfg: dict):
             vals.append(t[np.argmax(c)])
         return np.array(vals)
 
-    tpk_glu = t_peak("GLU"); tpk_gaba = t_peak("GABA")
+    tpk_da = t_peak("DA"); tpk_sero = t_peak("SERO")
 
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.8, 3.8))
-    axL.plot(d_grid*1e6, tpk_glu, label="GLU")
-    axL.plot(d_grid*1e6, tpk_gaba, label="GABA")
+    axL.plot(d_grid*1e6, tpk_da, label="DA")
+    axL.plot(d_grid*1e6, tpk_sero, label="SERO")
     axL.set_xlabel("Distance (µm)"); axL.set_ylabel("Time to Peak (s)")
     axL.set_title("Propagation Delay vs Distance"); axL.legend(); axL.grid(True, ls="--", alpha=0.25)
 
-    axR.loglog(d_grid*1e6, tpk_glu, label="GLU")
-    axR.loglog(d_grid*1e6, tpk_gaba, label="GABA")
+    axR.loglog(d_grid*1e6, tpk_da, label="DA")
+    axR.loglog(d_grid*1e6, tpk_sero, label="SERO")
     # Reference slopes (r^2 and r^1.5) for visual comparison
     r = d_grid*1e6
     axR.loglog(r, 1e-3*(r/r[0])**2, "k--", alpha=0.6, label="∝ r²")

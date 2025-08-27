@@ -39,8 +39,8 @@ def _load_cfg() -> dict:
     cfg.setdefault("sim", {}).setdefault("dt_s", 0.01)
     cfg.setdefault("pipeline", {}).setdefault("symbol_period_s", 20.0)
     cfg.setdefault("oect", {}).update(oect_mod.default_params())
-    # Minimum neurotransmitter params for GLU
-    cfg.setdefault("neurotransmitters", {}).setdefault("GLU", {
+    # Minimum neurotransmitter params for DA
+    cfg.setdefault("neurotransmitters", {}).setdefault("DA", {
         "k_on_M_s": 1e5, "k_off_s": 0.02, "q_eff_e": -1.0
     })
     cfg.setdefault("N_apt", 2e8)
@@ -64,17 +64,17 @@ def fig_mean_vs_mc(cfg: dict):
 
     # Use a realistic concentration transient at 100 µm:
     conc = transport_mod.finite_burst_concentration(
-        Nm=1e4, r=100e-6, t_vec=t, config=cfg, nt_type="GLU"
+        Nm=1e4, r=100e-6, t_vec=t, config=cfg, nt_type="DA"
     )
 
     # Deterministic mean
-    mean_b = binding_mod.mean_binding(conc, "GLU", cfg)
+    mean_b = binding_mod.mean_binding(conc, "DA", cfg)
     mu = float(np.mean(mean_b))
 
     # Three MC traces
     traces = []
     for seed in (101, 202, 303):
-        b_t, _, _ = binding_mod.bernoulli_binding(conc, "GLU", cfg, np.random.default_rng(seed))
+        b_t, _, _ = binding_mod.bernoulli_binding(conc, "DA", cfg, np.random.default_rng(seed))
         traces.append(b_t)
 
     # Plot
@@ -102,9 +102,9 @@ def fig_psd_empirical_vs_analytic(cfg: dict):
     conc = np.full_like(t, C_eq, dtype=float)
 
     # MC binding → current via OECT gain (use *signal* path only)
-    b_t, _, _ = binding_mod.bernoulli_binding(conc, "GLU", cfg, np.random.default_rng(404))
+    b_t, _, _ = binding_mod.bernoulli_binding(conc, "DA", cfg, np.random.default_rng(404))
     gm = float(cfg["oect"]["gm_S"]); Ctot = float(cfg["oect"]["C_tot_F"])
-    q_eff = float(cfg["neurotransmitters"]["GLU"]["q_eff_e"])
+    q_eff = float(cfg["neurotransmitters"]["DA"]["q_eff_e"])
     e = 1.602176634e-19
     i_sig = gm * q_eff * e * b_t / Ctot
     i_sig = i_sig - np.mean(i_sig)  # remove DC
@@ -114,11 +114,11 @@ def fig_psd_empirical_vs_analytic(cfg: dict):
 
     # Analytic binding PSD in A^2/Hz (provided by binding module)
     f_th = np.logspace(np.log10(max(1e-2, f_emp[1])), np.log10(fs/2), 500)
-    p_th = binding_mod.binding_noise_psd("GLU", cfg, f_th, C_eq=C_eq)
+    p_th = binding_mod.binding_noise_psd("DA", cfg, f_th, C_eq=C_eq)
 
     # Corner frequency estimate for label
-    k_on = float(cfg["neurotransmitters"]["GLU"]["k_on_M_s"])
-    k_off = float(cfg["neurotransmitters"]["GLU"]["k_off_s"])
+    k_on = float(cfg["neurotransmitters"]["DA"]["k_on_M_s"])
+    k_off = float(cfg["neurotransmitters"]["DA"]["k_off_s"])
     f_c = (k_on * C_eq + k_off) / (2*np.pi)
 
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
