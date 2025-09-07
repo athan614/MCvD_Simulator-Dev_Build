@@ -38,7 +38,7 @@ neurotransmitters:
     q_eff_e: 0.0
 
 # -------- Geometry --------
-gate_area_m2: 4e-8              # 200x200 μm²
+gate_area_m2: 4e-8              # 200x200 um^2
 
 # -------- Release profile --------
 T_release_ms: 10
@@ -58,11 +58,11 @@ binding:
 
 # -------- OECT device --------
 oect:
-  gm_S: 0.005                    # 10mS for better signal (was 0.005)
+  gm_S: 0.005                    # 5 mS transconductance
   C_tot_F: 5e-8               # Optimized capacitance (was 4e-7)
   R_ch_Ohm: 500                 # Channel resistance for Johnson noise
-  I_dc_A: 1.0e-4                # 1 µA baseline current for proper noise scaling
-  V_g_bias_V: -0.2             # -20 mV gate bias (was -0.2)
+  I_dc_A: 1.0e-4                # 100 µA baseline current for proper noise scaling
+  V_g_bias_V: -0.2             # -200 mV gate bias
 
 # -------- Noise --------
 noise:
@@ -73,7 +73,7 @@ noise:
   N_c: 4.5e11                   # CORRECTED: Literature standard
   effective_correlation: 0.9        # Override for noise calculations
   detection_bandwidth_Hz: 100       # Override detection bandwidth
-  rho_between_channels_after_ctrl: 0.8  # NEW: Cross-channel correlation after CTRL subtraction  
+  rho_between_channels_after_ctrl: 0.1  # NEW: Cross-channel correlation after CTRL subtraction  
 
 # -------- Simulation window --------
 monte_carlo_trials: 10000
@@ -88,7 +88,7 @@ sim:
 distances_um: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175]  # optimized range (removed 115, 200)
 # High-resolution distance grid (use only if needed)
 # distances_um: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
-Nm_range: [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200] # finer resolution
+Nm_range: [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000] # finer resolution
 
 # -------- Detection layer --------
 detection:
@@ -103,6 +103,9 @@ detection:
   #mu0_glu: 2.442e-05           # Mean charge for GLU class
   #mu1_gaba: -2.620e-05         # Mean charge for GABA class
   show_progress: true          # Show progress bars
+  decision_window_policy: fraction_of_Ts
+  decision_window_fraction: 0.9  # integrate the last 90* of Ts
+  # optional: min_decision_samples: 32
 
 # -------- End-to-end pipeline --------
 pipeline:
@@ -114,17 +117,19 @@ pipeline:
   modulation: "MoSK"            # Options: "MoSK", "CSK", "Hybrid"
   enable_isi: True              # Master switch for the Inter-Symbol Interference model
   isi_memory: 5                 # Default memory (will be made dynamic in analysis script)
-  guard_factor: 0.2             # 20% guard time (Reduced from 0.3)
+  guard_factor: 0.15             # 20% guard time (Reduced from 0.3)
   lod_nm_min: 50                # New flexible lower bound for LoD search
   csk_target_channel: "DA"     # Defines the molecule used for the pure CSK scheme
   level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
   csk_levels: 4                 # Number of concentration levels for CSK and Hybrid modes
+  csk_tail_fraction: 0.6        # Use tail-gating for CSK everywhere
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
   # NEW: Dual-channel CSK configuration
   csk_dual_channel: true          # enable dual-channel CSK
   csk_combiner: "zscore"          # one of: ["zscore","whitened","leakage"]
   csk_leakage_frac: 0.0           # fractional mean leakage on the 'other' channel (0–0.2 typical)
   csk_store_combiner_meta: true   # persist combiner + (σ,ρ) into CSVs
+  isi_memory_cap_symbols: 60   # cap the ISI tail
 
   # -------- Advanced Optimization Parameters --------
   # Adaptive calibration tuning (Issue 1 optimization)
@@ -171,3 +176,5 @@ analysis:
   enhanced_noise_model: false       # Enable configurable noise parameters
   timeout_retry_enabled: true       # Enable timeout retry logic
   pre_submission_ci_check: true     # Skip job submission when CI already satisfied
+  allow_ts_exceed: true  # do not abort the LoD row when Ts gets large
+  ts_cap_s: 0            # 0 disables the cap; or set a very high value

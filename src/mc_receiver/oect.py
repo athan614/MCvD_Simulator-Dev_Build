@@ -174,7 +174,8 @@ def oect_trio(bound_sites_trio: np.ndarray,
         thermal = rng.normal(scale=thermal_scale, size=(3, n))
 
     # VECTORIZED: Signal current calculation (let q_eff handle sign; no forced -)
-    q_eff_array = np.array([cfg['neurotransmitters'][nt]['q_eff_e'] for nt in nts])  # e.g., -1.0 for DA, +1.0 for SERO
+    q_eff_array = np.array([(cfg['neurotransmitters'][nt]['q_eff_e'] if nt in cfg.get('neurotransmitters', {}) else 0.0)
+                            if nt != "CTRL" else 0.0 for nt in nts])  # e.g., -1.0 for DA, +1.0 for SERO
     signal = gm * q_eff_array[:, np.newaxis] * ELEMENTARY_CHARGE * bound_sites_trio / C_tot  # q_eff dictates sign
     
     # Total current

@@ -79,7 +79,10 @@ def _get_ci_for_df(df: pd.DataFrame) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     return None
 
 # ----------------- plotting -----------------
-
+"""
+SNR proxy: MoSK/Hybrid use MoSK contrast statistic (pre-CTRL); 
+CSK uses the Q-statistic of the dual-channel combiner.
+"""
 def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
     colors = {'MoSK': '#0072B2', 'CSK': '#009E73', 'Hybrid': '#D55E00'}
@@ -322,13 +325,24 @@ def plot_figure_10_11_combined(results: Dict[str, Dict[str, pd.DataFrame]], save
             if 'data_rate_bps' in df.columns and not df['data_rate_bps'].empty:
                 max_idx = df['data_rate_bps'].idxmax()
                 if pd.notna(max_idx) and max_idx in df.index:
-                    max_rate = float(np.real(df.at[max_idx, 'data_rate_bps']))
-                    max_dist = float(np.real(df.at[max_idx, 'distance_um']))
-                    plt.annotate(f'{max_rate:.3f}',
-                                 xy=(max_dist, max_rate),
-                                 xytext=(5, 5),
-                                 textcoords='offset points',
-                                 fontsize=8)
+                    max_rate_val = df.at[max_idx, 'data_rate_bps']
+                    max_dist_val = df.at[max_idx, 'distance_um']
+                    
+                    # Safely convert to float, handling any potential non-numeric values
+                    try:
+                        max_rate = float(pd.to_numeric(max_rate_val, errors='coerce'))
+                        max_dist = float(pd.to_numeric(max_dist_val, errors='coerce'))
+                        
+                        # Skip annotation if conversion resulted in NaN
+                        if pd.notna(max_rate) and pd.notna(max_dist):
+                            plt.annotate(f'{max_rate:.3f}',
+                                         xy=(max_dist, max_rate),
+                                         xytext=(5, 5),
+                                         textcoords='offset points',
+                                         fontsize=8)
+                    except (ValueError, TypeError):
+                        # Skip annotation if conversion fails
+                        continue
 
     plt.tight_layout()
     plt.savefig(save_dir / "fig11_comparative_data_rate.png", dpi=300)

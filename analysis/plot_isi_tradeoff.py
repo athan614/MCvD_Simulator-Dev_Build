@@ -58,13 +58,28 @@ def main() -> None:
         gfcol = _gf_col(df)
         if gfcol is None or 'ser' not in df.columns:
             continue
-        # Aggregate medians per guard factor
-        g = df.groupby(gfcol, as_index=False).agg({
-            'ser': 'median',
-            'symbol_period_s': lambda x: np.median(pd.to_numeric(x, errors='coerce'))
-        }).sort_values(gfcol)
-        ax.semilogy(g[gfcol], g['ser'], marker='o', linewidth=2, label=m)
-        plotted = True
+
+        if 'use_ctrl' in df.columns and df['use_ctrl'].nunique() > 1:
+            for ctrl_state, grp in df.groupby('use_ctrl'):
+                g = grp.groupby(gfcol, as_index=False).agg({
+                    'ser': 'median',
+                    'symbol_period_s': lambda x: np.median(pd.to_numeric(x, errors='coerce'))
+                }).sort_values(gfcol)
+                ls = '-' if bool(ctrl_state) else '--'
+                lbl = f"{m} • {'CTRL' if bool(ctrl_state) else 'no CTRL'}"
+                # Clip SER to prevent log(0) issues
+                ser_clipped = np.maximum(g['ser'], 1e-6)
+                ax.semilogy(g[gfcol], ser_clipped, marker='o', linewidth=2, linestyle=ls, label=lbl)
+                plotted = True
+        else:
+            g = df.groupby(gfcol, as_index=False).agg({
+                'ser': 'median',
+                'symbol_period_s': lambda x: np.median(pd.to_numeric(x, errors='coerce'))
+            }).sort_values(gfcol)
+            # Clip SER to prevent log(0) issues  
+            ser_clipped = np.maximum(g['ser'], 1e-6)
+            ax.semilogy(g[gfcol], ser_clipped, marker='o', linewidth=2, label=m)
+            plotted = True
 
     ax.set_xlabel('Guard Factor (fraction of Ts)')
     ax.set_ylabel('SER with ISI enabled')
@@ -81,6 +96,7 @@ def main() -> None:
             gfcol = _gf_col(df)
             if gfcol is None or 'symbol_period_s' not in df.columns:
                 continue
+            # Use the full dataset for Ts median (regardless of CTRL state)
             g = df.groupby(gfcol, as_index=False).agg({'symbol_period_s': 'median'}).sort_values(gfcol)
             if guard_union is None:
                 guard_union = g[gfcol].to_numpy()

@@ -60,18 +60,89 @@ STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR = project_root / "results"
 
+"""# Results Data README
+
+This folder contains CSVs produced by `analysis/run_final_analysis.py`.
+
+## Common columns
+- `ser`: Symbol Error Rate (across seeds at that sweep point)
+- `snr_db`: SNR proxy (semantics depend on mode; see below)
+- `snr_semantics`: Human-readable note about how SNR is computed
+- `symbols_evaluated`: Total symbols aggregated across seeds
+- `use_ctrl`: True = CTRL subtraction enabled, False = not enabled
+- `mode`: MoSK | CSK | Hybrid
+
+## SNR semantics by mode
+- **MoSK** and **Hybrid (MoSK bit)**: SNR from the **MoSK contrast statistic** (sign-aware DA vs SERO), using **pre-CTRL** correlation in the denominator.
+- **CSK**: SNR from the **Q-statistic** used by the dual-channel combiner.
+
+Notes:
+- Hybrid amplitude decisions use CTRL subtraction when enabled; MoSK decisions do not.
+- LoD CSVs include `data_rate_bps` and `symbol_period_s` at the LoD operating point.
+
+"""
+
+def _safe_close_progress(pm: ProgressManager, overall, sub_dict: Dict[str, Any], sub_key: Optional[str] = None) -> None:
+    """Safely close progress managers with idempotent protection."""
+    try:
+        if sub_key and sub_key in sub_dict:
+            sub_dict[sub_key].close()
+    except Exception:
+        pass
+    try:
+        overall.close()
+    except Exception:
+        pass
+    try:
+        pm.stop()
+    except Exception:
+        pass
+
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(dict(data), indent=2), encoding='utf-8')
     tmp.replace(path)
 
-def _load_state() -> Dict[str, Any]:
+def _get_run_fingerprint(args: argparse.Namespace) -> str:
+    """Generate a fingerprint for the current run configuration."""
+    key_params = [
+        args.modes,
+        args.num_seeds,
+        args.sequence_length,
+        args.ablation,
+        args.parallel_modes,
+        getattr(args, 'preset', None),
+        getattr(args, 'nm_grid', ''),
+        getattr(args, 'distances', ''),
+        getattr(args, 'nt_pairs', ''),
+        args.target_ci,
+        args.min_ci_seeds,
+        args.lod_screen_delta,
+        getattr(args, 'lod_num_seeds', None),
+        getattr(args, 'lod_seq_len', None),
+        args.baseline_isi,
+        args.supplementary,
+        # Add version/tag for future compatibility
+        "v1.0"
+    ]
+    return str(hash(tuple(str(p) for p in key_params)))
+
+def _load_state(args: argparse.Namespace) -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            state = json.loads(STATE_FILE.read_text())
+            # Check fingerprint compatibility
+            current_fp = _get_run_fingerprint(args)
+            stored_fp = state.get('_fingerprint')
+            if stored_fp != current_fp:
+                print(f"⚠️  Configuration changed - invalidating resume state")
+                print(f"   Previous: {stored_fp}")
+                print(f"   Current:  {current_fp}")
+                return {"_fingerprint": current_fp}
+            return state
         except Exception:
-            return {}
-    return {}
+            return {"_fingerprint": _get_run_fingerprint(args)}
+    return {"_fingerprint": _get_run_fingerprint(args)}
 
 def _mark_done(state: Dict[str, Any], step: str) -> None:
     state[step] = {"done": True, "ts": time.time()}
@@ -140,10 +211,9 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     """Assemble the run_final_analysis.py command line with pass-through flags."""
     # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
     child_progress = args.progress
-    if args.progress == "gui" and args.parallel_modes and args.parallel_modes > 1:
-        # Only force fallback on macOS, where Tk must run in the main thread.
-        if platform.system() == "Darwin":
-            child_progress = "rich"
+    if (args.progress == "gui" and platform.system() == "Darwin" and 
+        ((args.parallel_modes and args.parallel_modes > 1) or args.ablation_parallel)):
+        child_progress = "rich"
     cmd = [
         sys.executable, "-u", "analysis/run_final_analysis.py",
         "--mode", "ALL" if args.modes.lower() == "all" else args.modes,
@@ -160,6 +230,9 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--resume")
     if args.recalibrate:
         cmd.append("--recalibrate")
+    # ISI baseline control
+    if args.baseline_isi == "off":
+        cmd.append("--disable-isi")
     # Performance flags
     if args.max_workers is not None:
         cmd.extend(["--max-workers", str(args.max_workers)])
@@ -170,7 +243,6 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     # NT-pairs (forward for CSK versatility)
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
-    # 🛠 ADD THESE LINES:
     # Nm grid override (forward sweep parameters)
     if args.nm_grid:
         cmd.extend(["--nm-grid", args.nm_grid])
@@ -204,6 +276,28 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     if hasattr(args, 'min_decision_points') and args.min_decision_points != 4:
         cmd.extend(["--min-decision-points", str(args.min_decision_points)])
 
+    # NEW: Forward decision window and ISI optimization flags
+    if args.decision_window_policy is not None:
+        cmd.extend(["--decision-window-policy", args.decision_window_policy])
+    if args.decision_window_frac is not None:
+        cmd.extend(["--decision-window-frac", str(args.decision_window_frac)])
+    if args.allow_ts_exceed:
+        cmd.append("--allow-ts-exceed")
+    if args.ts_cap_s is not None:
+        cmd.extend(["--ts-cap-s", str(args.ts_cap_s)])
+    if args.isi_memory_cap is not None:
+        cmd.extend(["--isi-memory-cap", str(args.isi_memory_cap)])
+    if args.guard_factor is not None:
+        cmd.extend(["--guard-factor", str(args.guard_factor)])
+
+    # NEW: Forward SER auto-refine flags
+    if args.ser_refine:
+        cmd.append("--ser-refine")
+    if args.ser_target != 0.01:
+        cmd.extend(["--ser-target", str(args.ser_target)])
+    if args.ser_refine_points != 2:
+        cmd.extend(["--ser-refine-points", str(args.ser_refine_points)])
+
     # Pass logging controls through to child...
     return cmd
 
@@ -211,7 +305,7 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     """Assemble the run_final_analysis.py command line for a single mode (no --parallel-modes)."""
     # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
     child_progress = args.progress
-    if args.progress == "gui" and platform.system() == "Darwin":
+    if args.progress == "gui" and platform.system() == "Darwin" and args.ablation_parallel:
         child_progress = "rich"
         
     cmd = [
@@ -231,6 +325,9 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.append("--resume")
     if args.recalibrate:
         cmd.append("--recalibrate")
+    # ISI baseline control
+    if args.baseline_isi == "off":
+        cmd.append("--disable-isi")
     # Performance flags
     if args.max_workers is not None:
         cmd.extend(["--max-workers", str(args.max_workers)])
@@ -241,7 +338,6 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     # NT-pairs (forward for CSK versatility)
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
-    # 🛠 ADD THESE LINES:
     # Nm grid override (forward sweep parameters)
     if args.nm_grid:
         cmd.extend(["--nm-grid", args.nm_grid])
@@ -275,6 +371,28 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     if hasattr(args, 'min_decision_points') and args.min_decision_points != 4:
         cmd.extend(["--min-decision-points", str(args.min_decision_points)])
 
+    # NEW: Forward decision window and ISI optimization flags
+    if args.decision_window_policy is not None:
+        cmd.extend(["--decision-window-policy", args.decision_window_policy])
+    if args.decision_window_frac is not None:
+        cmd.extend(["--decision-window-frac", str(args.decision_window_frac)])
+    if args.allow_ts_exceed:
+        cmd.append("--allow-ts-exceed")
+    if args.ts_cap_s is not None:
+        cmd.extend(["--ts-cap-s", str(args.ts_cap_s)])
+    if args.isi_memory_cap is not None:
+        cmd.extend(["--isi-memory-cap", str(args.isi_memory_cap)])
+    if args.guard_factor is not None:
+        cmd.extend(["--guard-factor", str(args.guard_factor)])
+
+    # NEW: Forward SER auto-refine flags
+    if args.ser_refine:
+        cmd.append("--ser-refine")
+    if args.ser_target != 0.01:
+        cmd.extend(["--ser-target", str(args.ser_target)])
+    if args.ser_refine_points != 2:
+        cmd.extend(["--ser-refine-points", str(args.ser_refine_points)])
+
     # Pass logging controls through to child...
     return cmd
 
@@ -287,6 +405,8 @@ def main() -> None:
     p.add_argument("--sequence-length", type=int, default=1000)
     p.add_argument("--recalibrate", action="store_true", help="Force recalibration (ignore JSON cache)")
     p.add_argument("--supplementary", action="store_true", help="Also generate supplementary figures")
+    p.add_argument("--baseline-isi", choices=["off", "on"], default="off",
+                help="ISI state for baseline SER/LoD sweeps; ISI trade-off always runs ON.")
     # Modes
     p.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default="all")
     p.add_argument("--parallel-modes", type=int, default=1,
@@ -301,7 +421,6 @@ def main() -> None:
                    help="Use cached simulation noise for ONSI calculation in hybrid benchmarks")
     p.add_argument("--nt-pairs", type=str, default="",
                    help="Comma-separated NT pairs for CSK sweeps, e.g. DA-5HT,DA-DA")
-    # 🛠 ADD THIS LINE:
     p.add_argument("--nm-grid", type=str, default="",
                    help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
                         "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
@@ -309,6 +428,29 @@ def main() -> None:
     p.add_argument("--extreme-mode", action="store_true", help="Pass through to run_final_analysis (max P-core threads)")
     p.add_argument("--beast-mode", action="store_true", help="Pass through to run_final_analysis (P-cores minus margin)")
     p.add_argument("--max-workers", type=int, default=None, help="Override worker count in run_final_analysis")
+    
+    # NEW: Decision window and ISI optimization toggles
+    p.add_argument("--decision-window-policy", choices=["fixed", "fraction_of_Ts", "full_Ts"], default=None,
+                   help="Override decision window policy (default: use YAML config)")
+    p.add_argument("--decision-window-frac", type=float, default=None,
+                   help="Decision window fraction for fraction_of_Ts policy (0.1-1.0)")
+    p.add_argument("--allow-ts-exceed", action="store_true", 
+                   help="Allow Ts to exceed limits during LoD sweeps")
+    p.add_argument("--ts-cap-s", type=float, default=None,
+                   help="Symbol period cap in seconds (0 = no cap)")
+    p.add_argument("--isi-memory-cap", type=int, default=None,
+                   help="ISI memory cap in symbols (0 = no cap)")
+    p.add_argument("--guard-factor", type=float, default=None,
+                   help="Override guard factor for ISI calculations")
+    
+    # ------ SER auto-refine near target SER ------
+    p.add_argument("--ser-refine", action="store_true",
+                   help="After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER.")
+    p.add_argument("--ser-target", type=float, default=0.01,
+                   help="Target SER for auto-refine (default: 0.01).")
+    p.add_argument("--ser-refine-points", type=int, default=2,
+                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 2).")
+    
     # Stage-13 tuning pass-through
     p.add_argument("--target-ci", type=float, default=0.0,
                    help="Stop adding seeds once Wilson 95% CI half-width <= target; 0 disables (pass-through)")
@@ -423,6 +565,7 @@ def main() -> None:
             args.modes = "all"
             args.ablation = "both"
             args.supplementary = True
+            _set_if_default("baseline_isi", "off")
             
             # Optimize performance (but allow manual override)
             if args.max_workers is None and not args.extreme_mode and not args.beast_mode:
@@ -430,7 +573,10 @@ def main() -> None:
             
             print("🏆 IEEE preset applied: publication-grade configuration")
             print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
-            print(f"   • LoD search: {getattr(args, 'lod_num_seeds', 8)} seeds × {getattr(args, 'lod_seq_len', 300)} symbols")
+            lod_seeds_display = getattr(args, 'lod_num_seeds', '8')
+            if isinstance(lod_seeds_display, str) and (',' in lod_seeds_display or ':' in lod_seeds_display):
+                lod_seeds_display = f"{lod_seeds_display} (rule)"
+            print(f"   • LoD search: {lod_seeds_display} × {getattr(args, 'lod_seq_len', 250)} symbols")
             print(f"   • Target CI: {args.target_ci}, All modes, Both ablations")
             print(f"   • Supplementary: {args.supplementary}, Performance: {'extreme-mode' if args.extreme_mode else 'default'}")
 
@@ -516,7 +662,7 @@ def main() -> None:
         "progress": args.progress,
         "resume": bool(args.resume and not args.reset),
         "with_ctrl": None if len(ablation_runs) == 2 else bool(ablation_runs[0]),
-        "isi": True,
+        "isi": args.baseline_isi == "on",  # Reflect actual baseline setting
         "flags": [
             f"--num-seeds={args.num_seeds}",
             f"--sequence-length={args.sequence_length}",
@@ -525,9 +671,8 @@ def main() -> None:
             f"--target-ci={args.target_ci}",
             f"--min-ci-seeds={args.min_ci_seeds}",
             f"--lod-screen-delta={args.lod_screen_delta}",
-        ] + ([f"--preset={args.preset}"] if args.preset else []) +  # NEW: Add preset to flags
+        ] + ([f"--preset={args.preset}"] if args.preset else []) +
             ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
-            # 🛠 ADD THIS LINE:
             ([f"--nm-grid={args.nm_grid}"] if args.nm_grid else []) +
             (["--recalibrate"] if args.recalibrate else []) +
             (["--extreme-mode"] if args.extreme_mode else (["--beast-mode"] if args.beast_mode else [])) +
@@ -545,7 +690,8 @@ def main() -> None:
     
     # Add global stop mechanism
     master_cancelled = threading.Event()
-    current_process: Optional[subprocess.Popen] = None
+    # Track all children to support concurrent kills
+    current_processes: "set[subprocess.Popen]" = set()
     process_lock = threading.Lock()
     
     def stop_callback():
@@ -553,25 +699,22 @@ def main() -> None:
         print("\n🛑 GUI Stop button pressed - initiating graceful shutdown...")
         master_cancelled.set()
         
-        # Terminate current subprocess if any
+        # Terminate *all* active subprocesses
         with process_lock:
-            if current_process is not None:
-                try:
-                    print("   → Terminating active subprocess...")
-                    if os.name == "nt":
-                        current_process.send_signal(signal.CTRL_BREAK_EVENT)
+            procs = list(current_processes)
+        for proc in procs:
+            try:
+                print(f"   → Terminating subprocess pid={getattr(proc, 'pid', '?')}")
+                if os.name == "nt":
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    killpg = getattr(os, 'killpg', None)
+                    if killpg and hasattr(proc, 'pid'):
+                        killpg(proc.pid, signal.SIGTERM)
                     else:
-                        killpg = getattr(os, 'killpg', None)
-                        if killpg and hasattr(current_process, 'pid'):
-                            killpg(current_process.pid, signal.SIGTERM)
-                        else:
-                            current_process.terminate()
-                except Exception as e:
-                    print(f"   ⚠️  Error terminating subprocess: {e}")
-                    try:
-                        current_process.terminate()
-                    except Exception:
-                        pass
+                        proc.terminate()
+            except Exception as e:
+                print(f"   ⚠️  Error terminating subprocess: {e}")
     
     # Connect stop callback to progress manager
     if hasattr(pm, 'set_stop_callback'):
@@ -583,7 +726,7 @@ def main() -> None:
     sub = {s: pm.task(total=1, description=s.replace("_"," ").title(),
                       parent="overall", key=("step", s), kind="mode") for s in steps}
 
-    state: Dict[str, Any] = _load_state() if args.resume and not args.reset else {}
+    state: Dict[str, Any] = _load_state(args) if args.resume and not args.reset else {"_fingerprint": _get_run_fingerprint(args)}
     t0 = time.time()
 
     # Initialize ctx to prevent "possibly unbound" error
@@ -599,8 +742,6 @@ def main() -> None:
         # Enhanced _run function to track current process
         def _run_tracked(cmd: List[str]) -> int:
             """Run a command with process tracking for stop button."""
-            nonlocal current_process
-            
             if master_cancelled.is_set():
                 print("🛑 Run cancelled before starting")
                 return 130  # Standard cancellation exit code
@@ -612,51 +753,52 @@ def main() -> None:
             else:
                 preexec_fn = getattr(os, 'setsid', None)
             
+            proc = subprocess.Popen(
+                cmd, cwd=project_root,
+                creationflags=creationflags,
+                preexec_fn=preexec_fn
+            )
             with process_lock:
-                current_process = subprocess.Popen(
-                    cmd, cwd=project_root,
-                    creationflags=creationflags, 
-                    preexec_fn=preexec_fn
-                )
+                current_processes.add(proc)
             
             try:
                 # Poll for completion or cancellation
-                while current_process.poll() is None:
+                while proc.poll() is None:
                     if master_cancelled.is_set():
                         print("🛑 Cancelling due to stop button...")
                         try:
                             if os.name == "nt":
-                                current_process.send_signal(signal.CTRL_BREAK_EVENT)
+                                proc.send_signal(signal.CTRL_BREAK_EVENT)
                             else:
                                 killpg = getattr(os, 'killpg', None)
-                                if killpg:
-                                    killpg(current_process.pid, signal.SIGTERM)
+                                if killpg and hasattr(proc, 'pid'):
+                                    killpg(proc.pid, signal.SIGTERM)
                                 else:
-                                    current_process.terminate()
+                                    proc.terminate()
                         except Exception:
-                            current_process.terminate()
+                            proc.terminate()
                         return 130
                     time.sleep(0.1)  # Check every 100ms
                 
-                return current_process.returncode
+                return proc.returncode
                 
             except KeyboardInterrupt:
                 print("\n^C received — stopping child process...", flush=True)
                 try:
                     if os.name == "nt":
-                        current_process.send_signal(signal.CTRL_BREAK_EVENT)
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
                     else:
                         killpg = getattr(os, 'killpg', None)
-                        if killpg:
-                            killpg(current_process.pid, signal.SIGTERM)
+                        if killpg and hasattr(proc, 'pid'):
+                            killpg(proc.pid, signal.SIGTERM)
                         else:
-                            current_process.terminate()
+                            proc.terminate()
                 except Exception:
-                    current_process.terminate()
-                return current_process.wait()
+                    proc.terminate()
+                return proc.wait()
             finally:
                 with process_lock:
-                    current_process = None
+                    current_processes.discard(proc)
 
         # --- Simulations per ablation state ---
         def _do_one_ablation(use_ctrl: bool) -> int:
@@ -691,11 +833,12 @@ def main() -> None:
                         rc = f.result()
                         rcs.append(rc)
                         if rc == 130:
-                            print(f"🛑 Mode cancelled: {skey}")
-                            return 130
+                            _safe_close_progress(pm, overall, sub, skey)
+                            print("🛑 Master pipeline stopped by user")
+                            sys.exit(130)
                         elif rc != 0:
-                            print(f"✗ Mode failed with exit code {rc}: {skey}")
-                            return rc
+                            _safe_close_progress(pm, overall, sub, skey)
+                            sys.exit(rc)
             else:
                 # Sequential mode execution (fallback)
                 for m in modes:
@@ -733,12 +876,12 @@ def main() -> None:
                     use = futs[fut]
                     rc = fut.result()
                     key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
-                    if rc == 130:
-                        sub[key].close(); overall.close(); pm.stop()
+                    if rc == 130:  # Cancellation
+                        _safe_close_progress(pm, overall, sub, key)
                         print("🛑 Master pipeline stopped by user")
                         sys.exit(130)
                     elif rc != 0:
-                        sub[key].close(); overall.close(); pm.stop()
+                        _safe_close_progress(pm, overall, sub, key)
                         sys.exit(rc)
                     sub[key].update(1); sub[key].close(); overall.update(1)
         else:
@@ -748,17 +891,17 @@ def main() -> None:
                 rc = _do_one_ablation(use)
                 key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
                 if rc == 130:  # Cancellation
-                    sub[key].close(); overall.close(); pm.stop()
+                    _safe_close_progress(pm, overall, sub, key)
                     print("🛑 Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
-                    sub[key].close(); overall.close(); pm.stop()
+                    _safe_close_progress(pm, overall, sub, key)
                     sys.exit(rc)
                 sub[key].update(1); sub[key].close(); overall.update(1)
 
         # Check cancellation before each major step
         if master_cancelled.is_set():
-            overall.close(); pm.stop()
+            _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
@@ -766,17 +909,18 @@ def main() -> None:
         if not (args.resume and state.get("plots", {}).get("done")):
             rc = _run_tracked([sys.executable, "-u", "analysis/generate_comparative_plots.py"])
             if rc == 130:
-                sub["plots"].close(); overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub, "plots")
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             elif rc != 0:
-                sub["plots"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                _safe_close_progress(pm, overall, sub, "plots")
+                sys.exit(rc)
             _mark_done(state, "plots")
         sub["plots"].update(1); sub["plots"].close(); overall.update(1)
 
         # Check cancellation before ISI step
         if master_cancelled.is_set():
-            overall.close(); pm.stop()
+            _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
@@ -784,17 +928,18 @@ def main() -> None:
         if not (args.resume and state.get("isi", {}).get("done")):
             rc = _run_tracked([sys.executable, "-u", "analysis/plot_isi_tradeoff.py"])
             if rc == 130:
-                sub["isi"].close(); overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub, "isi")
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             elif rc != 0:
-                sub["isi"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                _safe_close_progress(pm, overall, sub, "isi")
+                sys.exit(rc)
             _mark_done(state, "isi")
         sub["isi"].update(1); sub["isi"].close(); overall.update(1)
 
         # Check cancellation before hybrid step
         if master_cancelled.is_set():
-            overall.close(); pm.stop()
+            _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
@@ -812,17 +957,18 @@ def main() -> None:
                 hybrid_cmd.append("--realistic-onsi")
             rc = _run_tracked(hybrid_cmd)
             if rc == 130:
-                sub["hybrid"].close(); overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub, "hybrid")
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             elif rc != 0:
-                sub["hybrid"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                _safe_close_progress(pm, overall, sub, "hybrid")
+                sys.exit(rc)
             _mark_done(state, "hybrid")
         sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
 
         # Check cancellation before nb_replicas step
         if master_cancelled.is_set():
-            overall.close(); pm.stop()
+            _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
@@ -839,17 +985,18 @@ def main() -> None:
                     print(f"⚠️  Script not found: {script}"); continue
                 rc = _run_tracked([sys.executable, "-u", script])
                 if rc == 130:
-                    sub["nb_replicas"].close(); overall.close(); pm.stop()
+                    _safe_close_progress(pm, overall, sub, "nb_replicas")
                     print("🛑 Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
-                    sub["nb_replicas"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                    _safe_close_progress(pm, overall, sub, "nb_replicas")
+                    sys.exit(rc)
             _mark_done(state, "nb_replicas")
         sub["nb_replicas"].update(1); sub["nb_replicas"].close(); overall.update(1)
 
         # Check cancellation before tables step
         if master_cancelled.is_set():
-            overall.close(); pm.stop()
+            _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
@@ -857,65 +1004,67 @@ def main() -> None:
         if not (args.resume and state.get("tables", {}).get("done")):
             rc = _run_tracked([sys.executable, "-u", "analysis/param_table.py"])
             if rc == 130:
-                sub["tables"].close(); overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub, "tables")
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             elif rc != 0:
-                sub["tables"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                _safe_close_progress(pm, overall, sub, "tables")
+                sys.exit(rc)
             rc = _run_tracked([sys.executable, "-u", "analysis/table_maker.py"])
             if rc == 130:
-                sub["tables"].close(); overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub, "tables")
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             elif rc != 0:
-                sub["tables"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                _safe_close_progress(pm, overall, sub, "tables")
+                sys.exit(rc)
             _mark_done(state, "tables")
         sub["tables"].update(1); sub["tables"].close(); overall.update(1)
 
         # --- Supplementary (optional) ---
         if "supplementary" in sub:
             if master_cancelled.is_set():
-                overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub)
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             if not (args.resume and state.get("supplementary", {}).get("done")):
                 rc = _run_tracked([sys.executable, "-u", "analysis/generate_supplementary_figures.py",
                            "--strict", "--only-data"])
                 if rc == 130:
-                    sub["supplementary"].close(); overall.close(); pm.stop()
+                    _safe_close_progress(pm, overall, sub, "supplementary")
                     print("🛑 Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
-                    sub["supplementary"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                    _safe_close_progress(pm, overall, sub, "supplementary")
+                    sys.exit(rc)
                 _mark_done(state, "supplementary")
             sub["supplementary"].update(1); sub["supplementary"].close(); overall.update(1)
 
         if "appendix" in sub:
             if master_cancelled.is_set():
-                overall.close(); pm.stop()
+                _safe_close_progress(pm, overall, sub)
                 print("🛑 Master pipeline stopped by user")
                 sys.exit(130)
             if not (args.resume and state.get("appendix", {}).get("done")):
                 rc = _run_tracked([sys.executable, "-u", "analysis/diagnose_csk.py"])
                 if rc == 130:
-                    sub["appendix"].close(); overall.close(); pm.stop()
+                    _safe_close_progress(pm, overall, sub, "appendix")
                     print("🛑 Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
-                    sub["appendix"].close(); overall.close(); pm.stop(); sys.exit(rc)
+                    _safe_close_progress(pm, overall, sub, "appendix")
+                    sys.exit(rc)
                 _mark_done(state, "appendix")
             sub["appendix"].update(1); sub["appendix"].close(); overall.update(1)
 
     except KeyboardInterrupt:
         print("\n🛑 Master pipeline interrupted")
-        overall.close()
-        pm.stop()
+        _safe_close_progress(pm, overall, sub)
         sys.exit(130)
     finally:
-        overall.close()
-        pm.stop()
+        _safe_close_progress(pm, overall, sub)
         try:
-            if ctx is not None:  # Changed from checking if 'ctx' in locals()
+            if ctx is not None:
                 ctx.__exit__(None, None, None)
         except Exception:
             pass

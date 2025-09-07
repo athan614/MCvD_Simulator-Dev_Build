@@ -24,7 +24,7 @@ def diagnose_csk_levels():
     """Diagnose CSK signal generation and detection."""
     
     # Load configuration
-    with open(project_root / "config" / "default.yaml") as f:
+    with open(project_root / "config" / "default.yaml", encoding='utf-8') as f:
         config_base = yaml.safe_load(f)
     
     # Preprocess
@@ -98,8 +98,8 @@ def diagnose_csk_levels():
             )
             
             # Integration
-            q_da = float(np.trapz(currents_da, dx=cfg['sim']['dt_s']))
-            q_sero = float(np.trapz(currents_sero, dx=cfg['sim']['dt_s']))
+            q_da = float(np.trapezoid(currents_da, dx=cfg['sim']['dt_s']))
+            q_sero = float(np.trapezoid(currents_sero, dx=cfg['sim']['dt_s']))
             
             # Compute dual-channel Q
             if use_dual:

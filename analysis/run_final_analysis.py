@@ -28,6 +28,7 @@ import threading
 import queue as pyqueue
 import signal
 import subprocess
+import logging
 
 # Add project root to path
 project_root = Path(__file__).parent.parent if (Path(__file__).parent.name == "analysis") else Path(__file__).parent
@@ -119,6 +120,8 @@ class SleepInhibitor:
 CPU_COUNT = mp.cpu_count()
 PHYSICAL_CORES = psutil.cpu_count(logical=False) or 1
 I9_13950HX_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24
+I9_14900KS_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24  # Same topology as 13950HX
+I9_14900K_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24   # Same topology as 13950HX/14900KS
 
 HYBRID_CPU_CONFIGS: Dict[str, CPUConfig] = {
     "i9-13950HX": {
@@ -134,13 +137,41 @@ HYBRID_CPU_CONFIGS: Dict[str, CPUConfig] = {
         "e_cores_logical": list(range(16, 24)),
         "p_core_count": 8,
         "total_p_threads": 16
+    },
+    "i9-14900KS": {
+        "p_cores_physical": list(range(8)),
+        "p_cores_logical": list(range(16)),
+        "e_cores_logical": list(range(16, 32)),
+        "p_core_count": 8,
+        "total_p_threads": 16
+    },
+    "i9-14900K": {
+        "p_cores_physical": list(range(8)),
+        "p_cores_logical": list(range(16)),
+        "e_cores_logical": list(range(16, 32)),
+        "p_core_count": 8,
+        "total_p_threads": 16
     }
 }
 
 CPU_CONFIG: Optional[CPUConfig] = None
-if I9_13950HX_DETECTED:
-    CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]
-    print("🔥 i9-13950HX detected! P-core optimization available.")
+if I9_13950HX_DETECTED or I9_14900KS_DETECTED or I9_14900K_DETECTED:
+    # Need to distinguish between CPUs since they have identical core topology
+    import platform
+    cpu_name = platform.processor().upper()
+    if "14900KS" in cpu_name:
+        CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-14900KS"]
+        print("🔥 i9-14900KS detected! P-core optimization available.")
+    elif "14900K" in cpu_name:
+        CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-14900K"]
+        print("🔥 i9-14900K detected! P-core optimization available.")
+    elif "13950HX" in cpu_name:
+        CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]
+        print("🔥 i9-13950HX detected! P-core optimization available.")
+    else:
+        # Fallback to generic detection if specific model isn't found in processor string
+        CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]  # Use as default for this topology
+        print("🔥 Intel 13th/14th gen hybrid CPU detected! P-core optimization available.")
 
 def get_optimal_workers(mode: str = "optimal") -> int:
     if not CPU_CONFIG:
@@ -512,7 +543,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                     if k == "__meta__": 
                         continue
                     print(f"   {k}: {v if not isinstance(v, list) else f'list[{len(v)}]'}")
-            return {k: v for k, v in cached.items() if k != "_metadata"}  # prefer new __meta__
+            return {k: v for k, v in cached.items() if k not in ("_metadata", "__meta__")}
         except Exception:
             # fall through to re-calculate
             if verbose:
@@ -561,12 +592,17 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         mosk_dir_hint = ">" if s_da >= s_se else "<"  # heuristic; also provide empirical below
 
         used = 0
+        # For Hybrid sweeps, the generator must be MoSK to avoid mapping 0/1 to (DA,DA)
+        # with different amplitudes. This ensures DA-only vs SERO-only samples.
         for seed in seeds[:max_seeds]:
             used += 1
-            cal_cfg['pipeline']['random_seed'] = seed
+            # IMPORTANT: force MoSK generator to produce true DA-only / SERO-only symbols
+            cal_cfg_mosk = deepcopy(cal_cfg)
+            cal_cfg_mosk['pipeline']['modulation'] = 'MoSK'      # <—— key line
+            cal_cfg_mosk['pipeline']['random_seed'] = seed
 
-            r_da = run_calibration_symbols(cal_cfg, 0, mode='MoSK')  # DA class
-            r_se = run_calibration_symbols(cal_cfg, 1, mode='MoSK')  # SERO class
+            r_da = run_calibration_symbols(cal_cfg_mosk, 0, mode='MoSK')  # DA class
+            r_se = run_calibration_symbols(cal_cfg_mosk, 1, mode='MoSK')  # SERO class
             if r_da and 'q_values' in r_da:
                 mosk_stats['da'].extend(_clean(r_da['q_values']))
             if r_se and 'q_values' in r_se:
@@ -605,12 +641,20 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         # --- NEW: persist MoSK detector metadata so decoding matches calibration ---
         # Decision statistic used during calibration:
         thresholds['mosk_statistic'] = 'sign_aware_diff'  # D = (sgn(qeff_DA)*q_da - sgn(qeff_SERO)*q_sero) / sigma_diff
-        thresholds['mosk_direction'] = '>'     # DA wins when stat > threshold
-
+        # Calculate empirical direction from collected data
+        emp_dir = None
+        if mosk_stats['da'] and mosk_stats['sero']:
+            if float(np.mean(mosk_stats['da'])) > float(np.mean(mosk_stats['sero'])):
+                emp_dir = ">"
+            else:
+                emp_dir = "<"
+        
+        # Use empirical direction from data; fall back to sign hint
+        chosen_dir = emp_dir if emp_dir else mosk_dir_hint
+        thresholds['mosk_direction'] = chosen_dir     # DA wins when stat > threshold
+        
         # Comparator direction hint:
-        # For D as above, symbol-0 (DA) should typically be chosen when D > tau
-        # unless you explicitly inverted the sign definition elsewhere.
-        thresholds['mosk_comparator'] = '>'
+        thresholds['mosk_comparator'] = chosen_dir
 
         # Persist q_eff signs for sanity/debug
         try:
@@ -623,13 +667,6 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             'normalization': 'sigma_diff'
         })
 
-        # Also store empirical comparator hint (based on means of D)
-        emp_dir = None
-        if mosk_stats['da'] and mosk_stats['sero']:
-            if float(np.mean(mosk_stats['da'])) > float(np.mean(mosk_stats['sero'])):
-                emp_dir = ">"
-            else:
-                emp_dir = "<"
         thresholds['mosk_direction_hint'] = mosk_dir_hint
         thresholds['mosk_direction_empirical'] = emp_dir if emp_dir else mosk_dir_hint
 
@@ -925,6 +962,38 @@ def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
     
     return cfg
 
+def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    """Apply CLI argument overrides to configuration."""
+    
+    # Decision window overrides
+    if args.decision_window_policy is not None:
+        cfg.setdefault('detection', {})['decision_window_policy'] = args.decision_window_policy
+    
+    if args.decision_window_frac is not None:
+        cfg.setdefault('detection', {})['decision_window_fraction'] = float(args.decision_window_frac)
+        # Validate range
+        if not (0.1 <= args.decision_window_frac <= 1.0):
+            raise ValueError(f"--decision-window-frac must be between 0.1 and 1.0, got {args.decision_window_frac}")
+    
+    # Analysis overrides
+    if args.allow_ts_exceed:
+        cfg.setdefault('analysis', {})['allow_ts_exceed'] = True
+    
+    if args.ts_cap_s is not None:
+        cfg.setdefault('analysis', {})['ts_cap_s'] = float(args.ts_cap_s)
+    
+    # Pipeline overrides
+    if args.isi_memory_cap is not None:
+        cfg.setdefault('pipeline', {})['isi_memory_cap_symbols'] = int(args.isi_memory_cap)
+    
+    if args.guard_factor is not None:
+        cfg.setdefault('pipeline', {})['guard_factor'] = float(args.guard_factor)
+        # Validate range
+        if not (0.0 <= args.guard_factor <= 1.0):
+            raise ValueError(f"--guard-factor must be between 0.0 and 1.0, got {args.guard_factor}")
+    
+    return cfg
+
 def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> float:
     D_da = cfg['neurotransmitters']['DA']['D_m2_s']
     lambda_da = cfg['neurotransmitters']['DA']['lambda']
@@ -1115,11 +1184,85 @@ def _value_key(v):
 
 # ENHANCEMENT: Export the canonical value key formatter for consistency across modules
 def canonical_value_key(v):
+    """Convert a numeric parameter value to a standard string key for CSV/cache lookups."""
+    if isinstance(v, (int, float)):
+        return f"{float(v):.10g}"
+    return str(v)
+
+def _auto_refine_nm_points_from_df(df: pd.DataFrame,
+                                   target: float = 0.01,
+                                   extra_points: int = 2,
+                                   nm_min: int = 50,
+                                   nm_max: int = 100_000) -> List[int]:
     """
-    Canonical value key formatter exported for use by other modules.
-    Ensures consistent Nm formatting between cache writers and readers.
+    Given a SER vs Nm dataframe, find the first (lo, hi) pair that brackets `target`
+    (SER decreases with Nm), and return up to `extra_points` **log-spaced** Nm's
+    between them. Already-existing Nm's are filtered out by the caller.
+
+    Expects columns: one Nm column ('pipeline_Nm_per_symbol' or 'pipeline.Nm_per_symbol')
+    and 'ser'.
     """
-    return _value_key(v)
+    if df is None or df.empty:
+        return []
+
+    # Resolve Nm column
+    nm_col = None
+    for c in ("pipeline_Nm_per_symbol", "pipeline.Nm_per_symbol"):
+        if c in df.columns:
+            nm_col = c
+            break
+    if nm_col is None or 'ser' not in df.columns:
+        return []
+
+    # Clean + sort + drop duplicate Nm's (keep last)
+    d = df[[nm_col, 'ser']].copy()
+    d[nm_col] = pd.to_numeric(d[nm_col], errors='coerce')
+    d['ser'] = pd.to_numeric(d['ser'], errors='coerce')
+    d = d.dropna().drop_duplicates(subset=[nm_col], keep='last').sort_values(nm_col)
+
+    if d.empty:
+        return []
+
+    # Find first bracket: previous SER > target and current SER <= target
+    nms = d[nm_col].to_numpy(dtype=float)
+    sers = d['ser'].to_numpy(dtype=float)
+
+    lo, hi = None, None
+    for i in range(1, len(d)):
+        prev, curr = float(sers[i-1]), float(sers[i])
+        if (prev > target) and (curr <= target):
+            lo = int(round(nms[i-1]))
+            hi = int(round(nms[i]))
+            break
+
+    if lo is None or hi is None:
+        # No bracket in coarse grid -> nothing to refine (you could optionally
+        # schedule an out-of-range probe here, but we keep it minimal).
+        return []
+
+    # Clamp and sanity
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(nm_min, lo)
+    hi = min(nm_max, hi)
+    if hi - lo <= 1:
+        return []
+
+    # Generate log-spaced splits between lo and hi:
+    #   extra_points=1 -> one midpoint (geom. mean)
+    #   extra_points=2 -> thirds in log space, etc.
+    k = max(1, int(extra_points))
+    mids: List[int] = []
+    for j in range(1, k + 1):
+        alpha = j / (k + 1)  # 1/(k+1), 2/(k+1), ...
+        mid = int(round((lo ** (1.0 - alpha)) * (hi ** alpha)))
+        # Keep strictly inside the bracket
+        mid = min(max(mid, lo + 1), hi - 1)
+        mids.append(mid)
+
+    # Unique, sorted
+    mids = sorted({m for m in mids if lo < m < hi})
+    return mids
 
 # --- Stage 13 helpers: confidence intervals / screening ---
 def _wilson_halfwidth(k: int, n: int, z: float = 1.96) -> float:
@@ -1221,6 +1364,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--extreme-mode", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--disable-isi", action="store_true", help="Disable ISI (runtime). Default is enabled.")
+    parser.add_argument("--isi-sweep", choices=["auto", "always", "never"],
+                        default="always",
+                        help="Run ISI trade-off sweep: always (default), auto (only when ISI enabled), or never.")
     parser.add_argument("--debug-calibration", action="store_true", help="Print detailed calibration information")
     parser.add_argument("--csk-level-scheme", choices=["uniform", "zero-based"], default="uniform",
                        help="CSK level mapping scheme")
@@ -1293,6 +1439,27 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--nm-grid", type=str, default="",
                         help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
                              "If not provided, uses cfg['Nm_range'] from YAML.")
+    # NEW: Decision window and ISI optimization toggles
+    parser.add_argument("--decision-window-policy", choices=["fixed", "fraction_of_Ts", "full_Ts"], default=None,
+                   help="Override decision window policy")
+    parser.add_argument("--decision-window-frac", type=float, default=None,
+                   help="Decision window fraction for fraction_of_Ts policy")
+    parser.add_argument("--allow-ts-exceed", action="store_true",
+                   help="Allow Ts to exceed limits during LoD sweeps")
+    parser.add_argument("--ts-cap-s", type=float, default=None,
+                   help="Symbol period cap in seconds")
+    parser.add_argument("--isi-memory-cap", type=int, default=None,
+                   help="ISI memory cap in symbols")
+    parser.add_argument("--guard-factor", type=float, default=None,
+                   help="Override guard factor for ISI calculations")
+    
+    # ------ SER auto-refine near target SER ------
+    parser.add_argument("--ser-refine", action="store_true",
+                   help="After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER.")
+    parser.add_argument("--ser-target", type=float, default=0.01,
+                   help="Target SER for auto-refine (default: 0.01).")
+    parser.add_argument("--ser-refine-points", type=int, default=2,
+                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 2).")
     
     # Window guard tuning (Issue 2 optimization)
     parser.add_argument("--min-decision-points", type=int, default=4,
@@ -1421,8 +1588,14 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             i0 = int((1.0 - tail) * n_detect_samples)
 
             use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
-            q_da = float(np.trapezoid(((ig - ic) if use_ctrl else ig)[i0:n_detect_samples], dx=dt))
-            q_sero = float(np.trapezoid(((ia - ic) if use_ctrl else ia)[i0:n_detect_samples], dx=dt))
+            # For MoSK, do NOT subtract CTRL from the charges; for CSK/Hybrid keep the existing behavior.
+            subtract_for_q = (mode != "MoSK") and use_ctrl
+            
+            q_da_series   = (ig - ic) if subtract_for_q else ig
+            q_sero_series = (ia - ic) if subtract_for_q else ia
+            
+            q_da   = float(np.trapezoid(q_da_series[i0:n_detect_samples],   dx=dt))
+            q_sero = float(np.trapezoid(q_sero_series[i0:n_detect_samples], dx=dt))
             
             q_da_values.append(q_da); q_sero_values.append(q_sero)
         
@@ -1434,12 +1607,24 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
                 sign_da = 1.0 if q_eff_da >= 0 else -1.0
                 sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
                 
-                rho_cc = float(cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
-                sigma_diff = math.sqrt(sigma_da*sigma_da + sigma_sero*sigma_sero - 2.0*rho_cc*sigma_da*sigma_sero)
+                # FIX: For MoSK, never subtract CTRL from the statistic itself.
+                # Use CTRL only via the (reduced) cross-correlation in the denominator.
+                cal_use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
+                # For MoSK, use pre-CTRL correlation since we don't subtract CTRL from charges
+                if mode == "MoSK":
+                    rho_cc = float(cal_cfg.get('noise', {}).get('rho_corr', 0.9))
+                else:
+                    rho_cc = float(cal_cfg.get('noise', {}).get(
+                        'rho_between_channels_after_ctrl' if cal_use_ctrl else 'rho_corr',
+                        0.9
+                    ))
+                sigma_diff = math.sqrt(
+                    sigma_da*sigma_da + sigma_sero*sigma_sero - 2.0*rho_cc*sigma_da*sigma_sero
+                )
                 if sigma_diff <= 1e-15:
                     sigma_diff = 1e-15
-                # Fix: Use sign-aware difference to match runtime
-                D = (sign_da * q_da - sign_sero * q_sero) / sigma_diff
+                # Always use optimal sign-aware difference (no CTRL subtraction)
+                D = (sign_da * q_da - sign_sero * q_sero) / max(sigma_diff, 1e-15)
                 decision_stats.append(float(D))
             elif mode.startswith("CSK"):
                 if use_dual:
@@ -1582,7 +1767,8 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             cal_seeds = list(range(10))
             thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds, recalibrate)
             for k, v in thresholds.items():
-                cfg_run['pipeline'][k] = v
+                if not str(k).startswith("__"):
+                    cfg_run['pipeline'][k] = v
             if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
                 target_ch = cfg_run['pipeline'].get('csk_target_channel', 'DA').lower()
                 key = f'csk_thresholds_{target_ch}'
@@ -1954,24 +2140,30 @@ def run_sweep(cfg: Dict[str, Any],
         med_sigma_sero = float(np.nanmedian(ns_sero)) if any(np.isfinite(ns_sero)) else float('nan')
         med_sigma_diff = float(np.nanmedian(ns_diff)) if any(np.isfinite(ns_diff)) else float('nan')
 
+        mode_name = cfg['pipeline']['modulation']
+        snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
+                        if mode_name in ("MoSK", "Hybrid") else
+                        "CSK Q-statistic (dual-channel combiner)")
+
         row: Dict[str, Any] = {
             sweep_param: v,
             'ser': ser,
             'snr_db': snr_db,
+            'snr_semantics': snr_semantics,  # <-- NEW
             'num_runs': len(results),
-            'symbols_evaluated': int(total_symbols),  # NEW: for 95% CI calculations
-            'sequence_length': int(cfg['pipeline']['sequence_length']),  # NEW: for 95% CI calculations
+            'symbols_evaluated': int(total_symbols),
+            'sequence_length': int(cfg['pipeline']['sequence_length']),
             'isi_enabled': isi_enabled,
             'isi_memory_symbols': isi_memory_symbols,
             'symbol_period_s': symbol_period_s,
             'decision_window_s': decision_window_s,
             'isi_overlap_ratio': isi_overlap_mean,
-            'noise_sigma_da': med_sigma_da,           # NEW
-            'noise_sigma_sero': med_sigma_sero,         # NEW
-            'noise_sigma_I_diff': med_sigma_diff,       # NEW
-            'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),  # NEW: Add rho_cc
-            'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),  # persist CTRL flag
-            'mode': cfg['pipeline']['modulation'],
+            'noise_sigma_da': med_sigma_da,
+            'noise_sigma_sero': med_sigma_sero,
+            'noise_sigma_I_diff': med_sigma_diff,
+            'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
+            'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+            'mode': mode_name,
         }
         # Duplicate Nm column name for plotting compatibility
         if sweep_param == 'pipeline.Nm_per_symbol':
@@ -2402,7 +2594,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             
             # NEW: LoD down-step confirmation accelerator
             # Try a more aggressive value with minimal seeds for fast screening
-            nm_probe = max(nm_min, int(nm_mid / math.sqrt(2)))  # ~0.7x current
+            nm_probe = max(nm_min, int(0.60 * nm_mid))  # was int(nm_mid / sqrt(2))
             if nm_probe < nm_mid and nm_probe >= nm_min:
                 print(f"      [{dist_um}μm|{ctrl_str}] 🚀 Down-step probe: testing Nm={nm_probe} with {min(3, len(seeds))} seeds")
                 
@@ -2973,11 +3165,8 @@ def _canonical_nt_key(cfg: Dict[str, Any], name: str) -> Optional[str]:
     # Stage 2: Alias lookup
     aliases = {
         'ach': 'ACh', 'acetylcholine': 'ACh',
-        'da': 'DA', 'dopamine': 'DA', 
-        'da': 'DA', 'datamate': 'DA',
-        'sero': 'SERO',  # redundant but explicit
-        # Add more as needed:
-        'serotonin': 'SERO', 'sero': 'SERO',
+        'da': 'DA', 'dopamine': 'DA', 'datamate': 'DA',
+        'sero': 'SERO', 'serotonin': 'SERO',
         'norepinephrine': 'NE', 'ne': 'NE'
     }
     
@@ -3054,6 +3243,57 @@ def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_
             subset = [nm_key] + (['use_ctrl'] if 'use_ctrl' in combined.columns else [])
             combined = combined.drop_duplicates(subset=subset, keep='last')
             _atomic_write_csv(out_csv, combined)
+
+            # --- Apply SER auto-refine to this NT-pair if enabled ---
+        if args.ser_refine:
+            try:
+                # Read the final CSV back for this pair to get the most recent results
+                df_pair_final = pd.read_csv(out_csv) if out_csv.exists() else df_pair
+
+                # Find refine candidates for this pair around the target SER
+                refine_candidates = _auto_refine_nm_points_from_df(
+                    df_pair_final,
+                    target=float(args.ser_target),
+                    extra_points=int(args.ser_refine_points)
+                )
+
+                # Filter out any Nm that are already present for this CTRL state
+                if refine_candidates:
+                    desired_ctrl = bool(cfg_pair['pipeline'].get('use_control_channel', True))
+                    done_pair = load_completed_values(out_csv, 'pipeline_Nm_per_symbol', desired_ctrl)
+                    refine_candidates = [n for n in refine_candidates if canonical_value_key(n) not in done_pair]
+
+                if refine_candidates:
+                    print(f"    🔎 SER auto-refine for {first}-{second} around {args.ser_target:.2%}: {refine_candidates}")
+
+                    # Run the refine points for this specific NT pair
+                    df_refined_pair = run_sweep(
+                        cfg_pair, seeds,
+                        'pipeline.Nm_per_symbol',
+                        [float(n) for n in refine_candidates],
+                        f"SER refine near {args.ser_target:.2%} (CSK {first}-{second})",
+                        progress_mode=args.progress,
+                        persist_csv=out_csv,
+                        resume=args.resume,
+                        debug_calibration=args.debug_calibration,
+                        cache_tag=f"{pair_tag}_refine"  # Separate cache tag for refine
+                    )
+
+                    # Re-de-dupe the CSV again
+                    if out_csv.exists():
+                        existing_pair = pd.read_csv(out_csv)
+                        nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in existing_pair.columns else 'pipeline.Nm_per_symbol'
+                        combined_pair = existing_pair if df_refined_pair.empty else pd.concat([existing_pair, df_refined_pair], ignore_index=True)
+                        if 'use_ctrl' in combined_pair.columns:
+                            combined_pair = combined_pair.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values([nm_key, 'use_ctrl'])
+                        else:
+                            combined_pair = combined_pair.drop_duplicates(subset=[nm_key], keep='last').sort_values([nm_key])
+                        _atomic_write_csv(out_csv, combined_pair)
+                        print(f"    ✅ SER auto-refine for {first}-{second} completed; CSV updated")
+                else:
+                    print(f"    ℹ️  SER auto-refine for {first}-{second}: no bracket found or all refine Nm already present.")
+            except Exception as e:
+                print(f"    ⚠️  SER auto-refine for {first}-{second} failed: {e}")
 
     print("✓ NT-pair sweeps complete; comparative figure will be generated by generate_comparative_plots.py")
 
@@ -3188,6 +3428,21 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
 
 # ============= MAIN =============
 def run_one_mode(args: argparse.Namespace, mode: str) -> None:
+    # Avoid double‑installing tee logging (it is already set in main())
+    if not args.no_log:
+        root = logging.getLogger()
+        if not any(hasattr(h, "baseFilename") for h in root.handlers):
+            setup_tee_logging(Path(args.logdir), prefix="run_final_analysis", fsync=args.fsync_logs)
+    else:
+        print("[log] File logging disabled by --no-log")
+    cfg = preprocess_config_full(yaml.safe_load(open(project_root / "config" / "default.yaml", encoding='utf-8')))
+    
+    # NEW: Apply CLI overrides
+    cfg = apply_cli_overrides(cfg, args)
+    
+    # Apply CTRL ablation control
+    use_ctrl = args.use_ctrl
+    cfg['pipeline']['use_control_channel'] = use_ctrl
     # Build session metadata for GUI context
     session_meta = {
         "modes": [mode],
@@ -3295,9 +3550,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         except ValueError as e:
             print(f"⚠️  Invalid --nm-grid format: {args.nm_grid}. Error: {e}")
             print("   Using YAML default instead.")
-            nm_values = list(cfg.get('Nm_range', [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200]))
+            nm_values = list(cfg.get('Nm_range', [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000]))
     else:
-        nm_values = list(cfg.get('Nm_range', [250,350,500,700,1000,1400,2000,2800,4000,5600,8000,11200]))
+        nm_values = list(cfg.get('Nm_range', [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000]))
         print(f"📋 Using YAML Nm_range: {nm_values}")
     distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
@@ -3405,6 +3660,61 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         if overall_manual is None:
             overall_manual = pm.task(total=3, description=f"{mode} Progress")
         overall_manual.update(1, description=f"{mode} - SER vs Nm completed")
+
+    # --- Auto-refine near target SER (adds a few Nm points between the bracket) ---
+    if args.ser_refine:
+        try:
+            # Always read the latest CSV on disk so resume/de-dupe is consistent
+            df_ser_all = pd.read_csv(ser_csv) if ser_csv.exists() else df_ser_nm
+
+            # Propose midpoints between the first bracket that crosses the target
+            refine_candidates = _auto_refine_nm_points_from_df(
+                df_ser_all,
+                target=float(args.ser_target),
+                extra_points=int(args.ser_refine_points)
+            )
+
+            # Filter out any Nm that are already present for THIS CTRL state
+            if refine_candidates:
+                desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+                done = load_completed_values(ser_csv, 'pipeline_Nm_per_symbol', desired_ctrl)
+                refine_candidates = [n for n in refine_candidates if canonical_value_key(n) not in done]
+
+            if refine_candidates:
+                print(f"🔎 SER auto-refine around {args.ser_target:.2%}: {refine_candidates}")
+
+                # Run only those extra Nm points and append to the same CSV (resume-safe)
+                ser_refine_key = ("sweep", mode, "SER_refine")
+                df_refined = run_sweep(
+                    cfg, seeds,
+                    'pipeline.Nm_per_symbol',
+                    [float(n) for n in refine_candidates],
+                    f"SER refine near {args.ser_target:.2%} ({mode})",
+                    progress_mode=args.progress,
+                    persist_csv=ser_csv,
+                    resume=args.resume,
+                    debug_calibration=args.debug_calibration,
+                    pm=pm,
+                    sweep_key=ser_refine_key if (args.progress == "gui") else None,
+                    parent_key=mode_key if (args.progress == "gui") else None,
+                    recalibrate=args.recalibrate
+                )
+
+                # Re‑de‑dupe the CSV so plots read a clean file
+                if ser_csv.exists():
+                    existing = pd.read_csv(ser_csv)
+                    nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in existing.columns else 'pipeline.Nm_per_symbol'
+                    combined = existing if df_refined.empty else pd.concat([existing, df_refined], ignore_index=True)
+                    if 'use_ctrl' in combined.columns:
+                        combined = combined.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values([nm_key, 'use_ctrl'])
+                    else:
+                        combined = combined.drop_duplicates(subset=[nm_key], keep='last').sort_values([nm_key])
+                    _atomic_write_csv(ser_csv, combined)
+                    print(f"✅ SER auto-refine appended; CSV updated: {ser_csv}")
+            else:
+                print(f"ℹ️  SER auto-refine: no bracket found or all refine Nm already present.")
+        except Exception as e:
+            print(f"⚠️  SER auto-refine failed: {e}")
 
     # ---------- 1′) HDS grid (Hybrid only): Nm × distance with component errors ----------
     if mode == "Hybrid":
@@ -3872,20 +4182,30 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             overall_manual = pm.task(total=3, description=f"{mode} Progress")
         overall_manual.update(1, description=f"{mode} - LoD vs Distance completed")
 
+    # Around line 3889 in run_final_analysis.py
     if not df_lod.empty:
         cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
         print(f"\nLoD vs Distance (head) for {mode}:")
         print(df_lod[cols_to_show].head().to_string(index=False))
 
     # ---------- 3) ISI trade-off (guard-factor sweep) ----------
-    if cfg['pipeline'].get('enable_isi', True):
+    # BEFORE the sweep
+    do_isi = False
+    if args.isi_sweep == "always":
+        do_isi = True
+    elif args.isi_sweep == "auto":
+        do_isi = bool(cfg['pipeline'].get('enable_isi', False))
+    else:  # "never"
+        do_isi = False
+
+    if do_isi:
         print("\n3. Running ISI trade-off sweep (guard factor)…")
-        # Representative distance: use current distance from cfg
-        # (user can change default distance in config/default.yaml)
+        # ensure ISI ON during the sweep
+        cfg['pipeline']['enable_isi'] = True
+        
+        isi_jobs = len(guard_values) * len(seeds)
         guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
         isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
-        # Ensure ISI is enabled for this sweep
-        cfg['pipeline']['enable_isi'] = True
         pm.set_status(mode=mode, sweep="ISI trade-off")
         isi_key = ("sweep", mode, "ISI_tradeoff")
         isi_bar = None
@@ -3904,7 +4224,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             pm=pm,
             sweep_key=isi_key if hierarchy_supported else None,
             parent_key=mode_key if hierarchy_supported else None,
-            recalibrate=args.recalibrate  # <-- THIS LINE NEEDS TO BE ADDED
+            recalibrate=args.recalibrate
         )
         if isi_bar: isi_bar.close()
         # De-duplicate by (guard_factor, use_ctrl)
@@ -3963,7 +4283,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             else:
                 print(f"✓ ISI grid exists: {isi_grid_csv}")
     else:
-        print("\n3. ISI trade-off sweep skipped (ISI disabled).")
+        print(f"\n3. ISI trade-off sweep skipped by --isi-sweep={args.isi_sweep}.")
 
     elapsed = time.time() - start_time
     print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
