@@ -646,6 +646,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Hybrid Multi-Dimensional Benchmarks")
     parser.add_argument("--realistic-onsi", action="store_true", 
                         help="Use simulation-measured noise for ONSI (vs thermal proxy)")
+    parser.add_argument(
+        "--hds-csk-mode",
+        choices=["additive", "conditional", "effective"],
+        default="effective",
+        help="Which CSK contour to draw in the HDS panel"
+    )
     args = parser.parse_args()
     
     apply_ieee_style()
@@ -696,7 +702,19 @@ def main() -> None:
         # Build pivot tables for total SER and components
         g = df.pivot_table(index="distance_um", columns=nmcol, values="ser", aggfunc="median")
         g_mosk = df.pivot_table(index="distance_um", columns=nmcol, values="mosk_ser", aggfunc="median")
-        g_csk = df.pivot_table(index="distance_um", columns=nmcol, values="csk_ser", aggfunc="median")
+
+        # Choose CSK column based on mode
+        csk_col = "csk_ser"
+        if args.hds_csk_mode == "conditional" and "csk_ser_cond" in df.columns:
+            csk_col = "csk_ser_cond"
+        elif args.hds_csk_mode == "effective" and all(c in df.columns for c in ["csk_ser_cond", "mosk_exposure_frac"]):
+            # Compute effective CSK if not precomputed
+            if "csk_ser_eff" not in df.columns:
+                df["csk_ser_eff"] = pd.to_numeric(df["csk_ser_cond"], errors="coerce") * \
+                                    pd.to_numeric(df["mosk_exposure_frac"], errors="coerce")
+            csk_col = "csk_ser_eff"
+
+        g_csk = df.pivot_table(index="distance_um", columns=nmcol, values=csk_col, aggfunc="median")
 
         if g.size > 0:
             # Coordinate grids
@@ -728,7 +746,8 @@ def main() -> None:
             
             # Labels for contours
             axA.clabel(cs_mosk, inline=True, fontsize=7, fmt="MoSK: %.0e")
-            axA.clabel(cs_csk, inline=True, fontsize=7, fmt="CSK: %.0e")
+            label_fmt = {"additive": "CSK: %.0e", "conditional": "CSK(cond): %.0e", "effective": "CSK(eff): %.0e"}[args.hds_csk_mode]
+            axA.clabel(cs_csk, inline=True, fontsize=7, fmt=label_fmt)
             
             # Legend for contour types
             from matplotlib.lines import Line2D
@@ -846,6 +865,27 @@ def main() -> None:
                         # Enhanced contour labels
                         axC.clabel(cs, inline=True, fontsize=8, fmt='%.3f bits/s',
                                   inline_spacing=3)
+                
+                # NEW: Optional overlay: CSK effective error contours (requires new columns)
+                if {'csk_ser_eff'}.issubset(df_grid.columns):
+                    p_eff = df_grid.pivot_table(index='distance_um', columns='guard_factor',
+                                                values='csk_ser_eff', aggfunc='median')
+                    if p_eff.size > 0 and np.isfinite(p_eff.values).any():
+                        X = np.linspace(float(p_eff.columns.min()), float(p_eff.columns.max()), p_eff.shape[1])
+                        Y = np.linspace(float(p_eff.index.min()), float(p_eff.index.max()), p_eff.shape[0])
+                        Xg, Yg = np.meshgrid(X, Y)
+                        Z = p_eff.values.astype(float)
+                        # Pick levels relative to observed range
+                        nz = Z[np.isfinite(Z)]
+                        if nz.size:
+                            vmax = float(np.nanmax(nz))
+                            # Typical error‑rate contours; adjust if your data shifts
+                            levels = [1e-3, 1e-2, 1e-1]
+                            levels = [l for l in levels if l <= vmax and l > 0]
+                            if levels:
+                                cs_eff = axC.contour(Xg, Yg, Z, levels=levels,
+                                                    colors='white', linestyles=':', linewidths=1.2, alpha=0.9)
+                                axC.clabel(cs_eff, inline=True, fontsize=7, fmt='CSK eff: %.0e')
                 
                 # Add performance insights annotation
                 max_throughput = np.nanmax(pivot.values)

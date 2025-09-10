@@ -289,6 +289,14 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--isi-memory-cap", str(args.isi_memory_cap)])
     if args.guard_factor is not None:
         cmd.extend(["--guard-factor", str(args.guard_factor)])
+    if getattr(args, 'lod_distance_timeout_s', None) is not None:
+        cmd.extend(["--lod-distance-timeout-s", str(args.lod_distance_timeout_s)])
+    if args.ts_warn_only:
+        cmd.append("--ts-warn-only")
+    if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
+        cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
+    if getattr(args, 'lod_max_nm', None) is not None:
+        cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
 
     # NEW: Forward SER auto-refine flags
     if args.ser_refine:
@@ -384,6 +392,14 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--isi-memory-cap", str(args.isi_memory_cap)])
     if args.guard_factor is not None:
         cmd.extend(["--guard-factor", str(args.guard_factor)])
+    if getattr(args, 'lod_distance_timeout_s', None) is not None:
+        cmd.extend(["--lod-distance-timeout-s", str(args.lod_distance_timeout_s)])
+    if args.ts_warn_only:
+        cmd.append("--ts-warn-only")
+    if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
+        cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
+    if getattr(args, 'lod_max_nm', None) is not None:
+        cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
 
     # NEW: Forward SER auto-refine flags
     if args.ser_refine:
@@ -475,6 +491,14 @@ def main() -> None:
                 help="Skip LoD when dynamic Ts exceeds this (seconds; pass-through)")
     p.add_argument("--max-ts-for-lod", type=float, default=None,
                 help="Optional Ts cutoff to skip LoD at a distance (pass-through)")
+    p.add_argument("--lod-distance-timeout-s", type=float, default=7200.0,
+                help="Per-distance time budget during LoD analysis. <=0 disables timeout (pass-through)")
+    p.add_argument("--ts-warn-only", action="store_true",
+                help="Issue warnings for long Ts instead of skipping (overrides all Ts limits; pass-through)")
+    p.add_argument("--watchdog-secs", type=int, default=1800,
+                help="Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through)")
+    p.add_argument("--lod-max-nm", type=int, default=500000,
+                help="Upper bound for Nm during LoD search (default: 500000; pass-through)")
     # Optimization tuning (pass-through to run_final_analysis.py)
     p.add_argument("--cal-eps-rel", type=float, default=0.01,
                    help="Adaptive calibration convergence threshold (pass-through)")

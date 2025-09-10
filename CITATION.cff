@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+title: "Tri‑Channel OECT Molecular Communication Simulator"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Your-Surname
+    given-names: Your-Given-Names
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+repository-code: "https://github.com/yourname/tri-channel-oect-mc"
+license: MIT
+keywords:
+  - molecular communication
+  - organic electrochemical transistor
+  - OECT
+  - GLU
+  - GABA
+  - CSK
+  - MoSK
+  - hybrid modulation
+version: "0.3.0"
+date-released: "2025-08-17"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Your-Surname
+      given-names: Your-Given-Names
+  title: "Tri‑Channel OECT Receiver for Dense Molecular Communications"
+  journal: "IEEE Transactions on Molecular, Biological and Multi-Scale Communications"
+  year: 2025
+  doi: "10.5281/zenodo.TBD"

@@ -509,6 +509,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     tx_history: List[Tuple[int, float]] = []
     subsymbol_errors = {'mosk': 0, 'csk': 0}
     thresholds_used = {}
+    mosk_correct = 0 
     
     # Generate transmitted symbols
     if mod == 'MoSK':
@@ -804,10 +805,13 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
             true_mol_bit = s_tx >> 1
             true_amp_bit = s_tx & 1
+            # Enhanced subsymbol error tracking:
             if b_hat != true_mol_bit:
                 subsymbol_errors['mosk'] += 1
-            elif l_hat != true_amp_bit:
-                subsymbol_errors['csk'] += 1
+            else:
+                mosk_correct += 1                # Count symbols that pass MoSK and "expose" CSK
+                if l_hat != true_amp_bit:
+                    subsymbol_errors['csk'] += 1
                 
     # Calculate errors
     errors = np.sum(tx_symbols != rx_symbols)
@@ -839,6 +843,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if mod == 'Hybrid':
         result['mosk_sigma_diff_used'] = float(sigma_diff_mosk)
         result['mosk_stat_units'] = 'normalized_by_sigma_diff_single_ended_preCTRL'
+        result['n_mosk_correct'] = int(mosk_correct)
 
     return result
 

@@ -110,6 +110,8 @@ detection:
 # -------- End-to-end pipeline --------
 pipeline:
   symbol_period_s: 20.0         # Ts from manuscript
+  lod_nm_max: 500000            # Maximum Nm for LoD search (was hardcoded 100k)
+  min_symbol_period_s: 5.0      # Minimum symbol period (was hardcoded 20s)
   distance_um: 50               # Changed from 100 to 50 as in code
   Nm_per_symbol: 1e7          # molecules per burst (was 5.0e4)
   sequence_length: 1000         # symbols per Monte-Carlo run

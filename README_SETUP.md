@@ -1,74 +1,62 @@
-# Setup (Latest Packages + Enhanced Features)
+# Setup (latest packages + enhanced features)
 
-**Python**: 3.11+ is required (SciPy≥1.16 requires Python≥3.11).  
-**OS**: Linux, macOS, or Windows. (Optional Tk for GUI progress.)
+**Python**: 3.11+ (SciPy≥1.16 & NumPy≥2.x toolchain)  
+**OS**: Linux, macOS, or Windows (64‑bit)
 
-## Quick start
+## Quick start (editable install)
 ```bash
 # from repo root
+pip install -e .[dev]
+python setup_project.py
+```
+
+## Managed environment (venv helper)
+
+Create a local virtualenv, install either always‑latest (`requirements.in`) or the frozen set (`requirements.latest.txt`), and perform an editable install:
+
+```bash
+# Latest packages + dev extras + editable install
 python setup_env.py --extras dev --editable
-# or, to reproduce the exact set we validated on 2025‑08‑17:
+
+# Reproduce the frozen set validated on 2025‑08‑17
 python setup_env.py --use-freeze --editable
 ```
 
-This creates `.venv/`, installs the latest dependencies (or the frozen set),
-and installs the package itself.
+To activate the environment:
+- **Linux/macOS:** `source .venv/bin/activate`  
+- **Windows (PowerShell):** `.venv\Scripts\Activate.ps1`
+
+Then verify and create folders:
+```bash
+python setup_project.py
+```
 
 ## Handy commands
 
-### Full paper suite (enhanced)
+Full paper suite (with resume & progress):
 ```bash
-# Sequential execution (traditional)
-python analysis/run_master.py --modes all --resume --progress rich --supplementary
-
-# Parallel execution (3x faster)
-python analysis/run_master.py --modes all --resume --progress rich --supplementary --parallel-modes 3
-
-# With custom logging
-python analysis/run_master.py --modes all --resume --progress rich --logdir ./paper_logs
+python analysis/run_master.py --modes all --resume --progress rich
 ```
 
-### Fast sanity checks
+Parallel (≈3× faster):
 ```bash
-# Single mode with reduced seeds
-python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --progress tqdm --resume
-
-# Parallel sanity check
-python analysis/run_final_analysis.py --mode ALL --num-seeds 4 --sequence-length 200 --parallel-modes 3
+python analysis/run_master.py --modes all --resume --progress rich --parallel-modes 3
 ```
 
-### Mechanism figure generation
+Fast sanity check (minutes):
 ```bash
-# Generate all notebook-replica mechanism figures
+python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm
+```
+
+Generate mechanism figures:
+```bash
 python analysis/rebuild_oect_figs.py
-python analysis/rebuild_binding_figs.py  
+python analysis/rebuild_binding_figs.py
 python analysis/rebuild_transport_figs.py
 python analysis/rebuild_pipeline_figs.py
-
-# Or run via master (included in nb_replicas step)
-python analysis/run_master.py --modes all
 ```
 
-## New Features
+## Notes
 
-### 🚀 Parallel Mode Execution
-- `--parallel-modes N`: Run N modulation modes concurrently
-- Thread-based orchestration with shared process pool
-- 3x speedup for full simulation suite
-- Automatic progress bar multiplexing with Rich backend
-
-### 📝 Real-Time Logging  
-- `--logdir DIR`: Custom log directory (default: results/logs/)
-- `--no-log`: Disable file logging
-- `--fsync-logs`: Force OS sync for critical systems
-- All console output mirrored to timestamped files in real-time
-- Monitor progress: `tail -f results/logs/run_master_*.log`
-
-### 🖼️ Notebook-Replica Figures
-- Detailed mechanism visualizations in `results/figures/notebook_replicas/`
-- OECT noise analysis (differential PSD, noise breakdown)
-- Binding kinetics (deterministic vs Monte Carlo, PSD analysis)
-- Transport/diffusion (concentration profiles, scaling analysis)  
-- End-to-end pipeline with ISI effects
-
-See the top‑level README for more on the simulator, figures, and tables.
+- Real‑time logging mirrors console output to `results/logs/*.log`.  
+- On macOS, the GUI backend may fall back to `rich` when running in background threads.

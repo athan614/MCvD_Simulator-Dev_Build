@@ -12,6 +12,7 @@ README:
 - If CI columns are absent, error bars are omitted gracefully.
 """
 import sys
+import argparse
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -196,6 +197,27 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                         linewidth=2, label='MoSK errors', marker='^', markersize=5)
                 ax2.loglog(dfh[nmcol], dfh['csk_ser'], color=colors['CSK'], linestyle='-.',
                         linewidth=2, label='CSK errors', marker='s', markersize=5)
+                
+                # Enhancement B: Add conditional CSK error overlay
+                if 'conditional_csk_ser' in dfh.columns:
+                    ax2.loglog(dfh[nmcol], dfh['conditional_csk_ser'], color='red', linestyle=':',
+                            linewidth=3, label='Conditional CSK error', marker='D', markersize=6, alpha=0.8)
+
+                    # Annotate MoSK exposure fraction at each point
+                    if 'mosk_exposure_frac' in dfh.columns:
+                        for i, row in dfh.iterrows():
+                            x_val = row[nmcol]
+                            y_val = row['conditional_csk_ser']
+                            mosk_frac = row['mosk_exposure_frac']
+                            # Only annotate if we have valid data
+                            if pd.notna(x_val) and pd.notna(y_val) and pd.notna(mosk_frac):
+                                ax2.annotate(f"{mosk_frac:.0%}", 
+                                           (x_val, y_val), 
+                                           xytext=(3, 3), 
+                                           textcoords='offset points',
+                                           fontsize=6, 
+                                           alpha=0.6,
+                                           ha='left')
 
     ax2.set_xlabel('Number of Molecules per Symbol (Nm)')
     ax2.set_ylabel('Error Rate')
@@ -224,31 +246,64 @@ def plot_figure_10_11_combined(results: Dict[str, Dict[str, pd.DataFrame]], save
     for mode in ['MoSK', 'CSK', 'Hybrid']:
         if mode in results and 'lod_vs_distance' in results[mode]:
             df = results[mode]['lod_vs_distance']
-            df_clean = df.dropna(subset=['lod_nm'])
             
-            if not df_clean.empty:
+            # Separate found and not-found points
+            if 'lod_found' in df.columns:
+                df_found = df[df['lod_found'] == True].copy()
+                df_notfound = df[df['lod_found'] == False].copy()
+            else:
+                # Fallback to NaN-based detection
+                df_found = df.dropna(subset=['lod_nm'])
+                df_notfound = df[df['lod_nm'].isna() | (df['lod_nm'] <= 0)]
+            
+            # Plot found LoDs
+            if not df_found.empty:
                 # Check if CTRL state separation is needed
-                if 'use_ctrl' in df_clean.columns and df_clean['use_ctrl'].nunique() > 1:
+                if 'use_ctrl' in df_found.columns and df_found['use_ctrl'].nunique() > 1:
                     # Separate plotting by CTRL state
-                    for ctrl_state, grp in df_clean.groupby('use_ctrl'):
+                    for ctrl_state, grp in df_found.groupby('use_ctrl'):
                         if grp.empty:
                             continue
-                        grp_sorted = grp.sort_values('distance_um')
+                        grp = grp.sort_values('distance_um')
+                        ls = '-' if ctrl_state else '--'
+                        suf = '' if ctrl_state else ' (no CTRL)'
+                        alpha = 0.9 if ctrl_state else 0.6
                         
-                        plt.semilogy(grp_sorted['distance_um'], grp_sorted['lod_nm'],
-                                     color=colors[mode], 
-                                     marker=markers[mode],
-                                     markersize=8,
-                                     label=f"{mode}{ctrl_labels[bool(ctrl_state)]}",
-                                     linewidth=2.2,
-                                     linestyle=ctrl_styles[bool(ctrl_state)],
-                                     alpha=0.9 if ctrl_state else 0.6)  # Fade no-CTRL slightly
+                        plt.semilogy(grp['distance_um'], grp['lod_nm'],
+                                     color=colors[mode], marker=markers[mode],
+                                     linestyle=ls, markersize=8, label=f"{mode}{suf}", 
+                                     linewidth=2.2, alpha=alpha)
                 else:
                     # Single CTRL state or no CTRL column - original behavior
-                    df_sorted = df_clean.sort_values('distance_um')
+                    df_sorted = df_found.sort_values('distance_um')
                     plt.semilogy(df_sorted['distance_um'], df_sorted['lod_nm'],
                                  color=colors[mode], marker=markers[mode],
                                  markersize=8, label=mode, linewidth=2.2)
+            
+            # Plot ceiling markers for not-found LoDs
+            if not df_notfound.empty:
+                # Get ceiling value from data or use configurable default
+                if 'lod_nm_ceiling' in df_notfound.columns:
+                    ceiling_nm = df_notfound['lod_nm_ceiling'].iloc[0]
+                else:
+                    # Load config to get the proper default instead of hardcoded 100000
+                    try:
+                        import yaml
+                        config_path = project_root / "config" / "default.yaml"
+                        if config_path.exists():
+                            with open(config_path) as f:
+                                config = yaml.safe_load(f)
+                            ceiling_nm = config.get('pipeline', {}).get('lod_nm_max', 500000)
+                        else:
+                            ceiling_nm = 500000  # Updated default fallback
+                    except Exception:
+                        ceiling_nm = 500000  # Updated default fallback
+                
+                # Use upward-pointing triangles with no fill to indicate "greater than ceiling"
+                plt.semilogy(df_notfound['distance_um'], [ceiling_nm] * len(df_notfound),
+                             color=colors[mode], marker='^', fillstyle='none',
+                             markersize=12, linestyle='none', alpha=0.7,
+                             markeredgewidth=2, label=f'{mode} (>{ceiling_nm/1000:.0f}k)')
     plt.xlabel('Distance (μm)')
     plt.ylabel('Limit of Detection (molecules)')
     plt.title('Figure 10: Comparative LoD vs. Distance')
@@ -527,4 +582,9 @@ def main():
     print("="*60)
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate comparative plots across all modulation schemes")
+    parser.add_argument("--lod-max-nm", type=int, default=100000,
+                        help="Upper bound for Nm during LoD search (default: 100000)")
+    args = parser.parse_args()
     main()

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from html import parser
 import sys
 import json
 import argparse
@@ -992,6 +993,10 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         if not (0.0 <= args.guard_factor <= 1.0):
             raise ValueError(f"--guard-factor must be between 0.0 and 1.0, got {args.guard_factor}")
     
+    # NEW: LoD maximum Nm override
+    if hasattr(args, 'lod_max_nm') and args.lod_max_nm is not None:
+        cfg.setdefault('pipeline', {})['lod_nm_max'] = int(args.lod_max_nm)
+    
     return cfg
 
 def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> float:
@@ -1001,7 +1006,11 @@ def calculate_dynamic_symbol_period(distance_um: float, cfg: Dict[str, Any]) -> 
     time_95 = 3.0 * ((distance_um * 1e-6)**2) / D_eff
     guard_factor = cfg['pipeline'].get('guard_factor', 0.1)
     guard_time = guard_factor * time_95
-    symbol_period = max(20.0, round(time_95 + guard_time))
+    dt = float(cfg['sim']['dt_s'])
+    raw = float(time_95 + guard_time)
+    # NEW: configurable minimum symbol period (default 5s, was hardcoded 20s)
+    min_Ts = float(cfg['pipeline'].get('min_symbol_period_s', 5.0))
+    symbol_period = max(min_Ts, math.ceil(raw / dt) * dt)
     return symbol_period
 
 def calculate_snr_from_stats(stats_a: List[float], stats_b: List[float]) -> float:
@@ -1193,7 +1202,7 @@ def _auto_refine_nm_points_from_df(df: pd.DataFrame,
                                    target: float = 0.01,
                                    extra_points: int = 2,
                                    nm_min: int = 50,
-                                   nm_max: int = 100_000) -> List[int]:
+                                   nm_max: int = 500_000) -> List[int]:
     """
     Given a SER vs Nm dataframe, find the first (lo, hi) pair that brackets `target`
     (SER decreases with Nm), and return up to `extra_points` **log-spaced** Nm's
@@ -1452,6 +1461,12 @@ def parse_arguments() -> argparse.Namespace:
                    help="ISI memory cap in symbols")
     parser.add_argument("--guard-factor", type=float, default=None,
                    help="Override guard factor for ISI calculations")
+    parser.add_argument("--lod-distance-timeout-s", type=float, default=7200.0,
+                        help="Per-distance time budget during LoD analysis. <=0 disables timeout.")
+    parser.add_argument("--lod-max-nm", type=int, default=500000,
+                        help="Upper bound for Nm during LoD search (default: 500000).")
+    parser.add_argument("--ts-warn-only", action="store_true",
+                        help="Issue warnings for long Ts instead of skipping (overrides all Ts limits)")
     
     # ------ SER auto-refine near target SER ------
     parser.add_argument("--ser-refine", action="store_true",
@@ -2018,7 +2033,7 @@ def run_sweep(cfg: Dict[str, Any],
             if pending and not CANCEL.is_set():  # Only process if we have pending futures
                 wd = int(cfg.get('_watchdog_secs', 600))  # NEW: Configurable timeout
                 try:
-                    done_fut = next(as_completed(pending, timeout=wd))
+                    done_fut = next(as_completed(pending, timeout=wd if (wd and wd > 0) else None))
                     # capture seed before removing from map
                     sid = fut_seed.pop(done_fut, -1)
                     pending.remove(done_fut)
@@ -2178,6 +2193,36 @@ def run_sweep(cfg: Dict[str, Any],
             row['mosk_ser'] = mosk_errors / total_symbols
             row['csk_ser'] = csk_errors / total_symbols
 
+            # Enhancement A: Add conditional CSK error for Hybrid mode
+            if mode_name == 'Hybrid':
+                total_hybrid_errors = mosk_errors + csk_errors
+                row['conditional_csk_ser'] = csk_errors / total_hybrid_errors if total_hybrid_errors > 0 else 0.0
+                row['mosk_exposure_frac'] = mosk_errors / total_hybrid_errors if total_hybrid_errors > 0 else 0.0
+                
+                # PATCH 2: Enhanced MoSK exposure tracking and conditional CSK aggregation
+                # Extract MoSK correct count from results for exposure analysis
+                mosk_correct_total = sum(cast(int, r.get('n_mosk_correct', 0)) for r in results)
+                
+                # Track conditional CSK errors given MoSK exposure
+                row['mosk_correct_total'] = mosk_correct_total
+                row['csk_exposure_rate'] = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
+                row['conditional_csk_error_given_exposure'] = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
+                
+                # Compute hybrid error attribution percentages
+                if total_symbols > 0:
+                    row['mosk_error_pct'] = (mosk_errors / total_symbols) * 100.0
+                    row['csk_error_pct'] = (csk_errors / total_symbols) * 100.0
+                    row['hybrid_total_error_pct'] = ((mosk_errors + csk_errors) / total_symbols) * 100.0
+                
+                # Enhancement C: Optional assertion during sweeps
+                if total_symbols > 0:
+                    total_reported_errors = sum(cast(int, r['errors']) for r in results)
+                    
+                    # Relaxed assertion allowing for potential edge cases
+                    if total_hybrid_errors > total_reported_errors * 1.1:  # 10% tolerance
+                        print(f"Warning: Component errors ({total_hybrid_errors}) exceed total errors "
+                              f"({total_reported_errors}) by >10% at {sweep_param}={v}")
+
         aggregated_rows.append(row)
         
         # Append this value's aggregated row immediately (crash‑safe)
@@ -2192,7 +2237,7 @@ def run_sweep(cfg: Dict[str, Any],
     return pd.DataFrame(aggregated_rows)
 
 # ============= LOD SEARCH =============
-def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser: float = 0.01) -> Tuple[int, int]:
+def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser: float = 0.01, nm_ceiling: int = 500000) -> Tuple[int, int]:
     """
     Gaussian SER approximation to bracket LoD. Safe + fast; no physics change.
     Returns (nm_min_guess, nm_max_guess) or (0, 0) if we can't estimate.
@@ -2232,7 +2277,7 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
                 cfg_p['detection']['decision_window_s'] = min_win
 
                 # thresholds at this Nm (few seeds, cached)
-                th = calibrate_thresholds_cached(cfg_p, seeds[:3])
+                th = calibrate_thresholds_cached(cfg_p, list(range(min(3, len(seeds)))))
                 for k, v in th.items():
                     cfg_p['pipeline'][k] = v
 
@@ -2294,9 +2339,9 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
                 # Check if both probes are far from target
                 if ser1 > 10*target_ser and ser2 > 10*target_ser:
                     # Both too high - increase Nm (shift probes up)
-                    # When both probes are far from target, expand but clamp to [50, 100000]
-                    probes = [max(50, min(100000, p)) for p in [p * 3 for p in probes]]
-                    if all(p == 100000 for p in probes) or all(p == 50 for p in probes):
+                    # When both probes are far from target, expand but clamp to [50, nm_ceiling]
+                    probes = [max(50, min(nm_ceiling, p)) for p in [p * 3 for p in probes]]
+                    if all(p == nm_ceiling for p in probes) or all(p == 50 for p in probes):
                         print("    ⚠️ Analytic probes saturated; aborting analytic bracket.")
                         break
                     print(f"    🔄 Analytic probes too high ({ser1:.1e}, {ser2:.1e} >> {target_ser:.1e}), expanding up: {probes}")
@@ -2331,7 +2376,7 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
             
             # Conservative bracket: ±50% around interpolated point
             nm_min_est = max(50, int(nm_t * 0.5))
-            nm_max_est = min(100000, int(nm_t * 1.5))
+            nm_max_est = min(nm_ceiling, int(nm_t * 1.5))
             
             print(f"    📊 Analytic interpolation: target SER {target_ser:.1e} → Nm ≈ {nm_t}, bracket [{nm_min_est}-{nm_max_est}]")
             return (nm_min_est, nm_max_est)
@@ -2343,15 +2388,72 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
         print(f"    ⚠️  Analytic bracketing failed: {e}")
         return (0, 0)
 
+def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int, 
+                              nm_ceiling: int, target_ser: float, seeds: List[int]) -> Tuple[int, int, Optional[str]]:
+    """
+    Validate and fix the LoD bracket to ensure SER(nm_min) > target >= SER(nm_max).
+    Returns (corrected_nm_min, corrected_nm_max, skip_reason_if_any).
+    """
+    # Quick validation with 3 seeds
+    quick_seeds = seeds[:min(3, len(seeds))]
+    
+    def _quick_ser(nm: int) -> float:
+        cfg_test = deepcopy(cfg_base)
+        cfg_test['pipeline']['Nm_per_symbol'] = nm
+        cfg_test['pipeline']['sequence_length'] = 100  # Short for speed
+        
+        results = []
+        for seed in quick_seeds:
+            res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm, seed,
+                                     sweep_name="bracket_validation")
+            if res:
+                results.append(res)
+        
+        if not results:
+            return 1.0  # Assume failure if no results
+        
+        total_symbols = len(results) * cfg_test['pipeline']['sequence_length']
+        total_errors = sum(int(r.get('errors', 0)) for r in results)
+        return total_errors / total_symbols if total_symbols > 0 else 1.0
+    
+    # Check lower bound
+    ser_min = _quick_ser(nm_min)
+    if ser_min <= target_ser:
+        # Lower bound too good, push it down
+        while nm_min > 50 and ser_min <= target_ser:
+            nm_min = max(50, int(nm_min / 2))
+            ser_min = _quick_ser(nm_min)
+    
+    # Check upper bound
+    ser_max = _quick_ser(nm_max)
+    if ser_max > target_ser:
+        # Upper bound not good enough, try to grow it
+        while nm_max < nm_ceiling and ser_max > target_ser:
+            nm_max = min(nm_ceiling, nm_max * 2)
+            ser_max = _quick_ser(nm_max)
+        
+        # If we hit ceiling and still can't achieve target
+        if nm_max >= nm_ceiling and ser_max > target_ser:
+            return nm_min, nm_max, "nm_ceiling_exhausted"
+    
+    # Final validation
+    if ser_min <= target_ser or ser_max > target_ser:
+        # Still invalid bracket
+        return nm_min, nm_max, "bracket_validation_failed"
+    
+    return nm_min, nm_max, None
+
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      target_ser: float = 0.01,
                      debug_calibration: bool = False,
                      progress_cb: Optional[Any] = None,
                      resume: bool = False,
                      cache_tag: Optional[str] = None) -> Tuple[Union[int, float], float, int]:
-    nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
-    nm_max = 100000
-    nm_max_default = nm_max  # Store original default
+    nm_min = int(cfg_base['pipeline'].get('lod_nm_min', 50))
+    # NEW: configurable ceiling replaces all hardcoded 100000 limits
+    nm_ceiling = int(cfg_base['pipeline'].get('lod_nm_max', 500000))  # Raised default
+    nm_max = nm_ceiling
+    nm_max_default = nm_ceiling
 
     # NEW: Try analytic bracketing if enabled (experimental feature)
     analytic_bracket_cache = None  # Cache for analytic bracket result
@@ -2393,7 +2495,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 nm_max = min(upper_from_warm, upper_from_analytic, nm_max_default)
                 nm_min = max(nm_min, nm_min_analytic)
                 
-                print(f"    🔄 Warm + analytic intersect: [{nm_min} - {nm_max}] (capped at 100k)")
+                print(f"    🔄 Warm + analytic intersect: [{nm_min} - {nm_max}] (capped at {nm_ceiling})")
         else:
             # Pure warm-start without analytic constraints
             nm_max = min(nm_max_default, int(mult * warm))
@@ -2401,6 +2503,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     
     lod_nm: float = float('nan')
     best_ser: float = 1.0
+    best_nm: Optional[int] = None  # NEW: Track the Nm that gave best_ser
     dist_um = cfg_base['pipeline'].get('distance_um', 0)
     mode_name = cfg_base['pipeline']['modulation']
     use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
@@ -2440,7 +2543,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 nm_max = min(int(state.get("nm_max", nm_max)), min(succ))
             elif fail and not succ:
                 nm_min = max(int(state.get("nm_min", nm_min)), max(fail) + 1)
-                nm_max = min(100000, max(int(state.get("nm_max", nm_max)), max(fail) * 2))
+                nm_max = min(nm_ceiling, max(int(state.get("nm_max", nm_max)), max(fail) * 2))
             elif succ and not fail:
                 nm_min = max(50, int(min(succ) * 0.5))
                 nm_max = min(int(state.get("nm_max", nm_max)), min(succ))
@@ -2450,7 +2553,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             print("    ⚠️  Stale LoD state (nm_min>nm_max). Clearing state and restarting bracket.")
             _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}})
             nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
-            nm_max = 100000
+            nm_max = nm_ceiling
         else:
             print(f"    ↩️  Resuming LoD search @ {dist_um}μm: range {nm_min}-{nm_max}")
     if state:
@@ -2472,6 +2575,15 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         th = calibrate_thresholds_cached(cfg_tmp, list(range(6)))  # faster with fewer seeds
         th_cache[nm] = th
         return th
+    
+    # NEW: Validate and fix bracket before proceeding to bisection
+    nm_min, nm_max, skip_reason = _validate_and_fix_bracket(
+        cfg_base, nm_min, nm_max, nm_ceiling, target_ser, seeds
+    )
+
+    if skip_reason:
+        print(f"    [{dist_um}μm|{ctrl_str}] Skipping LoD search: {skip_reason}")
+        return float('nan'), 1.0, 0
 
     for iteration in range(20):
         if CANCEL.is_set():
@@ -2588,9 +2700,13 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
 
         print(f"      [{dist_um}μm|{ctrl_str}] Nm={nm_mid}: SER={ser:.4f} {'✓ PASS' if ser <= target_ser else '✗ FAIL'}")
 
+        # Track best attempt regardless of whether it passes
+        if ser < best_ser:
+            best_ser = ser
+            best_nm = nm_mid
+
         if ser <= target_ser:
             lod_nm = nm_mid
-            best_ser = ser
             
             # NEW: LoD down-step confirmation accelerator
             # Try a more aggressive value with minimal seeds for fast screening
@@ -2628,6 +2744,10 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                     decide_below, decide_above = _deterministic_screen(probe_k_err, probe_n_seen, total_planned, target_ser)
                     if decide_below:
                         # Probe passes! Skip bisection iterations
+                        probe_ser = probe_k_err / probe_n_seen if probe_n_seen > 0 else 1.0
+                        if probe_ser < best_ser:
+                            best_ser = probe_ser
+                            best_nm = nm_probe
                         print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS → skip to Nm={nm_probe}")
                         lod_nm = nm_probe
                         nm_max = nm_probe - 1
@@ -2664,7 +2784,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
 
     # OPTIMIZATION 1: Cap LoD validation retries
     # Only run a single-point validation when the bracket collapsed to one point
-    if math.isnan(lod_nm) and nm_min <= 100000 and nm_min == nm_max:
+    if math.isnan(lod_nm) and nm_min <= nm_ceiling and nm_min == nm_max:
         print(f"    [{dist_um}μm|{ctrl_str}] Final validation at Nm={nm_min}")
         cfg_final = deepcopy(cfg_base)
         cfg_final['pipeline']['Nm_per_symbol'] = nm_min
@@ -2727,8 +2847,12 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
                 return nm_min, final_ser, actual_progress
 
+    # Return best attempt if no solution found, otherwise return found solution
+    final_lod_nm = lod_nm if not math.isnan(lod_nm) else float('nan')
+    final_ser = best_ser  # Always return the best SER seen (either successful or closest attempt)
+    
     # Return actual count instead of constant
-    return lod_nm, best_ser, progress_count
+    return final_lod_nm, final_ser, progress_count
 
 def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
                                         lod_nm: int,
@@ -2850,35 +2974,58 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     actual_progress = 0  # Initialize before try block
     skipped_reason = None  # ✅ Initialize skipped_reason variable
     cfg = deepcopy(cfg_base)
-    Ts_dyn = calculate_dynamic_symbol_period(dist_um, cfg)
     
+    # ✅ FIX: Set distance before LoD search and rebuild window consistently
+    cfg['pipeline']['distance_um'] = float(dist_um)  # Bake distance into cfg
+    
+    # Recompute Ts and enforce a consistent minimum decision window
+    Ts_dyn = calculate_dynamic_symbol_period(float(dist_um), cfg)
+    cfg['pipeline']['symbol_period_s'] = Ts_dyn
+    min_win = _enforce_min_window(cfg, Ts_dyn)
+    cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
+    cfg.setdefault('detection', {})
+    cfg['detection']['decision_window_s'] = min_win
+    
+    # Check if Ts exceed flags are disabled
+    allow_ts = bool(getattr(args, "allow_ts_exceed", False))
+    if not allow_ts:
+        allow_ts = bool(cfg_base.get('analysis', {}).get('allow_ts_exceed', False))
+    # Check if we should only warn instead of skip
+    warn_only = bool(getattr(args, "ts_warn_only", False))
     # NEW: Check for Ts explosion and skip if too large (OPTIMIZATION 2)
     max_symbol_duration_s = cfg_base.get('max_symbol_duration_s', None)
-    if max_symbol_duration_s is not None and Ts_dyn > max_symbol_duration_s:
-        print(f"⚠️  Skipping distance {dist_um}μm: symbol period {Ts_dyn:.1f}s exceeds limit {max_symbol_duration_s}s")
-        return {
-            'distance_um': dist_um,
-            'lod_nm': float('nan'),
-            'ser_at_lod': float('nan'),
-            'data_rate_bps': 0.0,
-            'data_rate_ci_low': float('nan'),
-            'data_rate_ci_high': float('nan'),
-            'symbol_period_s': Ts_dyn,
-            'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
-        }
-    
+    if (not allow_ts) and (max_symbol_duration_s is not None) and (max_symbol_duration_s > 0) and (Ts_dyn > max_symbol_duration_s):
+        if warn_only:
+            print(f"⚠️  WARNING: distance {dist_um}μm has long symbol period {Ts_dyn:.1f}s (exceeds {max_symbol_duration_s}s), continuing anyway")
+            # Continue with LoD analysis instead of returning NaN
+        else:
+            print(f"⚠️  Skipping distance {dist_um}μm: symbol period {Ts_dyn:.1f}s exceeds limit {max_symbol_duration_s}s")
+            return {
+                'distance_um': dist_um,
+                'lod_nm': float('nan'),
+                'ser_at_lod': float('nan'),
+                'data_rate_bps': 0.0,
+                'data_rate_ci_low': float('nan'),
+                'data_rate_ci_high': float('nan'),
+                'symbol_period_s': Ts_dyn,
+                'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
+            }
     # Continue with existing logic for args.max_ts_for_lod (keep this too)
-    if args and getattr(args, "max_ts_for_lod", None) and Ts_dyn > float(args.max_ts_for_lod):
-        return {
-            'distance_um': dist_um, 'lod_nm': float('nan'), 'ser_at_lod': float('nan'),
-            'data_rate_bps': float('nan'), 'data_rate_ci_low': float('nan'), 'data_rate_ci_high': float('nan'),
-            'symbol_period_s': Ts_dyn, 'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-            'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
-            'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
-            'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
-            'actual_progress': 0, 'skipped_reason': f'Ts>{args.max_ts_for_lod}s'
-        }
-    cfg['pipeline']['symbol_period_s'] = Ts_dyn
+    cap_cli = getattr(args, "max_ts_for_lod", None) if args else None
+    if (not allow_ts) and (cap_cli is not None) and (float(cap_cli) > 0) and (Ts_dyn > float(cap_cli)):
+        if warn_only:
+            print(f"⚠️  WARNING: distance {dist_um}μm has long symbol period {Ts_dyn:.1f}s (exceeds CLI limit {cap_cli}s), continuing anyway")
+            # Continue with LoD analysis instead of returning NaN
+        else:
+            return {
+                'distance_um': dist_um, 'lod_nm': float('nan'), 'ser_at_lod': float('nan'),
+                'data_rate_bps': float('nan'), 'data_rate_ci_low': float('nan'), 'data_rate_ci_high': float('nan'),
+                'symbol_period_s': Ts_dyn, 'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+                'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
+                'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+                'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
+                'actual_progress': 0, 'skipped_reason': f'Ts>{cap_cli}s'
+            }
     
     # LoD search can use shorter sequences to bracket quickly
     if args and getattr(args, "lod_seq_len", None):
@@ -2887,6 +3034,9 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     # NEW: Propagate warm-start guess
     if warm_lod_guess and warm_lod_guess > 0:
         cfg['_warm_lod_guess'] = int(warm_lod_guess)
+    
+    # NEW: Set LoD max from args
+    cfg['lod_max_nm'] = int(getattr(args, "lod_max_nm", 500000))
     
     try:
         cache_tag = f"d{int(dist_um)}um"
@@ -3075,6 +3225,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     except Exception:
         pass
     
+    # Handle not found case
+    if math.isnan(lod_nm) or lod_nm <= 0:
+        skipped_reason = skipped_reason or 'not_bracketed'
+
     return {
         'distance_um': dist_um,
         'lod_nm': lod_nm,
@@ -3093,6 +3247,9 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'noise_sigma_I_diff': lod_sigma_median,
         'actual_progress': int(actual_progress),
         'skipped_reason': skipped_reason,  # ✅ Use the variable instead of None
+        'lod_found': bool(not (isinstance(lod_nm, float) and (math.isnan(lod_nm) or lod_nm <= 0))),
+        'best_seen_ser': float(ser_at_lod),
+        'lod_nm_ceiling': int(cfg.get('lod_max_nm', 500000))
     }
 
 # ============= MAIN PLOTTING HELPERS (unchanged visuals) =============
@@ -3115,7 +3272,7 @@ def plot_ser_vs_nm(results_dict: Dict[str, pd.DataFrame], save_path: Path):
     plt.grid(True, which="both", ls="--", alpha=0.3)
     plt.legend()
     plt.ylim(1e-4, 1)
-    plt.xlim(1e2, 1e5)
+    plt.xlim(1e2, 5e5)
     plt.axhline(y=0.01, color='k', linestyle=':', alpha=0.5, label='Target SER = 1%')
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
@@ -3370,10 +3527,21 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                         mosk_ser_val = (mosk_err / L) if L > 0 else float('nan')
                         csk_ser_val  = (csk_err  / L) if L > 0 else float('nan')
                         ts_val = float(res.get('symbol_period_s', cfg['pipeline']['symbol_period_s']))
+                        # Enhanced seed collection with conditional CSK metrics
+                        exposures = max(L - mosk_err, 0)  # number of symbols where CSK was actually used
+                        den = max(exposures, 1)           # guard against divide-by-zero (exposures can be 0)
+                        csk_ser_cond_seed = (csk_err / den)
+                        mosk_exposure_frac_seed = (exposures / L) if L > 0 else float('nan')
+                        # Effective CSK contribution (comparable with additive view):
+                        csk_ser_eff_seed = mosk_exposure_frac_seed * csk_ser_cond_seed  # equals csk_err/L per seed
+
                         seed_results.append({
                             'ser': ser_val,
-                            'mosk_ser': mosk_ser_val,
-                            'csk_ser': csk_ser_val,
+                            'mosk_ser': mosk_ser_val,          # unconditional MoSK error fraction
+                            'csk_ser': csk_ser_val,            # unconditional CSK error fraction (= csk_err/L)
+                            'csk_ser_cond': csk_ser_cond_seed, # conditional CSK error given correct MoSK
+                            'mosk_exposure_frac': mosk_exposure_frac_seed,
+                            'csk_ser_eff': csk_ser_eff_seed,   # exposure-weighted conditional CSK (for contouring)
                             'symbol_period_s': ts_val
                         })
                 except Exception as e:
@@ -3392,7 +3560,11 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     'ser': median_ser,
                     'mosk_ser': float(np.nanmedian([r['mosk_ser'] for r in seed_results])),
                     'csk_ser':  float(np.nanmedian([r['csk_ser']  for r in seed_results])),
-                    'use_ctrl': use_ctrl  # NEW: Track CTRL state
+                    # NEW conditional view columns:
+                    'csk_ser_cond': float(np.nanmedian([r['csk_ser_cond'] for r in seed_results])),
+                    'mosk_exposure_frac': float(np.nanmedian([r['mosk_exposure_frac'] for r in seed_results])),
+                    'csk_ser_eff': float(np.nanmedian([r['csk_ser_eff'] for r in seed_results])),
+                    'use_ctrl': use_ctrl
                 })
     
     if rows:
@@ -3410,6 +3582,11 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
         
         # Combine existing data with new data
         new_df = pd.DataFrame(rows)
+        # Sanity check: verify consistency between csk_ser and csk_ser_eff
+        if {'csk_ser', 'csk_ser_eff'}.issubset(new_df.columns):
+            diff = (new_df['csk_ser'] - new_df['csk_ser_eff']).abs().max()
+            if pd.notna(diff) and diff > 5e-3:
+                print(f"⚠️  median(csk_ser) and median(exposure*cond) differ by up to {diff:.3f}")
         if not existing_df.empty:
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         else:
@@ -3519,6 +3696,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         cfg["max_symbol_duration_s"] = float(args.max_symbol_duration_s)
     if getattr(args, "max_ts_for_lod", None) is not None:
         cfg["max_ts_for_lod"] = float(args.max_ts_for_lod)
+    # Map --allow-ts-exceed to config for consistency
+    if getattr(args, "allow_ts_exceed", False):
+        cfg.setdefault("analysis", {})["allow_ts_exceed"] = True
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
@@ -4026,8 +4206,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             wid = future_worker.pop(fut, 0)  # stable id assignment
             
             res = {}  # Initialize to prevent unbound variable
+            tmo = float(getattr(args, "lod_distance_timeout_s", 7200.0))
             try:
-                res = fut.result(timeout=7200)
+                res = fut.result(timeout=tmo if (tmo and tmo > 0) else None)
                 # Store actual progress for accurate parent counting  
                 res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
                 
@@ -4035,7 +4216,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 if res and not pd.isna(res.get('lod_nm', np.nan)):
                     last_lod_guess = int(res['lod_nm'])
             except TimeoutError:
-                print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout=7200s), skipping")
+                print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout={tmo}s), skipping")
                 res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
             except Exception as ex:
                 print(f"💥 Distance processing failed for {dist}μm: {ex}")
@@ -4155,20 +4336,22 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     if failed_distances:
         print(f"⚠️  No LoD found at distances: {failed_distances} μm")
 
-    # Merge with any prior rows (for a clean sorted CSV at the end)
+    # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
+    df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
+
     if lod_csv.exists():
         prior = pd.read_csv(lod_csv)
-        # Keep both CTRL states; sort by distance, then use_ctrl
-        if 'use_ctrl' in prior.columns:
-            df_lod = prior.drop_duplicates(subset=['distance_um', 'use_ctrl'], keep='last').sort_values(['distance_um', 'use_ctrl'])
-        else:
-            df_lod = prior.drop_duplicates(subset=['distance_um'], keep='last').sort_values('distance_um')
+        subset = ['distance_um'] + (['use_ctrl'] if 'use_ctrl' in set(prior.columns) | set(df_lod_new.columns) else [])
+        combined = prior if df_lod_new.empty else pd.concat([prior, df_lod_new], ignore_index=True)
+        combined = combined.drop_duplicates(subset=subset, keep='last').sort_values(subset)
+        _atomic_write_csv(lod_csv, combined)
+        df_lod = combined
+    elif not df_lod_new.empty:
+        _atomic_write_csv(lod_csv, df_lod_new)
+        df_lod = df_lod_new
     else:
-        if real_lod_results:
-            df_lod = pd.DataFrame(real_lod_results).sort_values('distance_um')
-        else:
-            print("⚠️  No LoD points were produced in this run.")
-            df_lod = pd.DataFrame()  # Empty DataFrame with no columns
+        print("⚠️  No LoD points were produced in this run.")
+        df_lod = pd.DataFrame()  # Empty DataFrame with no columns
 
     if not df_lod.empty:
         _atomic_write_csv(lod_csv, df_lod)
@@ -4202,9 +4385,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         print("\n3. Running ISI trade-off sweep (guard factor)…")
         # ensure ISI ON during the sweep
         cfg['pipeline']['enable_isi'] = True
-        
-        isi_jobs = len(guard_values) * len(seeds)
+
         guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+        isi_jobs = len(guard_values) * len(seeds)
         isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
         pm.set_status(mode=mode, sweep="ISI trade-off")
         isi_key = ("sweep", mode, "ISI_tradeoff")
