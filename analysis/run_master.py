@@ -35,6 +35,12 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Disable BLAS/OpenMP oversubscription for optimal process-level parallelism
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1") 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 # Import TclError for GUI exception handling
 from typing import TYPE_CHECKING
 
@@ -297,6 +303,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
     if getattr(args, 'lod_max_nm', None) is not None:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
+    if getattr(args, 'lod_distance_concurrency', None) is not None:
+        cmd.extend(["--lod-distance-concurrency", str(args.lod_distance_concurrency)])
 
     # NEW: Forward SER auto-refine flags
     if args.ser_refine:
@@ -309,8 +317,16 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     # Pass logging controls through to child...
     return cmd
 
-def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool) -> List[str]:
-    """Assemble the run_final_analysis.py command line for a single mode (no --parallel-modes)."""
+def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, 
+                                   concurrent_modes: int = 1) -> List[str]:
+    """Assemble the run_final_analysis.py command line for a single mode.
+    
+    Args:
+        args: Master arguments
+        mode: Mode to run (MoSK/CSK/Hybrid)
+        use_ctrl: Whether to use CTRL
+        concurrent_modes: Number of modes running concurrently (for worker allocation)
+    """
     # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
     child_progress = args.progress
     if args.progress == "gui" and platform.system() == "Darwin" and args.ablation_parallel:
@@ -336,9 +352,10 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     # ISI baseline control
     if args.baseline_isi == "off":
         cmd.append("--disable-isi")
-    # Performance flags
-    if args.max_workers is not None:
-        cmd.extend(["--max-workers", str(args.max_workers)])
+    # Performance flags with auto-splitting for concurrent modes
+    child_workers = _child_max_workers(args, concurrent_modes)
+    if child_workers is not None:
+        cmd.extend(["--max-workers", str(child_workers)])
     if args.extreme_mode:
         cmd.append("--extreme-mode")
     elif args.beast_mode:
@@ -400,6 +417,8 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
     if getattr(args, 'lod_max_nm', None) is not None:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
+    if getattr(args, 'lod_distance_concurrency', None) is not None:
+        cmd.extend(["--lod-distance-concurrency", str(args.lod_distance_concurrency)])
 
     # NEW: Forward SER auto-refine flags
     if args.ser_refine:
@@ -412,6 +431,78 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     # Pass logging controls through to child...
     return cmd
 
+def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, shared_workers: Optional[int] = None) -> List[str]:
+    """Create command line arguments for a specific mode with shared pool support."""
+    cmd = [
+        sys.executable, "-u", "analysis/run_final_analysis.py",
+        "--mode", mode,
+        "--num-seeds", str(args.num_seeds),
+        "--sequence-length", str(args.sequence_length),
+        "--progress", args.progress,
+        "--target-ci", str(args.target_ci),
+        "--min-ci-seeds", str(args.min_ci_seeds),
+        "--lod-screen-delta", str(args.lod_screen_delta),
+    ]
+    
+    # Ablation flag
+    cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
+    
+    # Resume / recalibrate
+    if args.resume and not args.reset:
+        cmd.append("--resume")
+    if args.recalibrate:
+        cmd.append("--recalibrate")
+    
+    # ISI baseline control
+    if args.baseline_isi == "off":
+        cmd.append("--disable-isi")
+    
+    # Worker allocation (shared pool or individual)
+    if shared_workers is not None:
+        cmd.extend(["--max-workers", str(shared_workers)])
+    elif args.max_workers is not None:
+        cmd.extend(["--max-workers", str(args.max_workers)])
+    
+    # Performance flags
+    if args.extreme_mode:
+        cmd.append("--extreme-mode")
+    elif args.beast_mode:
+        cmd.append("--beast-mode")
+    
+    # Pass through all other relevant arguments...
+    if args.nt_pairs:
+        cmd.extend(["--nt-pairs", args.nt_pairs])
+    if args.nm_grid:
+        cmd.extend(["--nm-grid", args.nm_grid])
+    if args.distances:
+        cmd.extend(["--distances", args.distances])
+    if args.lod_num_seeds is not None:
+        cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
+    if args.lod_seq_len is not None:
+        cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    
+    return cmd
+
+def _child_max_workers(args: argparse.Namespace, num_modes: int = 1) -> Optional[int]:
+    """
+    Calculate optimal worker allocation when running modes concurrently.
+    Returns None to use default behavior, or specific worker count for load balancing.
+    """
+    if num_modes <= 1:
+        return args.max_workers  # Single mode - pass through user's setting (None or specified)
+    
+    # For concurrent modes, calculate split
+    if args.max_workers is not None:
+        # User specified - split their value
+        workers_per_mode = max(1, args.max_workers // num_modes)
+    else:
+        # Auto-detect and split
+        import psutil
+        total = psutil.cpu_count(logical=True) or os.cpu_count() or 16
+        workers_per_mode = max(1, (total - 2) // num_modes)  # Reserve some for OS
+    
+    return workers_per_mode
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Master pipeline for tri-channel OECT paper")
     p.add_argument("--progress", choices=["gui", "rich", "tqdm", "none"], default="rich")
@@ -423,6 +514,8 @@ def main() -> None:
     p.add_argument("--supplementary", action="store_true", help="Also generate supplementary figures")
     p.add_argument("--baseline-isi", choices=["off", "on"], default="off",
                 help="ISI state for baseline SER/LoD sweeps; ISI trade-off always runs ON.")
+    p.add_argument("--shared-pool", action="store_true", dest="shared_pool",
+                help="Run modes in shared process pool for maximum utilization")
     # Modes
     p.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default="all")
     p.add_argument("--parallel-modes", type=int, default=1,
@@ -497,8 +590,8 @@ def main() -> None:
                 help="Issue warnings for long Ts instead of skipping (overrides all Ts limits; pass-through)")
     p.add_argument("--watchdog-secs", type=int, default=1800,
                 help="Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through)")
-    p.add_argument("--lod-max-nm", type=int, default=500000,
-                help="Upper bound for Nm during LoD search (default: 500000; pass-through)")
+    p.add_argument("--lod-max-nm", type=int, default=1000000,
+                help="Upper bound for Nm during LoD search (default: 1000000; pass-through)")
     # Optimization tuning (pass-through to run_final_analysis.py)
     p.add_argument("--cal-eps-rel", type=float, default=0.01,
                    help="Adaptive calibration convergence threshold (pass-through)")
@@ -510,6 +603,8 @@ def main() -> None:
                    help="Minimum samples per class for stable thresholds (pass-through)")
     p.add_argument("--min-decision-points", type=int, default=4,
                    help="Minimum time points for window guard (pass-through)")
+    p.add_argument("--lod-distance-concurrency", type=int, default=8,
+                help="How many distances to run concurrently in LoD sweep (default: 8).")
     # Reset
     p.add_argument(
         "--reset",
@@ -844,31 +939,175 @@ def main() -> None:
             
             if maxp > 1 and len(modes) > 1:
                 # Concurrent mode execution
-                with ThreadPoolExecutor(max_workers=maxp) as tpool:
-                    futs = []
-                    for m in modes:
-                        cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl)
-                        print(f"  $ {' '.join(cmd)}")
-                        futs.append(tpool.submit(_run_tracked, cmd))
+                actual_concurrent = min(maxp, len(modes))  # How many will actually run at once
+                if getattr(args, 'shared_pool', False):
+                    # Shared pool mode: Direct function call for maximum efficiency
+                    print(f"  🔀 Shared pool mode: running {len(modes)} mode(s) concurrently...")
+                    import sys
+                    sys.path.insert(0, str(project_root / "analysis"))
+                    import run_final_analysis as rfa    # type: ignore[import-not-found]
+                    from analysis.run_final_analysis import parse_arguments as rfa_parse_args
                     
-                    for f in as_completed(futs):
-                        if master_cancelled.is_set():
-                            return 130
-                        rc = f.result()
-                        rcs.append(rc)
-                        if rc == 130:
-                            _safe_close_progress(pm, overall, sub, skey)
-                            print("🛑 Master pipeline stopped by user")
-                            sys.exit(130)
-                        elif rc != 0:
-                            _safe_close_progress(pm, overall, sub, skey)
-                            sys.exit(rc)
+                    # IMPORTANT: In shared pool mode, use FULL worker count, not divided!
+                    # All modes share the same pool, so we want maximum workers available
+                    if args.extreme_mode:
+                        # Let run_final_analysis determine the optimal P-core count
+                        shared_workers = None  # Will use default extreme mode detection
+                    elif args.beast_mode:
+                        shared_workers = None  # Will use default beast mode detection  
+                    elif args.max_workers is not None:
+                        shared_workers = args.max_workers  # Use user's explicit value
+                    else:
+                        # Default: use all available minus a small margin
+                        import psutil
+                        total = psutil.cpu_count(logical=True) or os.cpu_count() or 16
+                        shared_workers = max(1, total - 2)
+                    
+                    with ThreadPoolExecutor(max_workers=len(modes)) as tpool:
+                        futs = []
+                        for m in modes:
+                            # Create a complete namespace with all required attributes for run_final_analysis
+                            mode_args = argparse.Namespace()
+                            
+                            # Copy all existing args
+                            for key, value in vars(args).items():
+                                setattr(mode_args, key, value)
+                            
+                            # Mode-specific overrides
+                            mode_args.mode = m
+                            mode_args.modes = None  # Clear modes to use mode
+                            mode_args.parallel_modes = 1  # Single mode per call
+                            
+                            # Set use_ctrl for this ablation run
+                            mode_args.use_ctrl = use_ctrl
+                            if use_ctrl:
+                                mode_args.with_ctrl = True
+                                mode_args.no_ctrl = False
+                            else:
+                                mode_args.with_ctrl = False
+                                mode_args.no_ctrl = True
+                            
+                            mode_args.disable_isi = (args.baseline_isi == "off")
+                            
+                            # Worker allocation: DO NOT DIVIDE in shared pool mode!
+                            if shared_workers is not None:
+                                mode_args.max_workers = shared_workers
+                            # Otherwise let run_final_analysis use its own detection
+                            
+                            # Hardcode run_final_analysis defaults to avoid argv parsing issues
+                            rfa_defaults = argparse.Namespace(
+                                verbose=False,
+                                isi_sweep='always',
+                                debug_calibration=False,
+                                csk_level_scheme='uniform',
+                                min_decision_points=4
+                            )
+                            
+                            # Ensure all required attributes exist with defaults from run_final_analysis
+                            # These are the critical attributes that run_final_analysis expects
+                            required_attrs = {
+                                # Master-level args (use getattr from args)
+                                'progress': getattr(args, 'progress', 'tqdm'),
+                                'num_seeds': getattr(args, 'num_seeds', 20),
+                                'sequence_length': getattr(args, 'sequence_length', 1000),
+                                'recalibrate': getattr(args, 'recalibrate', False),
+                                'beast_mode': getattr(args, 'beast_mode', False),
+                                'extreme_mode': getattr(args, 'extreme_mode', False),
+                                'resume': getattr(args, 'resume', False),
+                                'watchdog_secs': getattr(args, 'watchdog_secs', 1800),
+                                'target_ci': getattr(args, 'target_ci', 0.004),
+                                'min_ci_seeds': getattr(args, 'min_ci_seeds', 8),
+                                'lod_screen_delta': getattr(args, 'lod_screen_delta', 1e-4),
+                                
+                                # run_final_analysis-only args (use hardcoded defaults)
+                                'verbose': False,
+                                'isi_sweep': 'always', 
+                                'debug_calibration': False,
+                                'csk_level_scheme': 'uniform',
+                                'min_decision_points': 4,
+                                
+                                # Special handling for disable_isi (computed from baseline_isi)
+                                'disable_isi': (args.baseline_isi == "off"),
+                                
+                                # Continue with master-level args...
+                                'nt_pairs': getattr(args, 'nt_pairs', ''),
+                                'distances': getattr(args, 'distances', None),
+                                'lod_num_seeds': getattr(args, 'lod_num_seeds', None),
+                                'lod_seq_len': getattr(args, 'lod_seq_len', None),
+                                'lod_validate_seq_len': getattr(args, 'lod_validate_seq_len', None),
+                                'logdir': getattr(args, 'logdir', str(project_root / "results" / "logs")),
+                                'no_log': getattr(args, 'no_log', False),
+                                'fsync_logs': getattr(args, 'fsync_logs', False),
+                                'inhibit_sleep': getattr(args, 'inhibit_sleep', False),
+                                'keep_display_on': getattr(args, 'keep_display_on', False),
+                                'max_ts_for_lod': getattr(args, 'max_ts_for_lod', None),
+                                'max_lod_validation_seeds': getattr(args, 'max_lod_validation_seeds', 12),
+                                'max_symbol_duration_s': getattr(args, 'max_symbol_duration_s', None),
+                                'analytic_lod_bracket': getattr(args, 'analytic_lod_bracket', True),
+                                'cal_eps_rel': getattr(args, 'cal_eps_rel', 0.01),
+                                'cal_patience': getattr(args, 'cal_patience', 2),
+                                'cal_min_seeds': getattr(args, 'cal_min_seeds', 4),
+                                'cal_min_samples': getattr(args, 'cal_min_samples', 50),
+                                'nm_grid': getattr(args, 'nm_grid', ''),
+                                'decision_window_policy': getattr(args, 'decision_window_policy', None),
+                                'decision_window_frac': getattr(args, 'decision_window_frac', None),
+                                'allow_ts_exceed': getattr(args, 'allow_ts_exceed', False),
+                                'ts_cap_s': getattr(args, 'ts_cap_s', None),
+                                'isi_memory_cap': getattr(args, 'isi_memory_cap', None),
+                                'guard_factor': getattr(args, 'guard_factor', None),
+                                'lod_distance_timeout_s': getattr(args, 'lod_distance_timeout_s', 7200.0),
+                                'lod_distance_concurrency': getattr(args, 'lod_distance_concurrency', 8),
+                                'lod_max_nm': getattr(args, 'lod_max_nm', 1000000),
+                                'ts_warn_only': getattr(args, 'ts_warn_only', False),
+                                'ser_refine': getattr(args, 'ser_refine', False),
+                                'ser_target': getattr(args, 'ser_target', 0.01),
+                                'ser_refine_points': getattr(args, 'ser_refine_points', 2)
+                            }
+                            
+                            # Set all required attributes, using existing values if present, defaults otherwise
+                            for attr, default_value in required_attrs.items():
+                                if not hasattr(mode_args, attr):
+                                    setattr(mode_args, attr, default_value)
+                            
+                            futs.append(tpool.submit(rfa.run_one_mode, mode_args, m))
+                        
+                        for f in as_completed(futs):
+                            if master_cancelled.is_set():
+                                return 130
+                            try:
+                                f.result()
+                            except Exception as e:
+                                print(f"💥 Shared pool mode execution failed: {e}")
+                                return 1
+                else:
+                    # Original behavior: each mode gets split worker allocation
+                    with ThreadPoolExecutor(max_workers=maxp) as tpool:
+                        futs = []
+                        for m in modes:
+                            cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl, actual_concurrent)  # <-- CHANGED LINE
+                            print(f"  $ {' '.join(cmd)}")
+                            futs.append(tpool.submit(_run_tracked, cmd))
+                        
+                        for f in as_completed(futs):
+                            if master_cancelled.is_set():
+                                return 130
+                            rc = f.result()
+                            rcs.append(rc)
+                            if rc == 130:
+                                _safe_close_progress(pm, overall, sub, skey)
+                                import sys
+                                print("🛑 Master pipeline stopped by user")
+                                sys.exit(130)
+                            elif rc != 0:
+                                _safe_close_progress(pm, overall, sub, skey)
+                                import sys
+                                sys.exit(rc)
             else:
                 # Sequential mode execution (fallback)
                 for m in modes:
                     if master_cancelled.is_set():
                         return 130
-                    cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl)
+                    cmd = _build_run_final_cmd_for_mode(args, m, use_ctrl)  # <-- defaults to concurrent_modes=1
                     print(f"  $ {' '.join(cmd)}")
                     rc = _run_tracked(cmd)
                     rcs.append(rc)

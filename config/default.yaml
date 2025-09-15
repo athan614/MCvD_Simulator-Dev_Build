@@ -85,7 +85,7 @@ sim:
 
 # ——— Simulation / figure sweeps ———
 # Publication-friendly distance grid: dense at short ranges, trimmed tail for performance
-distances_um: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175]  # optimized range (removed 115, 200)
+distances_um: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150]  # optimized range (removed 115, 200)
 # High-resolution distance grid (use only if needed)
 # distances_um: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
 Nm_range: [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000] # finer resolution
@@ -110,7 +110,7 @@ detection:
 # -------- End-to-end pipeline --------
 pipeline:
   symbol_period_s: 20.0         # Ts from manuscript
-  lod_nm_max: 500000            # Maximum Nm for LoD search (was hardcoded 100k)
+  lod_nm_max: 1000000            # Maximum Nm for LoD search (was hardcoded 100k)
   min_symbol_period_s: 5.0      # Minimum symbol period (was hardcoded 20s)
   distance_um: 50               # Changed from 100 to 50 as in code
   Nm_per_symbol: 1e7          # molecules per burst (was 5.0e4)
