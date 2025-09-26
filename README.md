@@ -1,66 +1,76 @@
 # Tri-Channel OECT Molecular Communication Simulator
 
-This repository targets IEEE TMBMC practitioners who need reproducible end-to-end studies of a tri-channel organic electrochemical transistor (OECT) receiver operated over a diffusion-based molecular communication link. The implementation couples analytical channel models with device-level electrical models, supports hybrid multi-molecule modulation, and automates the publication workflow used in the accompanying manuscript.
+## Introduction
+This repository provides a research-grade simulation and analysis framework for the tri-channel organic electrochemical transistor (OECT) receiver documented in the associated IEEE Transactions on Molecular, Biological, and Multi-Scale Communications (TMBMC) manuscript. The implementation delivers reproducible, end-to-end evaluations of diffusion-based molecular communication links that employ glutamate (GLU), gamma-aminobutyric acid (GABA), and a differential control (CTRL) channel. Every stage of the physical pipeline, from molecular release through detection, is modeled with closed-form physics, stochastic sampling, and device-level electrical abstractions.
 
-## System Overview
-- Transmitter: finite-duration point releases with configurable Nm, burst shape, and guard policies.
-- Propagation: 3-D diffusion with tortuosity, extracellular volume fraction, and first-order clearance.
-- Receiver interface: selective aptamer binding kinetics driving an OECT-based readout for GLU, GABA, and a differential CTRL channel.
-- Detection: modulation-aware thresholding and SER estimation for MoSK, CSK-4, and a 2-bit hybrid mode.
-- Automation: parallel Monte Carlo engine with crash-safe resume, calibration cache management, and rich logging/visualisation utilities.
+## Feature Summary
+- **Complete transceiver stack**: parameterized transmitter, three-dimensional diffusive channel, receptor binding layer, OECT front-end, and digital detection logic for MoSK, CSK-4, and hybrid (2 bit/symbol) modulation.
+- **Hybrid analytic/Monte Carlo workflow**: vectorized solvers alongside calibrated Monte Carlo sampling with deterministic seeding, resume support, and full provenance tracking.
+- **IEEE publication assets**: automated generation of SER, LoD, ISI, sensitivity, and supplementary figures/tables in IEEE-compliant formats.
+- **Comprehensive configurability**: YAML-driven scenario definition covering tissue transport, binding kinetics, device parameters, modulation controls, and analysis heuristics.
+- **Scalable execution**: crash-safe multiprocessing, optional GUI/CLI progress front-ends, and balanced workload scheduling for heterogeneous CPU architectures.
 
-The top-level entry points (`src/pipeline.py` and `analysis/run_final_analysis.py`) expose these components as a composable simulator with deterministic configuration, while analysis scripts deliver the figures and tables aligned with IEEE submission requirements.
+## System Architecture
+The simulator decomposes the tri-channel link into modular components, each exposed through `src/` packages and controlled by the configuration in `config/default.yaml`.
 
-## Physical and Algorithmic Models
+### Transmitter
+- Finite-duration molecular bursts with configurable molecule budgets (`Nm_per_symbol`), shaping functions (`rect`, `gamma`), and guard factors.
+- Deterministic symbol schedules for analytic previews and stochastic generation for Monte Carlo runs.
 
-### Transport (`src/mc_channel/transport.py`)
-The propagator implements the restricted extracellular space Green's function:
+### Propagation (`src/mc_channel/transport.py`)
+The diffusion channel employs the restricted extracellular-space Green's function
 \[
-G(r,t) = \frac{1}{\alpha\,(4\pi D_\text{eff} t)^{3/2}}\,\exp\!\left(-\frac{r^2}{4D_\text{eff} t}\right)\exp(-k_\text{clear} t),
+G(r,t) = \frac{1}{\alpha (4 \pi D_\text{eff} t)^{3/2}} \exp\Big(-\frac{r^2}{4 D_\text{eff} t}\Big) \exp(-k_\text{clear} t),
 \]
-where \(D_\text{eff} = D/\lambda^2\). Vectorised helpers (`finite_burst_concentration`, `finite_burst_concentration_batch`, `finite_burst_concentration_batch_time`) integrate this kernel against arbitrary burst profiles and time grids, enabling simultaneous evaluation of multiple molecules, channels, and decision windows.
+with \(D_\text{eff} = D / \lambda^2\). Vectorized helpers (`finite_burst_concentration`, `finite_burst_concentration_batch`, `finite_burst_concentration_batch_time`) evaluate this kernel across time grids, molecule species, and channel geometries.
 
-### Binding layer (`src/mc_receiver/binding.py`)
-A stochastic birth-death process models aptamer occupancy with:
+### Binding Layer (`src/mc_receiver/binding.py`)
+A stochastic birth-death process captures aptamer occupancy:
 \[
-\frac{dN_b}{dt} = k_\text{on} C(t) (N_\text{sites}-N_b) - k_\text{off} N_b.
+\frac{dN_b}{dt} = k_\text{on} C(t) (N_\text{sites} - N_b) - k_\text{off} N_b.
 \]
-The solver supports both ODE integration (via `scipy.integrate.odeint`) and Bernoulli thinning for Monte Carlo seeds, allowing the simulator to switch between deterministic previews and full stochastic sampling. Dual-channel CSK operation relies on `N_sites_*` asymmetry and configurable leakage factors.
+The module supports ordinary differential equation integration (`scipy.integrate.odeint`) and Monte Carlo Bernoulli updating, enabling both deterministic previews and sample-driven statistics. Dual-channel CSK operation is modeled through channel-specific site counts and leakage factors.
 
-### OECT transduction (`src/mc_receiver/oect.py`)
-The electrical frontend maps bound charge to differential drain current using the small-signal relationship \(\Delta I = g_m \Delta V_g\). The code parameterises gate capacitance, thermal and 1/f noise (`alpha_H`), and correlated noise between GLU/GABA/CTRL. A Bessel post-filter approximates the front-end bandwidth and maintains causal filtering when discretised.
+### OECT Transduction (`src/mc_receiver/oect.py`)
+Bound charge perturbs the gate potential and modulates drain current according to \(\Delta I = g_m \Delta V_g\). The implementation parameterizes gate capacitance, transconductance, thermal and 1/f noise (`alpha_H`), and channel correlation. A causal Bessel post-filter approximates the OECT bandwidth prior to digitization.
 
-### Noise synthesis
-Shot noise (Poisson), thermal noise (Johnson), and correlated 1/f components are synthesised per time step. Residual correlation between CTRL-subtracted channels is controlled via `rho_between_channels_after_ctrl`, supporting sensitivity studies of imperfect differential cancellation.
+### Noise Synthesis
+Shot, thermal, and correlated 1/f noise components are synthesized per time step. Residual correlation between CTRL-subtracted currents is captured through `rho_between_channels_after_ctrl`, enabling studies of imperfect differential rejection.
 
-### Detection and modulation (`src/mc_detection/algorithms.py`)
-Detection functions compute maximum-likelihood thresholds for MoSK and CSK, analytic BER curves (`ber_mosk_analytic`, `sep_csk_mary`), and decision window policies. Hybrid modulation combines molecule presence (MoSK) with amplitude discrimination (CSK) under `csk_dual_channel` combiner strategies (`zscore`, `whitened`, `leakage`).
+### Detection and Modulation (`src/mc_detection/algorithms.py`)
+The detection layer provides maximum-likelihood thresholds, analytic BER expressions (`ber_mosk_analytic`, `sep_csk_mary`), and decision-window policies. Hybrid modulation combines molecular presence and amplitude discrimination via `csk_dual_channel` combiners (`zscore`, `whitened`, `leakage`).
 
 ## Simulation Workflow
-1. **Configuration ingestion**: YAML files are parsed via `src/config_utils.py` to normalise numeric literals and expand shorthand keys.
-2. **Calibration**: `analysis/run_final_analysis.py` precomputes detection thresholds, caches LoD bracket states, and harmonises RNG seeds using `numpy.random.SeedSequence` to guarantee reproducibility across workers.
-3. **Monte Carlo execution**: Each (sweep parameter, seed) pair runs through the pipeline to generate symbol traces, binding trajectories, and OECT currents. Process pools leverage `ProcessPoolExecutor` with oversubscription guards via environment variables.
-4. **Aggregation & resume**: Job outputs are atomically written to `results/cache/.../seed_<id>.json`. Aggregators consolidate SER/LoD metrics, append provenance metadata, and drop `.tmp` suffixes only after successful writes, making repeated runs safe under interruption.
-5. **Analysis generation**: Scripts in `analysis/` consume cached CSVs to build IEEE-style figures (Matplotlib with custom cyclers) and LaTeX tables.
+1. **Configuration ingestion** - `src/config_utils.py` normalizes numeric literals, validates parameter consistency, and expands shorthand configuration keys.
+2. **Calibration** - `analysis/run_final_analysis.py` derives detection thresholds, maintains limit-of-detection (LoD) bracket caches, and harmonizes RNG seeds via `numpy.random.SeedSequence` to ensure replicable worker execution.
+3. **Monte Carlo execution** - Each (sweep value, seed) pair traverses the end-to-end pipeline to produce symbol traces, binding trajectories, and OECT currents. Workloads are dispatched through `ProcessPoolExecutor` with oversubscription guards (`MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, etc.).
+4. **Aggregation and resume** - Intermediate results are written atomically to `results/cache/.../seed_<id>.json`; aggregation stages emit SER/LoD tables only after successful completion, permitting interruption and subsequent restart via `--resume`.
+5. **Analysis generation** - Scripts under `analysis/` transform cached data into IEEE-style figures (Matplotlib with custom cyclers), LaTeX tables, and diagnostic reports.
 
-`analysis/run_master.py` orchestrates multi-mode sweeps, CTRL ablations, and supplementary figure builds. It exposes pass-through arguments for LoD search heuristics (`--lod-num-seeds`, `--analytic-lod-bracket`) and parallelises modulation modes, CTRL states, and seeds to saturate heterogeneous CPU architectures.
+`analysis/run_master.py` orchestrates complete study pipelines (mode sweeps, CTRL ablations, supplementary figures) and exposes pass-through controls for LoD heuristics (`--lod-num-seeds`, `--analytic-lod-bracket`), neurotransmitter-pair exploration, and parallel execution.
 
-## Repository Layout
+## Software Layout
 ```
-analysis/          publication workflows, figure generation, diagnostics, and validation scripts
-config/            canonical and scenario-specific YAML configurations (default.yaml reflects the baseline study)
+analysis/          publication workflows, figure generation, diagnostics, validation harnesses
+config/            canonical and scenario-specific YAML configurations (default.yaml is the baseline study)
 results/           created on demand; hosts cache/, data/, figures/, tables/, logs/
-src/               reusable simulator modules (transport, binding, OECT, detection, pipeline glue)
+src/               reusable simulator modules (transport, binding, OECT, detection, pipeline integration)
 tests/             regression tests for transport, decision windows, and analytic validators
-setup_env.py       virtual environment bootstrap
-setup_project.py   dependency checker and results/ tree initialiser
-Makefile           shortcuts for linting, tests, and figure rebuilds
+setup_env.py       virtual environment bootstrapper
+setup_project.py   dependency checker and results/ tree initializer
+Makefile           convenience targets for linting, testing, and figure regeneration
 ```
 
-## Requirements and Environments
-- Python 3.11 or newer (SciPy 1.16 targets Python >=3.11).
+## Key Metrics
+- **Symbol Error Rate (SER)** for MoSK, CSK, and hybrid modulation, including CTRL on/off ablations.
+- **Limit of Detection (LoD)** versus link distance with adaptive seed scheduling and analytic bracketing.
+- **Inter-symbol Interference (ISI) throughput** as a function of guard factor and symbol period.
+- **Hybrid Decision Surface (HDS)**, **OECT-Normalized Sensitivity Index (ONSI)**, and **ISI-Robust Throughput (IRT)** generated by the analysis suite.
+
+## Requirements and Dependencies
+- Python 3.11 or newer (SciPy >= 1.16 requires Python 3.11+).
 - 64-bit Linux, macOS, or Windows (validated on Ubuntu 22.04, macOS 14, Windows 11).
-- Optional GPU kernels are not required; everything runs on CPU-class hardware.
+- CPU execution only; no GPU backends are required.
 
 ### Runtime dependencies (latest tested versions)
 - numpy 2.3.3
@@ -72,16 +82,16 @@ Makefile           shortcuts for linting, tests, and figure rebuilds
 - rich 14.1.0
 - psutil 7.1.0
 - joblib 1.5.2
-- statsmodels 0.14.5 (confidence intervals for SER estimates)
-- cycler 0.12.1 (IEEE plot palettes)
+- statsmodels 0.14.5 (Wilson/Wald confidence intervals)
+- cycler 0.12.1 (IEEE color palettes)
 
-Optional analysis extras (install with `pip install .[analysis]` or `setup_env.py --extras analysis`):
-- seaborn 0.13.2 (supplementary figure palettes)
-- pyarrow 21.0.0 (high-throughput CSV/Feather IO)
+Optional analysis extras (install via `pip install .[analysis]` or `setup_env.py --extras analysis`):
+- seaborn 0.13.2 for supplementary visualizations
+- pyarrow 21.0.0 for high-throughput CSV/Feather interchange
 
-Developer tooling is exposed via `pip install .[dev]` (pytest 8.4.2, pytest-cov 7.0.0, black 25.9.0, ruff 0.13.2, mypy 1.18.2, pip-tools 7.5.0, jupyter 1.1.1).
+Developer tooling (`pip install .[dev]`): pytest 8.4.2, pytest-cov 7.0.0, black 25.9.0, ruff 0.13.2, mypy 1.18.2, pip-tools 7.5.0, jupyter 1.1.1.
 
-## Installation and Environment Helpers
+## Environment Provisioning
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
@@ -90,67 +100,67 @@ pip install -e .[dev]
 python setup_project.py
 ```
 
-`setup_env.py` automates these steps and supports frozen installs:
+`setup_env.py` automates these steps and supports frozen installations:
 ```bash
-# Latest packages + dev extras
+# Latest packages + developer extras
 python setup_env.py --extras dev --editable
 
 # Reproduce requirements.latest.txt
 python setup_env.py --use-freeze --editable
 ```
-After installation, rerun `python setup_project.py` to verify dependencies, create `results/` folders, or reset caches (`--reset cache` or `--reset all`).
+Re-run `python setup_project.py` after installation to verify dependencies, create the `results/` hierarchy, or reset cached artifacts via `--reset cache` or `--reset all`.
 
-## Running Primary Experiments
+## Primary Experiment Entrypoints
 ```bash
-# Fast SER sanity for CSK (4 seeds)
-python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 \
-    --resume --recalibrate --progress tqdm
+# Short validation run (CSK mode, 4 seeds, resumable)
+python analysis/run_final_analysis.py --mode CSK --num-seeds 4 \
+    --sequence-length 200 --resume --recalibrate --progress tqdm
 
-# Full publication sweep (MoSK + CSK + Hybrid with CTRL ablations)
+# Full publication workflow (MoSK + CSK + Hybrid with CTRL ablations)
 python analysis/run_master.py --modes all --resume --progress rich --parallel-modes 3
 ```
-
-Entry points installed through `pip` provide CLI aliases:
+Installed entry points offer concise aliases:
 ```
 mcvd-simulate  # analysis/run_final_analysis.py
 mcvd-master    # analysis/run_master.py
 ```
 
-### Useful arguments
-- `--distance-grid`, `--nt-pairs`, and `--lod-seq-len` expose LoD/NT trade-offs without editing YAML.
-- `--progress {tqdm,rich,gui,none}` selects the progress backend implemented in `analysis/ui_progress.py`.
-- `--parallel-modes` and `--ablation-parallel` enable simultaneous modulation-mode and CTRL-state execution on multi-core hosts.
+### Frequently Used Arguments
+- `--distance-grid`, `--nt-pairs`, `--lod-seq-len` - scenario sweeps without editing YAML files.
+- `--progress {tqdm,rich,gui,none}` - select progress backends implemented in `analysis/ui_progress.py`.
+- `--parallel-modes`, `--ablation-parallel` - control concurrency across modulation modes and CTRL states.
+- `--preset {ieee,verify}` - load manuscript-aligned or quick-verification parameter sets.
 
-## Configuration and Extensibility
-`config/default.yaml` is the single source of truth for baseline studies. Key sections:
-- `neurotransmitters`: diffusion tensors, binding constants, and effective charge assignments for GLU, GABA, CTRL.
-- `pipeline`: symbol period, ISI horizon (`isi_memory`, `guard_factor`), LoD bounds, modulation selection, and dual-channel combiners.
-- `detection`: window policies (`fraction_of_Ts`, `full_Ts`), per-channel thresholds, Monte Carlo sequence lengths.
-- `analysis`: adaptive CI termination, LoD retry budgets, ISI enable/disable toggles.
+## Configuration Guidance
+`config/default.yaml` is the baseline scenario. Notable sections include:
+- `neurotransmitters` - diffusion coefficients, binding rates, and effective charges for GLU, GABA, CTRL.
+- `pipeline` - symbol period, ISI memory (`isi_memory`, `guard_factor`), LoD bounds, modulation selection, CSK combiner settings.
+- `detection` - decision-window policies (`fraction_of_Ts`, `full_Ts`), per-channel thresholds, Monte Carlo sequence lengths.
+- `analysis` - adaptive CI termination, LoD retry budget, ISI toggles, and timeout safeguards.
 
-`src/config_utils.py` normalises these values and guards against invalid combinations. For scenario sweeps, copy `default.yaml`, adjust the relevant subsections, and pass the file via `--config` to the analysis scripts.
+Use `src/config_utils.py` to validate custom YAML files. Scenario-specific studies can supply an alternate configuration with `--config path/to/custom.yaml` when invoking `analysis/run_final_analysis.py` or `analysis/run_master.py`.
 
 ## Data Products and Reproducibility
-- `results/data/ser_vs_nm_<mode>.csv`: SER vs molecules per symbol across modulation modes (Hybrid includes decomposed MoSK/CSK SER columns).
-- `results/data/lod_vs_distance_<mode>.csv`: limit-of-detection tables with symbol period, data rate, and CI metadata.
-- `results/data/isi_tradeoff_<mode>.csv`: guard factor sweeps for ISI robustness.
-- `results/figures/*.png`: IEEE-ready 300 dpi figures with consistent typography and colour ordering.
-- `results/tables/*.tex`: LaTeX tables (`table1.tex`, `table_ii_performance.tex`) ready for manuscript inclusion.
-- `results/logs/*.log`: tee-d runtime logs capturing CLI arguments, Git revisions, and timing.
+- `results/data/ser_vs_nm_<mode>.csv` - SER versus molecules per symbol (hybrid mode includes MoSK/CSK components).
+- `results/data/lod_vs_distance_<mode>.csv` - LoD metrics with symbol period, data rate, and confidence intervals.
+- `results/data/isi_tradeoff_<mode>.csv` - guard-factor sweeps for ISI throughput.
+- `results/figures/*.png` - IEEE-ready 300 dpi figures with consistent typography and color ordering.
+- `results/tables/*.tex` - LaTeX tables (`table1.tex`, `table_ii_performance.tex`) for manuscript integration.
+- `results/logs/*.log` - mirrored runtime logs capturing CLI arguments, Git revision, and execution timing.
 
-Each Monte Carlo job records its RNG seed and configuration hash inside the cache JSON, enabling exact replay. Atomic writes (`*.tmp` -> `.csv`) guarantee that partially completed runs can be resumed with `--resume` without manual cleanup.
+Every Monte Carlo job records its RNG seed and configuration hash in the cache JSON payload. Atomic renames (`*.tmp` to `.csv`) ensure that interrupted runs can safely resume once work is restarted with `--resume`.
 
-## Development and Testing
+## Development and Verification
 ```bash
-pytest                               # physics regression tests
-ruff check src analysis tests        # linting / style
-black src analysis tests             # formatting
-mypy src analysis                    # static typing
+pytest                               # Core physics regression tests
+ruff check src analysis tests        # Static linting
+black src analysis tests             # Formatting
+mypy src analysis                    # Static typing validation
 ```
-The `tests/` directory currently includes transport-versus-Fick validators, dynamic decision-window checks, and analytic SER regression tests. Extend these when adding new physics features to preserve reproducibility claims.
+The `tests/` suite presently covers transport versus Fickian diffusion, adaptive decision-window logic, and analytic SER checks. Extend the suite alongside new physics or algorithmic contributions to maintain reproducibility claims.
 
 ## Citation
-If you use this simulator, please cite the IEEE Transactions on Molecular, Biological, and Multi-Scale Communications manuscript associated with this repository. A machine-readable entry is available in `CITATION.cff`.
+If this simulator supports your research, please cite the corresponding IEEE TMBMC article. A machine-readable entry (`CITATION.cff`) is included at the repository root.
 
 ## License
-Released under the MIT License. See `LICENSE` for details.
+The project is distributed under the MIT License; see `LICENSE` for full terms.
