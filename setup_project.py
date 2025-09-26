@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Project bootstrapper for the Tri‑Channel OECT MC simulator.
+Project bootstrapper for the Tri-Channel OECT molecular communication simulator.
 
 What it does
 ------------
-- Verifies Python and core dependencies
-- Creates the expected results/ tree (data/, figures/, tables/, cache/, logs/, notebook_replicas/)
-- (Optional) Resets results with --reset {cache|all}
+- Verifies Python and required third-party packages
+- Creates the expected results/ tree (data/, figures/, tables/, cache/, logs/, figures/notebook_replicas/)
+- Optionally resets cached results via --reset {cache|all}
 
 Usage
 -----
@@ -33,40 +33,60 @@ REQUIRED = [
     ("tqdm", None),
     ("rich", None),
     ("psutil", None),
+    ("joblib", None),
+    ("statsmodels", None),
 ]
+
 
 def _check_python() -> None:
     if sys.version_info < (3, 11):
-        raise SystemExit("Python 3.11+ is required (SciPy>=1.16 & NumPy>=2.x). "
-                         f"Found {sys.version.split()[0]}")
+        raise SystemExit(
+            "Python 3.11+ is required (SciPy>=1.16 and NumPy>=2.x). "
+            f"Found {sys.version.split()[0]}"
+        )
+
 
 def _check_packages() -> None:
-    missing = []
-    versions = {}
-    for mod, pip_name in REQUIRED:
+    missing: list[str] = []
+    versions: dict[str, str] = {}
+    for module_name, pip_name in REQUIRED:
         try:
-            m = importlib.import_module(mod)
-            ver = getattr(m, "__version__", "unknown")
-            versions[mod] = ver
+            module = importlib.import_module(module_name)
         except Exception:
-            missing.append(pip_name or mod)
+            missing.append(pip_name or module_name)
+            continue
+        version = getattr(module, "__version__", "unknown")
+        versions[module_name] = version
+
     if missing:
-        print("✗ Missing packages:", ", ".join(missing))
-        print("   Install with:  pip install -e .[dev]")
+        print("Missing packages:", ", ".join(sorted(missing)))
+        print("Install them with:  pip install -e .[dev]")
         raise SystemExit(1)
-    print("✓ Package versions:")
-    for k, v in versions.items():
-        print(f"   {k:>10s} : {v}")
+
+    print("Detected package versions:")
+    for name in sorted(versions):
+        print(f"  {name:>10s} : {versions[name]}")
+
 
 def _mkdirs(root: Path) -> None:
-    for sub in ("results/data", "results/figures", "results/figures/notebook_replicas", 
-                "results/tables", "results/cache", "results/logs"):
-        p = root / sub
-        p.mkdir(parents=True, exist_ok=True)
-    print(f"✓ Created/verified results/ tree under {root.resolve()}")
+    for sub in (
+        "results/data",
+        "results/figures",
+        "results/figures/notebook_replicas",
+        "results/tables",
+        "results/cache",
+        "results/logs",
+    ):
+        path = root / sub
+        path.mkdir(parents=True, exist_ok=True)
+    print(f"Ensured results/ tree under {root.resolve()}")
+
 
 def _safe_rmtree(path: Path) -> None:
-    import shutil, os, stat
+    import os
+    import shutil
+    import stat
+
     root = (Path(__file__).parent / "results").resolve()
     target = path.resolve()
     if not str(target).startswith(str(root)):
@@ -80,10 +100,11 @@ def _safe_rmtree(path: Path) -> None:
                 pass
         shutil.rmtree(target, onerror=_on_rm_error)
 
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Bootstrap environment and folders")
-    p.add_argument("--reset", choices=["cache", "all"], help="Delete results cache or full results/*")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Bootstrap environment and folders")
+    parser.add_argument("--reset", choices=["cache", "all"], help="Delete results cache or full results/*")
+    args = parser.parse_args()
 
     _check_python()
     _check_packages()
@@ -97,13 +118,14 @@ def main() -> None:
             _safe_rmtree(results)
         else:
             _safe_rmtree(results / "cache")
-        print(f"✓ Reset completed: {args.reset}")
+        print(f"Reset completed: {args.reset}")
 
     _mkdirs(root)
-    print("All good. Try a quick sanity run, e.g.:")
+    print("All good. Try a quick sanity run, for example:")
     print("  python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm")
     print("\nOr test parallel execution:")
-    print("  python analysis/run_master.py --modes all --parallel-modes 3 --num-seeds 5")
+    print("  python analysis/run_master.py --modes all --parallel-modes 3 --resume --progress rich")
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,36 +7,40 @@ name = "tri-channel-oect-mc"
 version = "0.3.0"
 description = "Tri-channel OECT molecular communication simulator (MoSK/CSK/Hybrid) with crash-safe resume, parallel execution, real-time logging, IEEE-quality plotting, and benchmarking"
 readme = "README.md"
-requires-python = ">=3.11"  # SciPy>=1.16 requires Python >=3.11
+requires-python = ">=3.11"
 license = { text = "MIT" }
 
 authors = [
   { name = "Your Name", email = "you@example.com" }
 ]
 
-# Keep these unpinned to install latest by default; use requirements.latest.txt for a frozen set
 dependencies = [
-  "numpy>=2.3",
-  "scipy>=1.16",
-  "pandas>=2.3",
-  "matplotlib>=3.10",
-  "seaborn>=0.13",
-  "PyYAML>=6.0.2",
-  "tqdm>=4.67",
-  "rich>=14.1",
-  "psutil>=7.0",
-  "cycler>=0.12",
+  "numpy>=2.3.3",
+  "scipy>=1.16.2",
+  "pandas>=2.3.2",
+  "matplotlib>=3.10.6",
+  "seaborn>=0.13.2",
+  "PyYAML>=6.0.3",
+  "tqdm>=4.67.1",
+  "rich>=14.1.0",
+  "psutil>=7.1.0",
+  "joblib>=1.5.2",
+  "statsmodels>=0.14.5",
+  "cycler>=0.12.1",
 ]
 
 [project.optional-dependencies]
+analysis = [
+  "pyarrow>=21.0.0",
+]
 dev = [
-  "pytest>=8.3",
-  "pytest-cov>=5.0",
-  "black>=24.8",
-  "ruff>=0.6",
-  "mypy>=1.11",
-  "pip-tools>=7.4",
-  "jupyter>=1.0",
+  "pytest>=8.4.2",
+  "pytest-cov>=7.0.0",
+  "black>=25.9.0",
+  "ruff>=0.13.2",
+  "mypy>=1.18.2",
+  "pip-tools>=7.5.0",
+  "jupyter>=1.1.1",
 ]
 
 [tool.hatch.build.targets.wheel]

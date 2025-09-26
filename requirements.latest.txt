@@ -1,12 +1,15 @@
-# Pinned to the latest package versions available on PyPI as of 2025‑08‑17
-# If you want always‑latest on each install, use `requirements.in` instead.
-numpy==2.3.2
-scipy==1.16.1
-pandas==2.3.1
-matplotlib==3.10.5
+# Pinned to the latest package versions available on PyPI as of 2025-09-26
+# If you want always-latest on each install, use `requirements.in` instead.
+numpy==2.3.3
+scipy==1.16.2
+pandas==2.3.2
+matplotlib==3.10.6
 seaborn==0.13.2
-PyYAML==6.0.2
+PyYAML==6.0.3
 tqdm==4.67.1
 rich==14.1.0
-psutil==7.0.0
+psutil==7.1.0
+joblib==1.5.2
+statsmodels==0.14.5
 cycler==0.12.1
+pyarrow==21.0.0
