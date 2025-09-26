@@ -349,6 +349,7 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
         cfg['pipeline'].get('csk_level_scheme', 'uniform'),
         cfg['pipeline'].get('guard_factor', 0.0),
         bool(cfg['pipeline'].get('use_control_channel', True)),
+        cfg['pipeline'].get('channel_profile', 'tri'),
         _nt_pair_fp(cfg),
         _qeff_signs(cfg),  # NEW: signs guard
         cfg['pipeline'].get('csk_combiner', 'zscore'),
@@ -387,6 +388,7 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     dist = cfg['pipeline'].get('distance_um', None)
     nm = cfg['pipeline'].get('Nm_per_symbol', None)
     lvl = cfg['pipeline'].get('csk_level_scheme', 'uniform')
+    profile = cfg['pipeline'].get('channel_profile', 'tri')
     tgt = cfg['pipeline'].get('csk_target_channel', '')
     M   = cfg['pipeline'].get('csk_levels', None)
     gf  = cfg['pipeline'].get('guard_factor', None)
@@ -410,6 +412,7 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     if cmb == 'leakage' and lf is not None:
         parts.append(f"leak{float(lf):.3g}")
     ctrl = 'wctrl' if bool(cfg['pipeline'].get('use_control_channel', True)) else 'noctrl'
+    parts.append(f"profile{profile}")
     parts.append(ctrl)
     return results_dir / ( "_".join(parts) + ".json" )
 
@@ -684,6 +687,21 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         streak = 0
         used = 0
 
+        # FIX: Measure correlation first, then update config to use it
+        use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
+        if use_ctrl and mode.startswith('CSK'):
+            # Quick measurement with first few seeds
+            for test_seed in seeds[:min(3, len(seeds))]:
+                cal_cfg_test = deepcopy(cal_cfg)
+                cal_cfg_test['pipeline']['random_seed'] = test_seed
+                test_result = run_calibration_symbols(cal_cfg_test, 0, mode='CSK', num_symbols=20)
+                if test_result and 'rho_cc_measured' in test_result:
+                    rho_cc_measured = float(test_result['rho_cc_measured'])
+                    if np.isfinite(rho_cc_measured):
+                        # Update calibration config to use measured value
+                        cal_cfg.setdefault('noise', {})['rho_between_channels_after_ctrl'] = rho_cc_measured
+                        break
+
         for seed in seeds[:max_seeds]:
             used += 1
             cal_cfg['pipeline']['random_seed'] = seed
@@ -815,7 +833,11 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         thresholds['hybrid_threshold_da'] = float(prev_da_tau)
         thresholds['hybrid_threshold_sero'] = float(prev_se_tau)
 
-        # Comparator hints by sign (and empirical if available)
+        # Persist the learned orientation (on Q_amp it may be "increasing" even if q_eff < 0)
+        thresholds['hybrid_threshold_da_increasing']   = bool(np.mean(stats['da_high']) > np.mean(stats['da_low']))
+        thresholds['hybrid_threshold_sero_increasing'] = bool(np.mean(stats['sero_high']) > np.mean(stats['sero_low']))
+
+        # Keep existing hints for logging
         s_da, s_se = _qeff_signs(cfg)
         thresholds['hybrid_direction_da_hint']   = ">" if s_da > 0 else "<" if s_da < 0 else "="
         thresholds['hybrid_direction_sero_hint'] = ">" if s_se > 0 else "<" if s_se < 0 else "="
@@ -869,6 +891,55 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         except Exception as e:
             if verbose:
                 print(f"⚠️ Failed to save thresholds: {e}")
+
+    # Per-point combiner - propagate measured correlation to runtime
+    if mode.startswith("CSK") or mode == "Hybrid":
+        # Extract rho_cc_measured from calibration results
+        rho_cc_measured = np.nan
+        if mode.startswith("CSK"):
+            # For CSK, get it from the last calibration run
+            for level in range(cfg['pipeline'].get('csk_levels', 4)):
+                cal_result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
+                if cal_result and 'rho_cc_measured' in cal_result:
+                    measured_val = cal_result['rho_cc_measured']
+                    if np.isfinite(measured_val):
+                        rho_cc_measured = float(measured_val)
+                        break
+        elif mode == "Hybrid":
+            # For Hybrid, get it from any symbol run
+            cal_result = run_calibration_symbols(cal_cfg, 0, mode='Hybrid', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
+            if cal_result and 'rho_cc_measured' in cal_result:
+                measured_val = cal_result['rho_cc_measured']
+                if np.isfinite(measured_val):
+                    rho_cc_measured = float(measured_val)
+        
+        # Propagate measured correlation to runtime
+        rho_cc = cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.5)
+        rho_used = float(rho_cc_measured) if (np.isfinite(rho_cc_measured)) else float(rho_cc)
+        thresholds['noise.rho_between_channels_after_ctrl'] = rho_used
+        thresholds['rho_cc_measured'] = float(rho_cc_measured) if np.isfinite(rho_cc_measured) else float('nan')
+        
+        # Adaptive CTRL gating decision
+        ctrl_use = bool(cfg['pipeline'].get('use_control_channel', True))
+        if bool(cfg.get('_ctrl_auto', False)) and (mode.startswith('CSK') or mode == 'Hybrid'):
+            rho_abs = abs(rho_cc_measured) if np.isfinite(rho_cc_measured) else 0.0
+            # Simple correlation rule
+            if rho_abs < float(cfg.get('_ctrl_auto_rho_min_abs', 0.10)):
+                ctrl_use = False
+                
+            # Optional SNR gain rule (conservative approximation)
+            if ctrl_use and bool(cfg.get('_ctrl_auto', False)):
+                # For differential measurement: SNR gain ~ 1/(1-rho^2) vs single-ended
+                if rho_abs > 0:
+                    gain_linear = 1.0 / (1.0 - rho_abs**2)
+                    gain_db = 10.0 * np.log10(gain_linear) if gain_linear > 1.0 else 0.0
+                    min_gain_db = float(cfg.get('_ctrl_auto_min_gain_db', 0.0))
+                    if gain_db < min_gain_db:
+                        ctrl_use = False
+
+        # Emit decisions into the thresholds override
+        thresholds['use_control_channel'] = bool(ctrl_use)
+        thresholds['ctrl_auto_applied'] = bool(cfg.get('_ctrl_auto', False))
 
     return thresholds
 
@@ -997,6 +1068,17 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         if not (0.0 <= args.guard_factor <= 1.0):
             raise ValueError(f"--guard-factor must be between 0.0 and 1.0, got {args.guard_factor}")
     
+    if getattr(args, 'csk_target', None) is not None:
+        cfg.setdefault('pipeline', {})['csk_target_channel'] = str(args.csk_target)
+
+    if getattr(args, 'csk_dual', None) is not None:
+        cfg.setdefault('pipeline', {})['csk_dual_channel'] = (args.csk_dual == 'on')
+
+    profile = str(getattr(args, 'channel_profile', 'tri')).lower()
+    cfg.setdefault('pipeline', {})['channel_profile'] = profile
+    if profile in ('single', 'dual'):
+        cfg.setdefault('pipeline', {})['use_control_channel'] = False
+
     # NEW: LoD maximum Nm override
     if hasattr(args, 'lod_max_nm') and args.lod_max_nm is not None:
         cfg.setdefault('pipeline', {})['lod_nm_max'] = int(args.lod_max_nm)
@@ -1381,6 +1463,8 @@ def parse_arguments() -> argparse.Namespace:
                         default="always",
                         help="Run ISI trade-off sweep: always (default), auto (only when ISI enabled), or never.")
     parser.add_argument("--debug-calibration", action="store_true", help="Print detailed calibration information")
+    parser.add_argument("--channel-profile", choices=["tri", "dual", "single"], default="tri",
+                        help="Physical channel setup: tri (DA+SERO+CTRL), dual (DA+SERO), single (DA only).")
     parser.add_argument("--csk-level-scheme", choices=["uniform", "zero-based"], default="uniform",
                        help="CSK level mapping scheme")
     parser.add_argument("--resume", action="store_true", help="Resume: skip finished values and append results as we go")
@@ -1389,6 +1473,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none"], default="tqdm",
                     help="Progress UI backend")
     parser.add_argument("--nt-pairs", type=str, default="", help="CSV nt-pairs for CSK sweeps")
+
+    # --- Baseline / variant helpers ---
+    parser.add_argument(
+        "--variant", type=str, default="",
+        help="Suffix appended to CSV basenames (e.g., _single_DA, _dual)."
+    )
+    parser.add_argument(
+        "--csk-target", choices=["DA", "SERO"], default=None,
+        help="Override CSK target channel (single-channel baselines)."
+    )
+    parser.add_argument(
+        "--csk-dual", choices=["on", "off"], default=None,
+        help="Force dual-channel CSK combiner on/off for this run."
+    )
     parser.add_argument("--watchdog-secs", type=int, default=1800,
                         help="Soft timeout for seed completion before retry hint (default: 1800s/30min)") 
     parser.add_argument("--target-ci", type=float, default=0.004,
@@ -1479,12 +1577,21 @@ def parse_arguments() -> argparse.Namespace:
                    help="After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER.")
     parser.add_argument("--ser-target", type=float, default=0.01,
                    help="Target SER for auto-refine (default: 0.01).")
-    parser.add_argument("--ser-refine-points", type=int, default=2,
-                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 2).")
-    
+    parser.add_argument("--ser-refine-points", type=int, default=4,
+                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 4).")
+
     # Window guard tuning (Issue 2 optimization)
     parser.add_argument("--min-decision-points", type=int, default=4,
                         help="Minimum time points for window guard (default: 4)")
+    
+    # Adaptive CTRL control
+    parser.add_argument("--ctrl-auto", action="store_true",
+                       help="Enable adaptive CTRL on/off based on measured correlation")
+    parser.add_argument("--ctrl-rho-min-abs", type=float, default=0.10,
+                       help="Minimum absolute correlation threshold for CTRL (default: 0.10)")
+    parser.add_argument("--ctrl-snr-min-gain-db", type=float, default=0.0,
+                       help="Minimum SNR gain in dB to keep CTRL enabled (default: 0.0)")
+    
     args = parser.parse_args()
     
     # Auto-enable sleep inhibition when GUI is requested
@@ -1589,13 +1696,79 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         combiner = cal_cfg['pipeline'].get('csk_combiner', 'zscore')
         use_dual = bool(cal_cfg['pipeline'].get('csk_dual_channel', True))
         leakage = float(cal_cfg['pipeline'].get('csk_leakage_frac', 0.0))
-        rho_cc = float(cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0))
-        rho_cc = max(-1.0, min(1.0, rho_cc))
+        
+        # Enhancement 2: Use 0.5 fallback if noise model is symmetric
+        rho_pre = float(cal_cfg.get('noise', {}).get('rho_corr',
+                        cal_cfg.get('noise', {}).get('rho_correlated', 0.9)))
+        use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
+
+        noise_cfg_cal = cal_cfg.get('noise', {})
+        # FIX: Logic should check if rho_correlated is NOT explicitly set (i.e., using default)
+        # If rho_between_channels_after_ctrl is not set AND model is symmetric, use 0.5
+        if 'rho_between_channels_after_ctrl' not in noise_cfg_cal:
+            # Only use 0.5 if this is clearly a symmetric triplet setup
+            rho_post_default = 0.5 if use_ctrl else 0.0
+        else:
+            rho_post_default = noise_cfg_cal['rho_between_channels_after_ctrl']
+        rho_post = float(noise_cfg_cal.get('rho_between_channels_after_ctrl', rho_post_default))
+        rho_cc   = rho_post if (use_ctrl and mode != "MoSK") else rho_pre
+        rho_cc   = max(-1.0, min(1.0, rho_cc))
         
         # Use deterministic seeding for calibration consistency
         seed = cal_cfg['pipeline'].get('random_seed', 0)
         rng = np.random.default_rng(seed)
         
+        # Auto-measure ρ after CTRL for validation (Enhancement 1)
+        rho_cc_measured = np.nan
+        if use_ctrl and (mode.startswith('CSK') or mode == 'Hybrid'):
+            try:
+                # Generate noise-only samples for correlation measurement
+                # FIX D: Improve ρ measurement stability at low Nm
+                base_noise_samples = 20
+                # For very low Nm analysis, use more samples for stable correlation estimation
+                nm_value = cfg['pipeline'].get('Nm_per_symbol', 1e6)
+                if nm_value < 1000:  # Very low Nm regime
+                    noise_samples = 100
+                elif nm_value < 10000:  # Low Nm regime
+                    noise_samples = 50
+                else:
+                    noise_samples = base_noise_samples
+                q_da_noise, q_sero_noise = [], []
+                
+                # Temporarily set Nm to zero for noise-only measurement
+                cal_cfg_noise = deepcopy(cal_cfg)
+                cal_cfg_noise['pipeline']['Nm_per_symbol'] = 1e-6  # Minimal signal
+                
+                # Calculate detection samples for noise measurement
+                n_total_samples_noise = int(cal_cfg_noise['pipeline']['symbol_period_s'] / dt)
+                n_detect_samples_noise = min(int(detection_window_s / dt), n_total_samples_noise)
+                
+                for _ in range(noise_samples):
+                    ig_n, ia_n, ic_n, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
+                    
+                    # Apply CTRL subtraction (same as main path)
+                    sig_da_n = ig_n - ic_n
+                    sig_sero_n = ia_n - ic_n
+                    
+                    # Integrate over decision window
+                    q_da_n = float(np.trapezoid(sig_da_n[:n_detect_samples_noise], dx=dt))
+                    q_sero_n = float(np.trapezoid(sig_sero_n[:n_detect_samples_noise], dx=dt))
+                    
+                    q_da_noise.append(q_da_n)
+                    q_sero_noise.append(q_sero_n)
+                
+                # Measure empirical correlation
+                if len(q_da_noise) >= 3:
+                    rho_cc_measured = float(np.corrcoef(q_da_noise, q_sero_noise)[0, 1])
+                    if not np.isfinite(rho_cc_measured):
+                        rho_cc_measured = np.nan
+                        
+            except Exception:
+                rho_cc_measured = np.nan
+        else:
+            rho_cc_measured = np.nan
+        
+        # Main symbol generation loop
         for s_tx in tx_symbols:
             ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, [], cal_cfg, rng)
             n_total_samples = len(ig)
@@ -1653,16 +1826,25 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
                         q_da=q_da, q_sero=q_sero,
                         sigma_da=sigma_da, sigma_sero=sigma_sero,
                         rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
-                        target=target_channel
+                        target=target_channel,
+                        cfg=cal_cfg  # FIX: Pass cfg for shrinkage logic
                     )
                 else:
                     # Legacy single-channel
                     Q = q_da if target_channel == 'DA' else q_sero
                 decision_stats.append(Q)
             elif mode == "Hybrid":
-                mol_type = symbol >> 1
-                Q = q_da if mol_type == 0 else q_sero
-                decision_stats.append(Q)
+                mol_type = symbol >> 1  # 0: DA, 1: SERO (which channel carries amplitude)
+                combiner = str(cal_cfg['pipeline'].get('hybrid_combiner', cal_cfg['pipeline'].get('csk_combiner','zscore')))
+                leakage  = float(cal_cfg['pipeline'].get('hybrid_leakage_frac', cal_cfg['pipeline'].get('csk_leakage_frac', 0.0)))
+                target   = 'DA' if mol_type == 0 else 'SERO'
+                Q_amp = _csk_dual_channel_Q(
+                    q_da=q_da, q_sero=q_sero,
+                    sigma_da=sigma_da, sigma_sero=sigma_sero,
+                    rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
+                    target=target, cfg=cal_cfg
+                )
+                decision_stats.append(float(Q_amp))
         
         # Enhanced return with combiner metadata for CSK
         # Keep aux raw charges for flexible combiners
@@ -1678,11 +1860,46 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             result.update({
                 'combiner': combiner,
                 'rho_cc': rho_cc,
+                'rho_cc_measured': rho_cc_measured,  # Enhancement 1: Store measured correlation
                 'leakage_frac': leakage if combiner == 'leakage' else np.nan
             })
+        
+        # FIX A: Always include rho_cc_measured for Hybrid mode (not just CSK)
+        try:
+            if 'rho_cc_measured' in locals() and np.isfinite(rho_cc_measured):
+                result['rho_cc_measured'] = float(rho_cc_measured)
+        except Exception:
+            pass
+            
         return result
     except Exception:
         return None
+
+def _measure_rho_for_seed(cfg: Dict[str, Any], mode: str) -> float:
+    """Measure cross-channel correlation for a specific seed."""
+    if not cfg['pipeline'].get('use_control_channel', True):
+        return float('nan')
+    if mode not in ('CSK', 'Hybrid'):
+        return float('nan')
+    
+    cal = deepcopy(cfg)
+    cal['pipeline']['Nm_per_symbol'] = 1e-6  # Minimal signal
+    dt = float(cal['sim']['dt_s'])
+    win = float(cal.get('detection', {}).get('decision_window_s',
+                  cal['pipeline'].get('symbol_period_s', dt)))
+    n = max(1, int(win / dt))
+    qd, qs = [], []
+    rng = np.random.default_rng(cal['pipeline'].get('random_seed', 0))
+    
+    for _ in range(20):
+        ig, ia, ic, _ = _single_symbol_currents(0, [], cal, rng)
+        sig_da = ig - ic
+        sig_se = ia - ic
+        qd.append(float(np.trapezoid(sig_da[:n], dx=dt)))
+        qs.append(float(np.trapezoid(sig_se[:n], dx=dt)))
+    
+    r = float(np.corrcoef(qd, qs)[0, 1]) if len(qd) >= 3 else float('nan')
+    return r if np.isfinite(r) else float('nan')
 
 # ============= RUNTIME WORKERS =============
 def run_single_instance(config: Dict[str, Any], seed: int, attach_isi_meta: bool = True) -> Optional[Dict[str, Any]]:
@@ -1690,6 +1907,13 @@ def run_single_instance(config: Dict[str, Any], seed: int, attach_isi_meta: bool
     try:
         cfg_run = deepcopy(config)
         cfg_run['pipeline']['random_seed'] = int(seed)
+        mode = cfg_run['pipeline']['modulation']
+
+        # Add per-seed correlation measurement
+        rho_seed = _measure_rho_for_seed(cfg_run, mode)
+        if np.isfinite(rho_seed):
+            cfg_run.setdefault('noise', {})['rho_between_channels_after_ctrl'] = float(np.clip(rho_seed, -1.0, 1.0))
+
         mem_gb, total_gb, available_gb = check_memory_usage()
         if available_gb < 2.0:
             gc.collect()
@@ -1782,7 +2006,10 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
             for k, v in thresholds_override.items():
-                cfg_run['pipeline'][k] = v
+                if isinstance(k, str) and k.startswith('noise.'):
+                    cfg_run.setdefault('noise', {})[k.split('.', 1)[1]] = v
+                else:
+                    cfg_run['pipeline'][k] = v
         elif cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
              param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor']:
             cal_seeds = list(range(10))
@@ -1799,15 +2026,17 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         # Run the instance and attach per-run ISI metrics
         result = run_single_instance(cfg_run, seed, attach_isi_meta=True)
         if result is not None:
-            # Tag the in‑memory result so mixed cached+fresh paths dedupe correctly
+            # Tag the in-memory result so mixed cached+fresh paths dedupe correctly
             try:
                 result["__seed"] = int(seed)
             except Exception:
                 pass
             mode = cfg_base['pipeline']['modulation']
-            use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
+            # FIX: Use effective CTRL setting from thresholds_override
+            eff_use_ctrl = bool((thresholds_override or {}).get('use_control_channel',
+                                cfg_run['pipeline'].get('use_control_channel', True)))
             result_safe = cast(Dict[str, Any], _json_safe(result))
-            write_seed_cache(mode, sweep_name, param_value, seed, result_safe, use_ctrl, cache_tag)
+            write_seed_cache(mode, sweep_name, param_value, seed, result_safe, eff_use_ctrl, cache_tag)
         return result
 
     except Exception as e:
@@ -1963,12 +2192,16 @@ def run_sweep(cfg: Dict[str, Any],
     aggregated_rows: List[Dict[str, Any]] = []
 
     for v in values_to_run:
+        # FIX: Get effective CTRL state for this value
+        use_ctrl_for_v = bool(thresholds_map.get(v, {}).get('use_control_channel',
+                            cfg['pipeline'].get('use_control_channel', True)))
+        
         # Split cached vs missing seeds
         cached_results: List[Dict[str, Any]] = []
         seeds_to_run: List[int] = []
         if resume:
             for s in seeds:
-                r = read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag)
+                r = read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl_for_v, cache_tag)  # FIX: use effective
                 if r is not None:
                     cached_results.append(r)
                 else:
@@ -2169,11 +2402,14 @@ def run_sweep(cfg: Dict[str, Any],
                         if mode_name in ("MoSK", "Hybrid") else
                         "CSK Q-statistic (dual-channel combiner)")
 
+        # Extract rho_cc_measured safely before creating the dictionary
+        rho_cc_raw = thresholds_map.get(v, {}).get('rho_cc_measured', float('nan'))
+        
         row: Dict[str, Any] = {
             sweep_param: v,
             'ser': ser,
             'snr_db': snr_db,
-            'snr_semantics': snr_semantics,  # <-- NEW
+            'snr_semantics': snr_semantics,
             'num_runs': len(results),
             'symbols_evaluated': int(total_symbols),
             'sequence_length': int(cfg['pipeline']['sequence_length']),
@@ -2186,7 +2422,10 @@ def run_sweep(cfg: Dict[str, Any],
             'noise_sigma_sero': med_sigma_sero,
             'noise_sigma_I_diff': med_sigma_diff,
             'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
-            'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+            'use_ctrl': bool(thresholds_map.get(v, {}).get('use_control_channel',
+                            cfg['pipeline'].get('use_control_channel', True))),
+            'ctrl_auto_applied': bool(thresholds_map.get(v, {}).get('ctrl_auto_applied', False)),
+            'rho_cc_measured': float(rho_cc_raw) if isinstance(rho_cc_raw, (int, float)) else float('nan'),
             'mode': mode_name,
         }
         # Duplicate Nm column name for plotting compatibility
@@ -2552,7 +2791,8 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         # 2) Try to reconstruct a sane bracket from per-Nm tallies
         t = state.get("tested", {})
         if isinstance(t, dict) and t:
-            succ, fail = [], []
+            succ: list[int] = []
+            fail: list[int] = []
             for k, v in t.items():
                 try:
                     nm = int(k)
@@ -3647,6 +3887,11 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # NEW: Apply CLI overrides
     cfg = apply_cli_overrides(cfg, args)
     
+    # Adaptive CTRL configuration
+    cfg['_ctrl_auto'] = args.ctrl_auto
+    cfg['_ctrl_auto_rho_min_abs'] = args.ctrl_rho_min_abs
+    cfg['_ctrl_auto_min_gain_db'] = args.ctrl_snr_min_gain_db
+    
     # Apply CTRL ablation control
     use_ctrl = args.use_ctrl
     cfg['pipeline']['use_control_channel'] = use_ctrl
@@ -3692,11 +3937,20 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     data_dir = results_dir / "data"
     figures_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{args.variant}" if getattr(args, 'variant', '') else ''
 
     cfg['pipeline']['enable_isi'] = not args.disable_isi
     cfg['pipeline']['modulation'] = mode
     cfg['pipeline']['sequence_length'] = args.sequence_length
+    profile = str(getattr(args, 'channel_profile', 'tri')).lower()
+    cfg['pipeline']['channel_profile'] = profile
+    if profile == 'single':
+        cfg['pipeline']['csk_dual_channel'] = False
+    elif profile == 'dual':
+        cfg['pipeline']['csk_dual_channel'] = cfg['pipeline'].get('csk_dual_channel', True)
     cfg['pipeline']['use_control_channel'] = bool(args.use_ctrl)
+    if profile in ('single', 'dual'):
+        cfg['pipeline']['use_control_channel'] = False
     print(f"CTRL subtraction: {'ON' if cfg['pipeline']['use_control_channel'] else 'OFF'}")
     cfg['verbose'] = args.verbose
     # Stage 13: pass adaptive-CI config via cfg (so workers see it)
@@ -3728,8 +3982,14 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     if mode.startswith("CSK"):
         cfg['pipeline']['csk_levels'] = 4
-        cfg['pipeline']['csk_target_channel'] = 'DA'
+        cfg['pipeline'].setdefault('csk_target_channel', 'DA')
         cfg['pipeline']['csk_level_scheme'] = args.csk_level_scheme
+        profile = cfg['pipeline'].get('channel_profile', 'tri')
+        if profile == 'single':
+            cfg['pipeline']['csk_dual_channel'] = False
+            cfg['pipeline']['csk_target_channel'] = cfg['pipeline'].get('csk_target_channel', 'DA')
+        elif profile == 'dual':
+            cfg['pipeline']['csk_dual_channel'] = cfg['pipeline'].get('csk_dual_channel', True)
         print(f"CSK Configuration: {cfg['pipeline']['csk_levels']} levels, "
               f"{cfg['pipeline']['csk_target_channel']} channel, "
               f"{args.csk_level_scheme} scheme")
@@ -3807,7 +4067,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         ser_bar = None
 
     # CSV file paths
-    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"
+    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}{suffix}.csv"
 
     # ---------- 1) SER vs Nm ----------
     print("\n1. Running SER vs. Nm sweep...")
@@ -4004,7 +4264,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             d_run = [int(x) for x in cfg['distances_um']]
         else:
             d_run = [25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150, 175, 200]
-    lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
+    lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
     pm.set_status(mode=mode, sweep="LoD vs distance")
     # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
     pool = global_pool.get_pool(max_workers=maxw)
@@ -4441,7 +4701,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # --- pick an anchor for ISI sweep (after LoD) ---
         d_ref = None
         nm_ref = None
-        lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
+        lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
         if lod_csv.exists():
             df_lod_all = pd.read_csv(lod_csv)
             # choose CTRL-matching rows
@@ -4475,7 +4735,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
         guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
         isi_jobs = len(guard_values) * len(seeds)
-        isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}.csv"
+        isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}{suffix}.csv"
         pm.set_status(mode=mode, sweep="ISI trade-off")
         isi_key = ("sweep", mode, "ISI_tradeoff")
         isi_bar = None

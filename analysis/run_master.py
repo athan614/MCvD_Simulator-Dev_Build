@@ -232,6 +232,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     ]
     # Ablation flag
     cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
+    if getattr(args, 'channel_profile', 'tri') != 'tri':
+        cmd.extend(['--channel-profile', args.channel_profile])
     if args.resume and not args.reset:
         cmd.append("--resume")
     if args.recalibrate:
@@ -311,8 +313,16 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--ser-refine")
     if args.ser_target != 0.01:
         cmd.extend(["--ser-target", str(args.ser_target)])
-    if args.ser_refine_points != 2:
+    if args.ser_refine_points != 4:
         cmd.extend(["--ser-refine-points", str(args.ser_refine_points)])
+
+    # Forward adaptive CTRL arguments
+    if getattr(args, 'ctrl_auto', False):
+        cmd.append("--ctrl-auto")
+    if hasattr(args, 'ctrl_rho_min_abs') and args.ctrl_rho_min_abs != 0.10:
+        cmd.extend(["--ctrl-rho-min-abs", str(args.ctrl_rho_min_abs)])
+    if hasattr(args, 'ctrl_snr_min_gain_db') and args.ctrl_snr_min_gain_db != 0.0:
+        cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
 
     # Pass logging controls through to child...
     return cmd
@@ -344,6 +354,8 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     ]
     # Ablation flag
     cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
+    if getattr(args, 'channel_profile', 'tri') != 'tri':
+        cmd.extend(['--channel-profile', args.channel_profile])
     # Resume / recalibrate
     if args.resume and not args.reset:
         cmd.append("--resume")
@@ -425,8 +437,16 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.append("--ser-refine")
     if args.ser_target != 0.01:
         cmd.extend(["--ser-target", str(args.ser_target)])
-    if args.ser_refine_points != 2:
+    if args.ser_refine_points != 4:
         cmd.extend(["--ser-refine-points", str(args.ser_refine_points)])
+
+    # Forward adaptive CTRL arguments
+    if getattr(args, 'ctrl_auto', False):
+        cmd.append("--ctrl-auto")
+    if hasattr(args, 'ctrl_rho_min_abs') and args.ctrl_rho_min_abs != 0.10:
+        cmd.extend(["--ctrl-rho-min-abs", str(args.ctrl_rho_min_abs)])
+    if hasattr(args, 'ctrl_snr_min_gain_db') and args.ctrl_snr_min_gain_db != 0.0:
+        cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
 
     # Pass logging controls through to child...
     return cmd
@@ -481,6 +501,14 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
     
+    # Forward adaptive CTRL arguments
+    if getattr(args, 'ctrl_auto', False):
+        cmd.append("--ctrl-auto")
+    if hasattr(args, 'ctrl_rho_min_abs') and args.ctrl_rho_min_abs != 0.10:
+        cmd.extend(["--ctrl-rho-min-abs", str(args.ctrl_rho_min_abs)])
+    if hasattr(args, 'ctrl_snr_min_gain_db') and args.ctrl_snr_min_gain_db != 0.0:
+        cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
+    
     return cmd
 
 def _child_max_workers(args: argparse.Namespace, num_modes: int = 1) -> Optional[int]:
@@ -529,11 +557,16 @@ def main() -> None:
     p.add_argument("--realistic-onsi", action="store_true",
                    help="Use cached simulation noise for ONSI calculation in hybrid benchmarks")
     p.add_argument("--nt-pairs", type=str, default="",
-                   help="Comma-separated NT pairs for CSK sweeps, e.g. DA-5HT,DA-DA")
+                    help="Comma-separated NT pairs for CSK sweeps, e.g. DA-5HT,DA-DA")
+    p.add_argument("--csk-baselines", action="store_true",
+                   help="Generate CSK single/dual baseline sweeps and comparison plots.")
+    p.add_argument("--channel-suite", action="store_true",
+                   help="Run physical channel baselines (single-channel DA and dual-channel DA+SERO).")
+    p.add_argument("--validate-theory", action="store_true",
+                   help="Run analytic BER/SEP and diffusion validation figure scripts.")
     p.add_argument("--nm-grid", type=str, default="",
-                   help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
-                        "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
-    # Performance pass-through
+                    help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
+                         "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
     p.add_argument("--extreme-mode", action="store_true", help="Pass through to run_final_analysis (max P-core threads)")
     p.add_argument("--beast-mode", action="store_true", help="Pass through to run_final_analysis (P-cores minus margin)")
     p.add_argument("--max-workers", type=int, default=None, help="Override worker count in run_final_analysis")
@@ -557,8 +590,8 @@ def main() -> None:
                    help="After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER.")
     p.add_argument("--ser-target", type=float, default=0.01,
                    help="Target SER for auto-refine (default: 0.01).")
-    p.add_argument("--ser-refine-points", type=int, default=2,
-                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 2).")
+    p.add_argument("--ser-refine-points", type=int, default=4,
+                   help="How many log-spaced Nm points to add between the bracketing Nm pair (default: 4).")
     
     # Stage-13 tuning pass-through
     p.add_argument("--target-ci", type=float, default=0.0,
@@ -603,6 +636,8 @@ def main() -> None:
                    help="Minimum samples per class for stable thresholds (pass-through)")
     p.add_argument("--min-decision-points", type=int, default=4,
                    help="Minimum time points for window guard (pass-through)")
+    p.add_argument("--studies", type=str, default="",
+                   help="Comma list from {sensitivity,capacity,isi-analytic}. Empty = none.")
     p.add_argument("--lod-distance-concurrency", type=int, default=8,
                 help="How many distances to run concurrently in LoD sweep (default: 8).")
     # Reset
@@ -622,6 +657,15 @@ def main() -> None:
                    help="Force fsync on each write")
     p.add_argument("--inhibit-sleep", action="store_true",
                    help="Prevent the OS from sleeping while the pipeline runs")
+    
+    # Adaptive CTRL control (pass-through)
+    p.add_argument("--ctrl-auto", action="store_true",
+                   help="Enable adaptive CTRL on/off (pass-through)")
+    p.add_argument("--ctrl-rho-min-abs", type=float, default=0.10,
+                   help="Minimum correlation threshold for CTRL (pass-through)")
+    p.add_argument("--ctrl-snr-min-gain-db", type=float, default=0.0,
+                   help="Minimum SNR gain for CTRL (pass-through)")
+    
     p.add_argument("--keep-display-on", action="store_true",
                    help="Also keep the display awake (Windows/macOS)")
 
@@ -678,13 +722,17 @@ def main() -> None:
             # Avoid infeasible tails: skip LoD when Ts is too large (no physics change)
             if not hasattr(args, 'distances') or args.distances == "":
                 # keep long points optional; user can restore by passing --max-ts-for-lod=None
-                args.distances = "25,35,45,55,65,75,85,95,105,125,150,175"
+                args.distances = "15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150"
             
             # Force comprehensive coverage
             args.modes = "all"
             args.ablation = "both"
             args.supplementary = True
+            _set_if_default("channel_suite", True)
+            _set_if_default("csk_baselines", True)
+            _set_if_default("validate_theory", True)
             _set_if_default("baseline_isi", "off")
+            _set_if_default("studies", "sensitivity,capacity,isi-analytic")
             
             # Optimize performance (but allow manual override)
             if args.max_workers is None and not args.extreme_mode and not args.beast_mode:
@@ -767,6 +815,8 @@ def main() -> None:
             except Exception:
                 pass
 
+    studies_set = {s.strip().lower() for s in (args.studies or "").split(",") if s.strip()}
+
     # Resolve ablation plan
     if args.ablation == "on":
         ablation_runs = [True]   # CTRL ON only
@@ -793,15 +843,31 @@ def main() -> None:
         ] + ([f"--preset={args.preset}"] if args.preset else []) +
             ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
             ([f"--nm-grid={args.nm_grid}"] if args.nm_grid else []) +
+            (["--csk-baselines"] if args.csk_baselines else []) +
+            (["--channel-suite"] if args.channel_suite else []) +
+            (["--validate-theory"] if args.validate_theory else []) +
             (["--recalibrate"] if args.recalibrate else []) +
             (["--extreme-mode"] if args.extreme_mode else (["--beast-mode"] if args.beast_mode else [])) +
-            ([f"--max-workers={args.max_workers}"] if args.max_workers is not None else [])
+            ([f"--max-workers={args.max_workers}"] if args.max_workers is not None else []) +
+            ([f"--studies={args.studies}"] if args.studies else [])
     }
 
     # Dynamic step plan: split simulate into per-ablation steps
     steps: List[str] = []
     steps.extend(["simulate_ctrl_on" if use else "simulate_ctrl_off" for use in ablation_runs])
+    if args.csk_baselines:
+        steps.append("csk_baselines")
+    if args.channel_suite:
+        steps.append("channel_suite")
+    if args.validate_theory:
+        steps.append("validate_theory")
     steps += ["plots", "isi", "hybrid", "nb_replicas", "tables"]
+    if "sensitivity" in studies_set:
+        steps.append("study_sensitivity")
+    if "capacity" in studies_set:
+        steps.append("study_capacity")
+    if "isi-analytic" in studies_set:
+        steps.append("study_isi_analytic")
     if args.supplementary:
         steps.extend(["supplementary", "appendix"])
 
@@ -1025,6 +1091,7 @@ def main() -> None:
                                 'debug_calibration': False,
                                 'csk_level_scheme': 'uniform',
                                 'min_decision_points': 4,
+                                'channel_profile': getattr(args, 'channel_profile', 'tri'),
                                 
                                 # Special handling for disable_isi (computed from baseline_isi)
                                 'disable_isi': (args.baseline_isi == "off"),
@@ -1061,7 +1128,7 @@ def main() -> None:
                                 'ts_warn_only': getattr(args, 'ts_warn_only', False),
                                 'ser_refine': getattr(args, 'ser_refine', False),
                                 'ser_target': getattr(args, 'ser_target', 0.01),
-                                'ser_refine_points': getattr(args, 'ser_refine_points', 2)
+                                'ser_refine_points': getattr(args, 'ser_refine_points', 4)
                             }
                             
                             # Set all required attributes, using existing values if present, defaults otherwise
@@ -1073,12 +1140,20 @@ def main() -> None:
                         
                         for f in as_completed(futs):
                             if master_cancelled.is_set():
+                                # Cancel remaining futures
+                                for remaining in futs:
+                                    remaining.cancel()
                                 return 130
                             try:
                                 f.result()
+                                rcs.append(0)  # Track successful completion
                             except Exception as e:
                                 print(f"💥 Shared pool mode execution failed: {e}")
-                                return 1
+                                rcs.append(1)  # Track failure
+                        # Check if any mode failed
+                        if any(rc != 0 for rc in rcs):
+                            print(f"✗ One or more modes failed in shared pool mode: {skey}")
+                            return 1
                 else:
                     # Original behavior: each mode gets split worker allocation
                     with ThreadPoolExecutor(max_workers=maxp) as tpool:
@@ -1162,6 +1237,138 @@ def main() -> None:
                     sys.exit(rc)
                 sub[key].update(1); sub[key].close(); overall.update(1)
 
+        if args.csk_baselines:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("?? Master pipeline stopped by user")
+                sys.exit(130)
+
+            if not (args.resume and state.get("csk_baselines", {}).get("done")):
+                print("\n?? Running CSK baseline sweeps (single vs dual)...")
+
+                def _exec_baseline(cmd: List[str]) -> None:
+                    print(f"  $ {' '.join(cmd)}")
+                    rc = _run_tracked(cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, "csk_baselines")
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, "csk_baselines")
+                        sys.exit(rc)
+
+                ser_baselines = [
+                    (False, ["--variant", "single_DA_noctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                    (False, ["--variant", "single_SERO_noctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                    (False, ["--variant", "dual_noctrl", "--csk-dual", "on"]),
+                ]
+                for use_ctrl, extra in ser_baselines:
+                    cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                    cmd.extend(extra)
+                    _exec_baseline(cmd)
+
+                lod_baselines = [
+                    (True, ["--variant", "single_DA_ctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                    (True, ["--variant", "single_SERO_ctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                    (True, ["--variant", "dual_ctrl", "--csk-dual", "on"]),
+                ]
+                for use_ctrl, extra in lod_baselines:
+                    cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                    cmd.extend(extra)
+                    _exec_baseline(cmd)
+
+                plot_script = project_root / "analysis" / "plot_csk_single_dual.py"
+                if plot_script.exists():
+                    _exec_baseline([sys.executable, "-u", str(plot_script)])
+                else:
+                    print("??  CSK baseline plot script not found; skipping plot step")
+
+                _mark_done(state, "csk_baselines")
+
+            sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
+
+        if args.channel_suite:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("?? Master pipeline stopped by user")
+                sys.exit(130)
+
+            key = "channel_suite"
+            if not (args.resume and state.get(key, {}).get('done')):
+                print("\n?? Running physical channel suite (single & dual channels)...")
+
+                def _exec_suite(cmd: List[str]) -> None:
+                    print(f"  $ {' '.join(cmd)}")
+                    rc = _run_tracked(cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, key)
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, key)
+                        sys.exit(rc)
+
+                modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+                profiles = [("single", "single_physical", False), ("dual", "dual_physical", False)]
+                for profile, variant, use_ctrl in profiles:
+                    print(f"   -> {profile.title()} profile")
+                    for mode in modes:
+                        cmd = _build_run_final_cmd_for_mode(args, mode, use_ctrl, concurrent_modes=1)
+                        cmd.extend(["--channel-profile", profile, "--variant", variant])
+                        if profile == 'single':
+                            if mode.startswith('CSK'):
+                                cmd.extend(["--csk-target", "DA", "--csk-dual", "off"])
+                            elif mode == 'Hybrid':
+                                cmd.extend(["--csk-dual", "off"])
+                        elif profile == 'dual' and mode.startswith('CSK'):
+                            cmd.extend(["--csk-dual", "on"])
+
+                plot_script = project_root / "analysis" / "plot_channel_profiles.py"
+                if plot_script.exists():
+                    _exec_suite([sys.executable, "-u", str(plot_script)])
+                else:
+                    print("??  Channel profile plot script not found; skipping plot step")
+
+                _mark_done(state, key)
+
+            sub["channel_suite"].update(1); sub["channel_suite"].close(); overall.update(1)
+
+        if args.validate_theory:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("?? Master pipeline stopped by user")
+                sys.exit(130)
+
+
+            key = "validate_theory"
+            if not (args.resume and state.get(key, {}).get("done")):
+                scripts: List[Path] = [
+                    project_root / "analysis" / "validate_analytics.py",
+                    project_root / "analysis" / "validate_transport_against_fick.py",
+                    project_root / "analysis" / "rebuild_oect_figs.py",
+                    project_root / "analysis" / "rebuild_binding_figs.py",
+                    project_root / "analysis" / "rebuild_transport_figs.py",
+                    project_root / "analysis" / "rebuild_pipeline_figs.py",
+                ]
+                for script in scripts:
+                    if not script.exists():
+                        print(f"??  Script not found: {script.name}")
+                        continue
+                    cmd = [sys.executable, "-u", str(script)]
+                    rc = _run_tracked(cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, key)
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, key)
+                        sys.exit(rc)
+                _mark_done(state, key)
+
+
+            sub[key].update(1); sub[key].close(); overall.update(1)
+
+
         # Check cancellation before each major step
         if master_cancelled.is_set():
             _safe_close_progress(pm, overall, sub)
@@ -1237,26 +1444,23 @@ def main() -> None:
 
         # --- Optional notebook-replica panels (if present) ---
         if not (args.resume and state.get("nb_replicas", {}).get("done")):
-            for script in [
-                "analysis/rebuild_oect_figs.py",
-                "analysis/rebuild_binding_figs.py",
-                "analysis/rebuild_transport_figs.py",
-                "analysis/rebuild_pipeline_figs.py",
-            ]:
-                script_path = Path(script)
+            scripts = [
+                project_root / "analysis" / "rebuild_oect_figs.py",
+                project_root / "analysis" / "rebuild_binding_figs.py",
+                project_root / "analysis" / "rebuild_transport_figs.py",
+                project_root / "analysis" / "rebuild_pipeline_figs.py",
+            ]
+            for script_path in scripts:
                 if not script_path.exists():
-                    print(f"⚠️  Script not found: {script}"); continue
-                rc = _run_tracked([sys.executable, "-u", script])
+                    print(f"??  Script not found: {script_path.name}"); continue
+                rc = _run_tracked([sys.executable, "-u", str(script_path)])
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, "nb_replicas")
-                    print("🛑 Master pipeline stopped by user")
+                    print("?? Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
                     _safe_close_progress(pm, overall, sub, "nb_replicas")
                     sys.exit(rc)
-            _mark_done(state, "nb_replicas")
-        sub["nb_replicas"].update(1); sub["nb_replicas"].close(); overall.update(1)
-
         # Check cancellation before tables step
         if master_cancelled.is_set():
             _safe_close_progress(pm, overall, sub)
@@ -1283,6 +1487,66 @@ def main() -> None:
                 sys.exit(rc)
             _mark_done(state, "tables")
         sub["tables"].update(1); sub["tables"].close(); overall.update(1)
+
+        if "study_sensitivity" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("[stop] Master pipeline stopped by user")
+                sys.exit(130)
+            key = "study_sensitivity"
+            if not (args.resume and state.get(key, {}).get("done")):
+                print()
+                print("[study] Running parameter sensitivity sweeps...")
+                rc = _run_tracked([sys.executable, "-u", "analysis/sensitivity_study.py", "--progress", args.progress])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, key)
+                    print("[stop] Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, key)
+                    sys.exit(rc)
+                _mark_done(state, key)
+            sub[key].update(1); sub[key].close(); overall.update(1)
+
+        if "study_capacity" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("[stop] Master pipeline stopped by user")
+                sys.exit(130)
+            key = "study_capacity"
+            if not (args.resume and state.get(key, {}).get("done")):
+                print()
+                print("[study] Running capacity analysis...")
+                rc = _run_tracked([sys.executable, "-u", "analysis/capacity_analysis.py", "--progress", args.progress])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, key)
+                    print("[stop] Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, key)
+                    sys.exit(rc)
+                _mark_done(state, key)
+            sub[key].update(1); sub[key].close(); overall.update(1)
+
+        if "study_isi_analytic" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("[stop] Master pipeline stopped by user")
+                sys.exit(130)
+            key = "study_isi_analytic"
+            if not (args.resume and state.get(key, {}).get("done")):
+                print()
+                print("[study] Building analytic ISI overlay...")
+                rc = _run_tracked([sys.executable, "-u", "analysis/isi_analytic_model.py", "--progress", args.progress])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, key)
+                    print("[stop] Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, key)
+                    sys.exit(rc)
+                _mark_done(state, key)
+            sub[key].update(1); sub[key].close(); overall.update(1)
 
         # --- Supplementary (optional) ---
         if "supplementary" in sub:

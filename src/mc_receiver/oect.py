@@ -7,7 +7,7 @@ with batch operations and efficient FFT-based methods.
 
 from __future__ import annotations
 import numpy as np
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, cast
 from scipy import signal    #type: ignore
 from ..constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
 
@@ -133,7 +133,7 @@ def oect_trio(bound_sites_trio: np.ndarray,
     R_ch = cfg["oect"]["R_ch_Ohm"]
     gm = cfg["oect"]["gm_S"]
     C_tot = cfg["oect"]["C_tot_F"]
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
     I_DC = gm * abs(V_g_bias)
     I_DC = max(I_DC, 1e-6)
 
@@ -218,10 +218,10 @@ def oect_current(
     alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
     N_c = oect.get('N_c', cfg.get('N_c'))
     K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
-    T = cfg.get('temperature_K', 310)  # ✅ Add missing temperature
+    T = cfg['sim'].get('temperature_K', 310)
     
     # Time parameters
-    dt = cfg['dt_s']
+    dt = cfg['sim']['dt_s']
     fs = 1 / dt
     n_samples = len(bound_sites_t)
     duration = n_samples * dt
@@ -230,7 +230,7 @@ def oect_current(
     i_signal = gm * q_eff * ELEMENTARY_CHARGE * bound_sites_t / C_tot
     
     # DC current for noise calculations
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
     I_DC = gm * abs(V_g_bias)
     I_DC = max(I_DC, 1e-6)
     
@@ -242,9 +242,9 @@ def oect_current(
     # VECTORIZED: Generate all noise components at once
     if cfg.get('deterministic_mode', False):
         # No noise in deterministic mode
-        i_thermal = np.zeros(n_samples)
-        i_flicker = np.zeros(n_samples)
-        i_drift = np.zeros(n_samples)
+        i_thermal = np.zeros(n_samples, dtype=np.float64)
+        i_flicker = np.zeros(n_samples, dtype=np.float64)
+        i_drift = np.zeros(n_samples, dtype=np.float64)
     else:
         # Generate complex noise for all components
         complex_noise = rng.normal(size=(3, n_freqs)) + 1j * rng.normal(size=(3, n_freqs))
@@ -254,18 +254,18 @@ def oect_current(
         psd_thermal = 4 * BOLTZMANN * T / R_ch
         effective_B = min(B_det, fs / 2)
         thermal_scale = np.sqrt(psd_thermal * effective_B / 2)
-        i_thermal = np.fft.irfft(complex_noise[0] * thermal_scale, n=n_samples)
+        i_thermal = cast(np.ndarray, np.fft.irfft(complex_noise[0] * thermal_scale, n=n_samples))
         
         # 2. Flicker noise
         K_f = alpha_H / N_c
         psd_flicker = K_f * I_DC**2 / freqs
         flicker_scale = np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_samples)
-        i_flicker = np.fft.irfft(complex_noise[1] * flicker_scale, n=n_samples)
+        i_flicker = cast(np.ndarray, np.fft.irfft(complex_noise[1] * flicker_scale, n=n_samples))
         
         # 3. Drift noise
         psd_drift = K_d * I_DC**2 / (freqs**2)
         drift_scale = np.sqrt(psd_drift * fs / 2) / np.sqrt(n_samples)
-        i_drift = np.fft.irfft(complex_noise[2] * drift_scale, n=n_samples)
+        i_drift = cast(np.ndarray, np.fft.irfft(complex_noise[2] * drift_scale, n=n_samples))
     
     # Total current
     i_total = i_signal + i_thermal + i_flicker + i_drift
@@ -309,10 +309,10 @@ def oect_current_batch(
     alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
     N_c = oect.get('N_c', cfg.get('N_c'))
     K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
-    T = cfg.get('temperature_K', 310)
+    T = cfg['sim'].get('temperature_K', 310)
     
     # Time parameters
-    dt = cfg['dt_s']
+    dt = cfg['sim']['dt_s']
     fs = 1 / dt
     duration = n_time * dt
     
@@ -330,7 +330,7 @@ def oect_current_batch(
         }
     
     # DC current for noise calculations (use mean of each batch)
-    V_g_bias = cfg.get('V_g_bias_V', -0.2)
+    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
     I_DC = gm * abs(V_g_bias)
     I_DC = max(I_DC, 1e-6)
     
@@ -389,7 +389,7 @@ def oect_static_gain(N_b: float, nt: str, cfg: Dict[str, Any]) -> float:
     gm = cfg['oect']['gm_S']
     C_tot = cfg['oect']['C_tot_F']
     
-    delta_I = gm * q_eff * ELEMENTARY_CHARGE * N_b / C_tot * -1.0
+    delta_I = gm * q_eff * ELEMENTARY_CHARGE * N_b / C_tot
     
     return delta_I
 

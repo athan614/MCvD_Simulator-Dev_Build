@@ -189,6 +189,12 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                     ax2.loglog(g[nmcol], g['csk_ser'], color=colors['CSK'], 
                             linestyle='-.', linewidth=2, 
                             label=f'CSK errors{suf}', marker='s', markersize=5, alpha=alpha)
+                    
+                    # Enhancement B: Add conditional CSK error for both CTRL states
+                    if 'conditional_csk_ser' in g.columns:
+                        ax2.loglog(g[nmcol], g['conditional_csk_ser'], color='red', 
+                                linestyle='--' if ls=='-' else ':', linewidth=2, 
+                                label=f'CSK|MoSK ok{suf}', marker='D', markersize=5, alpha=alpha*0.8)
             else:
                 # Single CTRL state or no CTRL column - original behavior
                 dfh = dfh.sort_values(nmcol)

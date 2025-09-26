@@ -103,11 +103,13 @@ def diagnose_csk_levels():
             
             # Compute dual-channel Q
             if use_dual:
+# MISSING cfg parameter
                 Q = _csk_dual_channel_Q(
                     q_da=q_da, q_sero=q_sero,
                     sigma_da=sigma_da, sigma_sero=sigma_sero,
                     rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
-                    target=target_channel
+                    target=target_channel,
+                    cfg=cfg
                 )
             else:
                 # Legacy single-channel

@@ -73,7 +73,7 @@ noise:
   N_c: 4.5e11                   # CORRECTED: Literature standard
   effective_correlation: 0.9        # Override for noise calculations
   detection_bandwidth_Hz: 100       # Override detection bandwidth
-  rho_between_channels_after_ctrl: 0.1  # NEW: Cross-channel correlation after CTRL subtraction  
+  rho_between_channels_after_ctrl: 0.5  # residual Corr(DA-CTRL, SERO-CTRL) for symmetric triplet
 
 # -------- Simulation window --------
 monte_carlo_trials: 10000
@@ -158,7 +158,7 @@ pipeline:
   aptamer_specificity:
     GLU: {GLU: 1.0, GABA: 0.0}    # GLU aptamers only bind GLU
     GABA: {GLU: 0.0, GABA: 1.0}   # GABA aptamers only bind GABA
-    CTRL: {GLU: 0.05, GABA: 0.05}  # CORRECTED: 5% cross-reactivity (was 0.001)
+    CTRL: {GLU: 0.0, GABA: 0.0}    # Control must be signal-free for differential subtraction
   # Channel-specific aptamer counts (tri-channel architecture)
   N_sites_glu: 1.0e9              # Aptamer sites for GLU channel
   N_sites_gaba: 1.0e9             # Aptamer sites for GABA channel

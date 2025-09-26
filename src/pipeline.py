@@ -63,7 +63,8 @@ def _csk_dual_channel_Q(
     rho_cc: float,
     combiner: str = "zscore",
     leakage_frac: float = 0.0,
-    target: str = "DA"
+    target: str = "DA",
+    cfg: Optional[Dict[str, Any]] = None  # FIX: Add cfg parameter
 ) -> float:
     """
     Compute dual-channel CSK decision statistic Q_comb = w_t Q_t + w_o Q_o.
@@ -75,6 +76,7 @@ def _csk_dual_channel_Q(
         combiner: "zscore", "whitened", or "leakage"
         leakage_frac: For leakage combiner, fraction of signal on 'other' channel
         target: "DA" or "SERO" - which channel carries the primary signal
+        cfg: Optional configuration dictionary for shrinkage parameters
     """
     # Nominal means direction (amplitude-only lives on 'target' axis)
     # μ = [μ_t, μ_o]; for pure CSK (no leakage): μ = [μ_t, 0]; with leakage: μ_o = leakage_frac * μ_t
@@ -86,13 +88,32 @@ def _csk_dual_channel_Q(
     if combiner == "zscore":
         # Numerically well-conditioned, scale-free:
         # Q = (Qt/σt) − ρ * (Qo/σo)
-        return (Qt / max(sg_t, 1e-30)) - rho * (Qo / max(sg_o, 1e-30))
+        if abs(rho) >= 0.1:
+            # FIX B: Use measured rho when available, with CI-aware shrinkage for stability
+            rho_effective = rho
+            
+            # Optional: shrinkage based on sample size (if metadata available)
+            # For very low Nm, shrink toward 0 to reduce over-subtraction risk
+            if cfg is not None:  # FIX: Check cfg exists
+                pipeline_cfg = cfg.get('pipeline', {})
+                n_samples = pipeline_cfg.get('_noise_sample_size', 100)  # default to 100
+                if n_samples < 50:  # few samples, apply shrinkage
+                    shrinkage_factor = min(1.0, n_samples / 50.0)
+                    rho_effective = shrinkage_factor * rho
+            
+            return Qt/sg_t - rho_effective * (Qo/sg_o)
+        else:
+            # keep variance normalization for stability
+            return Qt / max(sg_t, 1e-30)
 
     elif combiner == "whitened":
         # Fisher LDA for ordered classes; w ∝ Σ^{-1} μ, Σ = [[σt^2, ρσtσo],[ρσtσo, σo^2]]
         # For pure CSK (μ=[μt,0]), up to scale: w ∝ [1/σt^2, -ρ/(σtσo)].
         # Implement via the scale-free z-score equivalent for stability:
-        return (Qt / max(sg_t, 1e-30)) - rho * (Qo / max(sg_o, 1e-30))
+        if abs(rho) >= 0.1:
+            return (Qt / max(sg_t, 1e-30)) - rho * (Qo / max(sg_o, 1e-30))
+        else:
+            return (Qt / max(sg_t, 1e-30))  # no benefit from cross-channel term
 
     elif combiner == "leakage":
         # General Σ^{-1} μ with μ = [μt, μo] and μo = leakage_frac * μt
@@ -316,6 +337,10 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         distance_sero_m = distance_m
         distance_ctrl_m = distance_m
     
+    profile = str(cfg['pipeline'].get('channel_profile', 'tri')).lower()
+    sero_active = profile in ('dual', 'tri')
+    ctrl_active = profile == 'tri'
+
     mod = cfg['pipeline']['modulation']
     level_scheme = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     
@@ -421,9 +446,10 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             conc_at_da_ch += conc_da
             sym_da += conc_da
         else:  # SERO
-            conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
-            conc_at_sero_ch += conc_sero
-            sym_sero += conc_sero
+            if sero_active:
+                conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+                conc_at_sero_ch += conc_sero
+                sym_sero += conc_sero
             
     elif mod.startswith("CSK"):
         target_channel = cfg['pipeline'].get('csk_target_channel', 'DA')
@@ -433,9 +459,10 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
                 conc_at_da_ch += conc_da
                 sym_da += conc_da
             else:  # SERO
-                conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
-                conc_at_sero_ch += conc_sero
-                sym_sero += conc_sero
+                if sero_active:
+                    conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+                    conc_at_sero_ch += conc_sero
+                    sym_sero += conc_sero
             
     elif mod == "Hybrid":
         mol_type_bit = s_tx >> 1
@@ -444,23 +471,30 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             conc_at_da_ch += conc_da
             sym_da += conc_da
         else:  # SERO
-            conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
-            conc_at_sero_ch += conc_sero
-            sym_sero += conc_sero
+            if sero_active:
+                conc_sero = finite_burst_concentration(Nm_actual, distance_sero_m, t_vec, cfg, 'SERO')
+                conc_at_sero_ch += conc_sero
+                sym_sero += conc_sero
     
     # INDEPENDENT Binding simulation for each channel
     cfg_da = cfg.copy()
     cfg_da['N_apt'] = cfg.get('binding', {}).get('N_sites_da', cfg.get('N_apt'))
     bound_da_ch, _, _ = bernoulli_binding(conc_at_da_ch, 'DA', cfg_da, rng)
-    
-    cfg_sero = cfg.copy()
-    cfg_sero['N_apt'] = cfg.get('binding', {}).get('N_sites_sero', cfg.get('N_apt'))
-    bound_sero_ch, _, _ = bernoulli_binding(conc_at_sero_ch, 'SERO', cfg_sero, rng)
-    
-    cfg_ctrl = cfg.copy()
-    cfg_ctrl['N_apt'] = 0  # No aptamer sites
-    bound_ctrl_ch, _, _ = bernoulli_binding(conc_at_ctrl_ch, 'CTRL', cfg_ctrl, rng)
-    
+
+    if sero_active:
+        cfg_sero = cfg.copy()
+        cfg_sero['N_apt'] = cfg.get('binding', {}).get('N_sites_sero', cfg.get('N_apt'))
+        bound_sero_ch, _, _ = bernoulli_binding(conc_at_sero_ch, 'SERO', cfg_sero, rng)
+    else:
+        bound_sero_ch = np.zeros(n_samples)
+
+    if ctrl_active:
+        cfg_ctrl = cfg.copy()
+        cfg_ctrl['N_apt'] = 0  # No aptamer sites
+        bound_ctrl_ch, _, _ = bernoulli_binding(conc_at_ctrl_ch, 'CTRL', cfg_ctrl, rng)
+    else:
+        bound_ctrl_ch = np.zeros(n_samples)
+
     # OECT current generation
     bound_sites_trio = np.vstack([bound_da_ch, bound_sero_ch, bound_ctrl_ch])
     currents = oect_trio(
@@ -499,6 +533,10 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Detection logic unchanged - the fixes are in signal generation.
     """
     
+    profile = str(cfg.get('pipeline', {}).get('channel_profile', 'tri')).lower()
+    if profile in ('single', 'dual'):
+        cfg['pipeline']['use_control_channel'] = False
+
     # Guard against missing detection config
     cfg.setdefault('detection', {})
         
@@ -508,7 +546,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     
     tx_history: List[Tuple[int, float]] = []
     subsymbol_errors = {'mosk': 0, 'csk': 0}
-    thresholds_used = {}
+    thresholds_used: Dict[str, Any] = {}
     mosk_correct = 0 
     
     # Generate transmitted symbols
@@ -557,7 +595,12 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # - MoSK: use pre-CTRL correlation (matches calibration)
     # - CSK/Hybrid: use post-CTRL correlation when CTRL subtraction is on; otherwise pre-CTRL
     rho_pre   = float(noise_cfg.get('rho_corr', noise_cfg.get('rho_correlated', 0.9)))
-    rho_post  = float(noise_cfg.get('rho_between_channels_after_ctrl', 0.0))
+    
+    # Enhancement 2: Use 0.5 fallback if noise model is symmetric
+    # Conservative default: keep previous 0.0 behavior unless explicitly overridden
+    rho_post_default = 0.0
+    rho_post = float(noise_cfg.get('rho_between_channels_after_ctrl', rho_post_default))
+    rho_post = float(cfg['pipeline'].get('rho_cc_measured', rho_post))
     if mod == 'MoSK':
         rho_for_diff = rho_pre
     else:
@@ -577,8 +620,12 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         0.0
     )))
     
-    # Keep rho_cc for CSK dual-channel combiner (preserve existing behavior)
-    rho_cc = rho_post
+    # FIX B: Use measured ρ_post whenever available; fall back to config otherwise
+    rho_cc_measured = cfg['pipeline'].get('rho_cc_measured')
+    if rho_cc_measured is not None:
+        rho_cc = float(rho_cc_measured)
+    else:
+        rho_cc = rho_post if use_ctrl else rho_pre
     rho_cc = max(-1.0, min(1.0, rho_cc))
 
     # Process symbols
@@ -724,7 +771,8 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     q_da=q_da, q_sero=q_sero,
                     sigma_da=sigma_da, sigma_sero=sigma_sero,
                     rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
-                    target=target_channel
+                    target=target_channel,
+                    cfg=cfg
                 )
             else:
                 # Legacy single-channel behavior
@@ -767,9 +815,12 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                             f"ρcc={rho_cc:+.2f}, increasing={increasing}, leakage={leakage:.2f}")
               
         elif mod == 'Hybrid':
-
-            q_da_raw = float(np.trapezoid(ig[:n_detect_samples], dx=dt))
-            q_sero_raw = float(np.trapezoid(ia[:n_detect_samples], dx=dt))
+            # Align MoSK integration window with calibration (tail-gated)
+            tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
+            tail = min(max(tail, 0.1), 1.0)
+            i0 = int((1.0 - tail) * n_detect_samples)
+            q_da_raw = float(np.trapezoid(ig[i0:n_detect_samples], dx=dt))
+            q_sero_raw = float(np.trapezoid(ia[i0:n_detect_samples], dx=dt))
 
             # Use MoSK decision statistic with proper single-ended noise
             sign_da = 1.0 if q_eff_da >= 0 else -1.0
@@ -781,16 +832,36 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             b_hat = (0 if (decision_stat > threshold_mosk) else 1) if comparator == '>' \
                     else (0 if (decision_stat < threshold_mosk) else 1)
 
-            # Amplitude decision still uses CTRL-differenced charges
-            threshold_da = cfg['pipeline'].get('hybrid_threshold_da', 0.0)
-            threshold_sero = cfg['pipeline'].get('hybrid_threshold_sero', 0.0)
-            
+            # Recompute amplitude charges with tail-gated window and CTRL treatment
+            use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+
+            # Tail-gated window (same as used for MoSK statistic above)
+            # i0 and n_detect_samples are already defined in the Hybrid block above
+            sig_da_amp   = (ig - ic) if use_ctrl else ig
+            sig_sero_amp = (ia - ic) if use_ctrl else ia
+            q_da_amp     = float(np.trapezoid(sig_da_amp[i0:n_detect_samples], dx=dt))
+            q_sero_amp   = float(np.trapezoid(sig_sero_amp[i0:n_detect_samples], dx=dt))
+
+            # NEW: Use the dual‑channel combiner for the amplitude bit (like CSK)
+            combiner = str(cfg['pipeline'].get('hybrid_combiner', cfg['pipeline'].get('csk_combiner','zscore')))
+            leakage  = float(cfg['pipeline'].get('hybrid_leakage_frac', cfg['pipeline'].get('csk_leakage_frac', 0.0)))
+            target   = 'DA' if b_hat == 0 else 'SERO'
+            Q_amp = _csk_dual_channel_Q(
+                q_da=q_da_amp, q_sero=q_sero_amp,
+                sigma_da=sigma_da, sigma_sero=sigma_sero,
+                rho_cc=rho_cc,
+                combiner=combiner, leakage_frac=leakage,
+                target=target, cfg=cfg
+            )
+
+            # NEW: Use calibrated thresholds on Q_amp with data-driven orientation
             if b_hat == 0:
-                # DA channel active: sign-aware comparator
-                l_hat = 1 if ((q_da > threshold_da) if q_eff_da >= 0 else (q_da < threshold_da)) else 0
+                tau   = float(cfg['pipeline'].get('hybrid_threshold_da', 0.0))
+                inc   = bool(cfg['pipeline'].get('hybrid_threshold_da_increasing', True))
             else:
-                # SERO channel active: sign-aware comparator
-                l_hat = 1 if ((q_sero > threshold_sero) if q_eff_sero >= 0 else (q_sero < threshold_sero)) else 0
+                tau   = float(cfg['pipeline'].get('hybrid_threshold_sero', 0.0))
+                inc   = bool(cfg['pipeline'].get('hybrid_threshold_sero_increasing', True))
+            l_hat = 1 if ((Q_amp > tau) if inc else (Q_amp < tau)) else 0
 
             # Construct final symbol
             s_rx = (b_hat << 1) | l_hat

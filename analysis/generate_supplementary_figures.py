@@ -633,7 +633,7 @@ def plot_figure_s6_energy_per_bit(results_dir: Path, save_path: Path) -> None:
 
     # Parameters
     k_B = 1.381e-23  # Boltzmann constant (J/K)
-    T = float(cfg['temperature_K'])  # Temperature (K)
+    T = float(cfg.get('sim', {}).get('temperature_K', 310.0))  # Temperature (K)
     eta = 0.10  # Transduction efficiency (10%)
 
     # Data
