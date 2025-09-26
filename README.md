@@ -1,7 +1,7 @@
 # Tri-Channel OECT Molecular Communication Simulator
 
 ## Introduction
-This repository provides a research-grade simulation and analysis framework for the tri-channel organic electrochemical transistor (OECT) receiver documented in the associated IEEE Transactions on Molecular, Biological, and Multi-Scale Communications (TMBMC) manuscript. The implementation delivers reproducible, end-to-end evaluations of diffusion-based molecular communication links that employ glutamate (GLU), gamma-aminobutyric acid (GABA), and a differential control (CTRL) channel. Every stage of the physical pipeline, from molecular release through detection, is modeled with closed-form physics, stochastic sampling, and device-level electrical abstractions.
+This repository provides a research-grade simulation and analysis framework for the tri-channel organic electrochemical transistor (OECT) receiver documented in the associated IEEE Transactions on Molecular, Biological, and Multi-Scale Communications (TMBMC) manuscript. The implementation delivers reproducible, end-to-end evaluations of diffusion-based molecular communication links that employ dopamine (DA), serotonin (SERO), and a differential control (CTRL) channel. Every stage of the physical pipeline, from molecular release through detection, is modeled with closed-form physics, stochastic sampling, and device-level electrical abstractions.
 
 ## Feature Summary
 - **Complete transceiver stack**: parameterized transmitter, three-dimensional diffusive channel, receptor binding layer, OECT front-end, and digital detection logic for MoSK, CSK-4, and hybrid (2 bit/symbol) modulation.
@@ -133,7 +133,7 @@ mcvd-master    # analysis/run_master.py
 
 ## Configuration Guidance
 `config/default.yaml` is the baseline scenario. Notable sections include:
-- `neurotransmitters` - diffusion coefficients, binding rates, and effective charges for GLU, GABA, CTRL.
+- `neurotransmitters` - diffusion coefficients, binding rates, and effective charges for DA, SERO, CTRL.
 - `pipeline` - symbol period, ISI memory (`isi_memory`, `guard_factor`), LoD bounds, modulation selection, CSK combiner settings.
 - `detection` - decision-window policies (`fraction_of_Ts`, `full_Ts`), per-channel thresholds, Monte Carlo sequence lengths.
 - `analysis` - adaptive CI termination, LoD retry budget, ISI toggles, and timeout safeguards.
