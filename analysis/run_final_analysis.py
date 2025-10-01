@@ -45,7 +45,7 @@ try:
     from src.mc_detection.algorithms import calculate_ml_threshold
 except ImportError:
     from src.detection import calculate_ml_threshold
-from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents, _csk_dual_channel_Q
+from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents, _csk_dual_channel_Q, _resolve_decision_window
 from src.config_utils import preprocess_config
 
 # Progress UI
@@ -1128,6 +1128,53 @@ def estimate_isi_overlap_ratio(cfg: Dict[str, Any]) -> float:
     tail = max(0.0, time_95 - Ts)
     return float(min(1.0, tail / time_95))
 
+
+
+def _resolve_isi_overlap_warn_threshold(cfg: Dict[str, Any]) -> float:
+    pipeline_cfg = cfg.get('pipeline', {})
+    if isinstance(pipeline_cfg, dict):
+        val = pipeline_cfg.get('isi_overlap_warn_threshold')
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    analysis_cfg = cfg.get('analysis')
+    if isinstance(analysis_cfg, dict):
+        val = analysis_cfg.get('isi_overlap_warn_threshold')
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    return 0.2
+
+
+def _maybe_warn_isi_overlap(cfg: Dict[str, Any], ratio: float, context: str = "") -> None:
+    if not np.isfinite(ratio):
+        return
+    threshold = _resolve_isi_overlap_warn_threshold(cfg)
+    if threshold <= 0:
+        return
+    if ratio >= threshold:
+        suffix = f" ({context})" if context else ""
+        print(f"??  ISI overlap {ratio:.1%} exceeds {threshold:.0%} threshold{suffix}")
+
+
+def _coerce_float(value: Any, default: float = float('nan')) -> float:
+    """Best-effort float coercion that is type-checker friendly."""
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
 def _enforce_min_window(cfg: Dict[str, Any], Ts: float) -> float:
     """
     Centralized minimum decision window enforcement.
@@ -2002,6 +2049,10 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
             cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
             cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
+        elif param_name in ['oect.gm_S', 'oect.C_tot_F']:
+            min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
+            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
+            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
@@ -2011,7 +2062,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 else:
                     cfg_run['pipeline'][k] = v
         elif cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
-             param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor']:
+             param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
             cal_seeds = list(range(10))
             thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds, recalibrate)
             for k, v in thresholds.items():
@@ -2089,7 +2140,7 @@ def run_sweep(cfg: Dict[str, Any],
     # Pre-calibrate thresholds once per sweep value (hoisted from per-seed)
     thresholds_map: Dict[Union[float, int], Dict[str, Union[float, List[float], str]]] = {}
     if cfg['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
-       sweep_param in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor']:
+       sweep_param in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
         cal_seeds = list(range(10))
         for v in values_to_run:
             cfg_v = deepcopy(cfg)
@@ -2119,6 +2170,12 @@ def run_sweep(cfg: Dict[str, Any],
                 min_win = _enforce_min_window(cfg_v, Ts)
                 cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
                 cfg_v['detection']['decision_window_s'] = min_win
+            elif sweep_param in ['oect.gm_S', 'oect.C_tot_F']:
+                Ts = float(cfg_v['pipeline'].get('symbol_period_s', calculate_dynamic_symbol_period(float(cfg_v['pipeline'].get('distance_um', 50.0)), cfg_v)))
+                min_win = _enforce_min_window(cfg_v, Ts)
+                cfg_v['pipeline']['symbol_period_s'] = Ts
+                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_v.setdefault('detection', {})['decision_window_s'] = min_win
             thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
 
     # Determine how many seed-jobs remain (for progress accounting)
@@ -2390,12 +2447,40 @@ def run_sweep(cfg: Dict[str, Any],
         ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
         ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
         ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
+        ns_thermal = [float(r.get('noise_sigma_thermal', float('nan'))) for r in results]
+        ns_flicker = [float(r.get('noise_sigma_flicker', float('nan'))) for r in results]
+        ns_drift = [float(r.get('noise_sigma_drift', float('nan'))) for r in results]
+        thermal_fracs = [float(r.get('noise_thermal_fraction', float('nan'))) for r in results]
         arr_da = np.asarray(ns_da, dtype=float)
         arr_sero = np.asarray(ns_sero, dtype=float)
         arr_diff = np.asarray(ns_diff, dtype=float)
+        arr_thermal = np.asarray(ns_thermal, dtype=float)
+        arr_flicker = np.asarray(ns_flicker, dtype=float)
+        arr_drift = np.asarray(ns_drift, dtype=float)
+        arr_thermal_frac = np.asarray(thermal_fracs, dtype=float)
         med_sigma_da = float(np.nanmedian(arr_da)) if np.isfinite(arr_da).any() else float('nan')
         med_sigma_sero = float(np.nanmedian(arr_sero)) if np.isfinite(arr_sero).any() else float('nan')
         med_sigma_diff = float(np.nanmedian(arr_diff)) if np.isfinite(arr_diff).any() else float('nan')
+        med_sigma_thermal = float(np.nanmedian(arr_thermal)) if np.isfinite(arr_thermal).any() else float('nan')
+        med_sigma_flicker = float(np.nanmedian(arr_flicker)) if np.isfinite(arr_flicker).any() else float('nan')
+        med_sigma_drift = float(np.nanmedian(arr_drift)) if np.isfinite(arr_drift).any() else float('nan')
+        med_thermal_frac = float(np.nanmedian(arr_thermal_frac)) if np.isfinite(arr_thermal_frac).any() else float('nan')
+
+        delta_stat_values: List[float] = []
+        for r in results:
+            stats_da = np.asarray(r.get('stats_da', []), dtype=float)
+            stats_sero = np.asarray(r.get('stats_sero', []), dtype=float)
+            if stats_da.size == 0 or stats_sero.size == 0:
+                continue
+            mean_da = float(np.nanmean(stats_da))
+            mean_sero = float(np.nanmean(stats_sero))
+            if not (np.isfinite(mean_da) and np.isfinite(mean_sero)):
+                continue
+            delta_val = mean_da - mean_sero
+            if np.isfinite(delta_val):
+                delta_stat_values.append(delta_val)
+        med_delta_stat = float(np.nanmedian(np.asarray(delta_stat_values, dtype=float))) if delta_stat_values else float('nan')
+        delta_I_diff = float(med_delta_stat * med_sigma_diff) if (np.isfinite(med_delta_stat) and np.isfinite(med_sigma_diff)) else float('nan')
 
         mode_name = cfg['pipeline']['modulation']
         snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
@@ -2405,6 +2490,13 @@ def run_sweep(cfg: Dict[str, Any],
         # Extract rho_cc_measured safely before creating the dictionary
         rho_cc_raw = thresholds_map.get(v, {}).get('rho_cc_measured', float('nan'))
         
+        current_distance = float(cfg['pipeline'].get('distance_um', float('nan')))
+        current_nm = float(cfg['pipeline'].get('Nm_per_symbol', float('nan')))
+        if sweep_param == 'pipeline.distance_um':
+            current_distance = float(v)
+        if sweep_param == 'pipeline.Nm_per_symbol':
+            current_nm = float(v)
+
         row: Dict[str, Any] = {
             sweep_param: v,
             'ser': ser,
@@ -2421,6 +2513,14 @@ def run_sweep(cfg: Dict[str, Any],
             'noise_sigma_da': med_sigma_da,
             'noise_sigma_sero': med_sigma_sero,
             'noise_sigma_I_diff': med_sigma_diff,
+            'noise_sigma_thermal': med_sigma_thermal,
+            'noise_sigma_flicker': med_sigma_flicker,
+            'noise_sigma_drift': med_sigma_drift,
+            'noise_thermal_fraction': med_thermal_frac,
+            'delta_over_sigma': med_delta_stat,
+            'delta_I_diff': delta_I_diff,
+            'distance_um': current_distance,
+            'Nm_per_symbol': current_nm,
             'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
             'use_ctrl': bool(thresholds_map.get(v, {}).get('use_control_channel',
                             cfg['pipeline'].get('use_control_channel', True))),
@@ -2463,7 +2563,20 @@ def run_sweep(cfg: Dict[str, Any],
                     row['mosk_error_pct'] = (mosk_errors / total_symbols) * 100.0
                     row['csk_error_pct'] = (csk_errors / total_symbols) * 100.0
                     row['hybrid_total_error_pct'] = ((mosk_errors + csk_errors) / total_symbols) * 100.0
-                
+                bits_per_symbol_csk_branch = float(math.log2(max(cfg['pipeline'].get('csk_levels', 4), 2)))
+                if total_symbols > 0:
+                    bits_mosk_realized = (total_symbols - mosk_errors) / total_symbols
+                    bits_csk_realized = ((mosk_correct_total - csk_errors) / total_symbols) * bits_per_symbol_csk_branch
+                else:
+                    bits_mosk_realized = float('nan')
+                    bits_csk_realized = float('nan')
+                row['hybrid_bits_per_symbol_mosk'] = bits_mosk_realized
+                row['hybrid_bits_per_symbol_csk'] = bits_csk_realized
+                if math.isnan(bits_mosk_realized) or math.isnan(bits_csk_realized):
+                    row['hybrid_bits_per_symbol_total'] = float('nan')
+                else:
+                    row['hybrid_bits_per_symbol_total'] = bits_mosk_realized + bits_csk_realized
+
                 # Enhancement C: Optional assertion during sweeps
                 if total_symbols > 0:
                     total_reported_errors = sum(cast(int, r['errors']) for r in results)
@@ -3254,7 +3367,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
     cfg.setdefault('detection', {})
     cfg['detection']['decision_window_s'] = min_win
-    
+
+    isi_overlap_ratio_initial = estimate_isi_overlap_ratio(cfg)
+    _maybe_warn_isi_overlap(cfg, isi_overlap_ratio_initial, context=f"LoD distance {dist_um:.0f} um")
+
     # Check if Ts exceed flags are disabled
     allow_ts = bool(getattr(args, "allow_ts_exceed", False))
     if not allow_ts:
@@ -3277,6 +3393,18 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'data_rate_ci_low': float('nan'),
                 'data_rate_ci_high': float('nan'),
                 'symbol_period_s': Ts_dyn,
+                'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
+                'isi_memory_symbols': 0,
+                'decision_window_s': Ts_dyn,
+                'isi_overlap_ratio': isi_overlap_ratio_initial,
+                'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
+                'mode': cfg['pipeline']['modulation'],
+                'noise_sigma_I_diff': float('nan'),
+                'noise_sigma_thermal': float('nan'),
+                'noise_sigma_flicker': float('nan'),
+                'noise_sigma_drift': float('nan'),
+                'noise_thermal_fraction': float('nan'),
+                'actual_progress': 0,
                 'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
             }
     # Continue with existing logic for args.max_ts_for_lod (keep this too)
@@ -3290,9 +3418,11 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'distance_um': dist_um, 'lod_nm': float('nan'), 'ser_at_lod': float('nan'),
                 'data_rate_bps': float('nan'), 'data_rate_ci_low': float('nan'), 'data_rate_ci_high': float('nan'),
                 'symbol_period_s': Ts_dyn, 'isi_enabled': bool(cfg['pipeline'].get('enable_isi', False)),
-                'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
+                'isi_memory_symbols': 0, 'decision_window_s': Ts_dyn, 'isi_overlap_ratio': isi_overlap_ratio_initial,
                 'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
                 'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
+                'noise_sigma_thermal': float('nan'), 'noise_sigma_flicker': float('nan'),
+                'noise_sigma_drift': float('nan'), 'noise_thermal_fraction': float('nan'),
                 'actual_progress': 0, 'skipped_reason': f'Ts>{cap_cli}s'
             }
     
@@ -3460,12 +3590,25 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             cfg_lod['pipeline'][k] = v
         
         sigma_values = []
+        sigma_thermal_values = []
+        sigma_flicker_values = []
+        sigma_drift_values = []
+        thermal_fraction_values = []
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
                                         debug_calibration=debug_calibration, 
                                         sweep_name="lod_validation", cache_tag="lod_sigma")
-            if result and 'noise_sigma_I_diff' in result:
-                sigma_values.append(result['noise_sigma_I_diff'])
+            if result:
+                if 'noise_sigma_I_diff' in result:
+                    sigma_values.append(result['noise_sigma_I_diff'])
+                if 'noise_sigma_thermal' in result:
+                    sigma_thermal_values.append(result['noise_sigma_thermal'])
+                if 'noise_sigma_flicker' in result:
+                    sigma_flicker_values.append(result['noise_sigma_flicker'])
+                if 'noise_sigma_drift' in result:
+                    sigma_drift_values.append(result['noise_sigma_drift'])
+                if 'noise_thermal_fraction' in result:
+                    thermal_fraction_values.append(result['noise_thermal_fraction'])
             # Progress callback for completed noise sigma seed
             if progress_cb is not None:
                 try: 
@@ -3474,8 +3617,16 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                     pass
         
         lod_sigma_median = float(np.median(sigma_values)) if sigma_values else float('nan')
+        lod_sigma_thermal = float(np.median(sigma_thermal_values)) if sigma_thermal_values else float('nan')
+        lod_sigma_flicker = float(np.median(sigma_flicker_values)) if sigma_flicker_values else float('nan')
+        lod_sigma_drift = float(np.median(sigma_drift_values)) if sigma_drift_values else float('nan')
+        lod_thermal_fraction = float(np.median(thermal_fraction_values)) if thermal_fraction_values else float('nan')
     else:
         lod_sigma_median = float('nan')
+        lod_sigma_thermal = float('nan')
+        lod_sigma_flicker = float('nan')
+        lod_sigma_drift = float('nan')
+        lod_thermal_fraction = float('nan')
 
     # mark LoD state as done ONLY if valid result
     try:
@@ -3499,6 +3650,8 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     if math.isnan(lod_nm) or lod_nm <= 0:
         skipped_reason = skipped_reason or 'not_bracketed'
 
+    isi_overlap_ratio_final = estimate_isi_overlap_ratio(cfg)
+
     return {
         'distance_um': dist_um,
         'lod_nm': lod_nm,
@@ -3511,10 +3664,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'isi_memory_symbols': int(cfg['pipeline'].get('isi_memory_symbols', 0)) if cfg['pipeline'].get('enable_isi', False) else 0,
         'decision_window_s': float(cfg.get('detection', {}).get(
             'decision_window_s', cfg['pipeline']['symbol_period_s'])),
-        'isi_overlap_ratio': estimate_isi_overlap_ratio(cfg),
+        'isi_overlap_ratio': isi_overlap_ratio_final,
         'use_ctrl': bool(cfg['pipeline'].get('use_control_channel', True)),
         'mode': cfg['pipeline']['modulation'],
         'noise_sigma_I_diff': lod_sigma_median,
+        'noise_sigma_thermal': lod_sigma_thermal,
+        'noise_sigma_flicker': lod_sigma_flicker,
+        'noise_sigma_drift': lod_sigma_drift,
+        'noise_thermal_fraction': lod_thermal_fraction,
         'actual_progress': int(actual_progress),
         'skipped_reason': skipped_reason,  # ✅ Use the variable instead of None
         'lod_found': bool(not (isinstance(lod_nm, float) and (math.isnan(lod_nm) or lod_nm <= 0))),
@@ -3737,6 +3894,422 @@ def _json_safe(obj):
         return obj.item()
     return obj
 
+def _run_device_fom_sweeps(
+    cfg_base: Dict[str, Any],
+    seeds: List[int],
+    mode: str,
+    data_dir: Path,
+    suffix: str,
+    df_lod: Optional[pd.DataFrame],
+    resume: bool,
+    args: argparse.Namespace,
+    pm: Optional[ProgressManager] = None,
+    mode_key: Optional[Any] = None,
+) -> None:
+    """Sweep OECT parameters to capture delta-over-sigma device figures of merit."""
+    if not seeds:
+        return
+
+    desired_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
+    gm_grid = [1e-3, 3e-3, 5e-3, 1e-2]
+    c_grid = [1e-8, 3e-8, 5e-8, 1e-7]
+
+    device_csv = data_dir / f"device_fom_{mode.lower()}{suffix}.csv"
+    try:
+        existing = pd.read_csv(device_csv)
+    except Exception:
+        existing = pd.DataFrame()
+
+    def _filter(values: List[float], param_type: str) -> List[float]:
+        vals = [float(v) for v in values]
+        if not resume or existing.empty or 'param_type' not in existing.columns:
+            return vals
+        df_match = existing[existing['param_type'] == param_type]
+        if 'use_ctrl' in df_match.columns:
+            df_match = df_match[df_match['use_ctrl'] == desired_ctrl]
+        done = {
+            round(float(v), 12)
+            for v in pd.to_numeric(df_match.get('param_value', pd.Series(dtype=float)), errors='coerce').dropna()
+        }
+        return [v for v in vals if round(v, 12) not in done]
+
+    gm_values = _filter(gm_grid, 'gm_S') if gm_grid else []
+    c_values = _filter(c_grid, 'C_tot_F') if c_grid else []
+
+    df_ref = df_lod if df_lod is not None else pd.DataFrame()
+    d_ref: Optional[int] = None
+    nm_ref: Optional[float] = None
+    if not df_ref.empty and {'distance_um', 'lod_nm'}.issubset(df_ref.columns):
+        df_match = df_ref.copy()
+        if 'use_ctrl' in df_match.columns:
+            df_match = df_match[df_match['use_ctrl'] == desired_ctrl]
+        df_valid = df_match.dropna(subset=['lod_nm'])
+        if not df_valid.empty:
+            df_valid = df_valid.assign(
+                __dist=pd.to_numeric(df_valid['distance_um'], errors='coerce')
+            ).dropna(subset=['__dist'])
+            if not df_valid.empty:
+                dist_vals = df_valid['__dist'].to_numpy(dtype=float)
+                d_ref = int(np.median(dist_vals))
+                dist_delta = np.abs(dist_vals - float(d_ref))
+                idx = int(np.argmin(dist_delta))
+                nm_candidate = float(pd.to_numeric(df_valid.iloc[idx]['lod_nm'], errors='coerce'))
+                if math.isfinite(nm_candidate) and nm_candidate > 0:
+                    nm_ref = nm_candidate
+
+    if d_ref is None:
+        d_ref = int(float(cfg_base['pipeline'].get('distance_um', 50.0)))
+    if nm_ref is None or not math.isfinite(nm_ref) or nm_ref <= 0:
+        nm_ref = float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+
+    device_seed_count = min(len(seeds), 6) if len(seeds) > 0 else 0
+    if device_seed_count == 0:
+        return
+    device_seeds = seeds[:device_seed_count]
+
+    cfg_template = deepcopy(cfg_base)
+    cfg_template['pipeline']['distance_um'] = d_ref
+    cfg_template['pipeline']['Nm_per_symbol'] = nm_ref
+    Ts_ref = calculate_dynamic_symbol_period(d_ref, cfg_template)
+    min_win = _enforce_min_window(cfg_template, Ts_ref)
+    cfg_template['pipeline']['symbol_period_s'] = Ts_ref
+    cfg_template['pipeline']['time_window_s'] = max(cfg_template['pipeline'].get('time_window_s', 0.0), min_win)
+    cfg_template.setdefault('detection', {})['decision_window_s'] = min_win
+
+    seq_len_base = int(cfg_template['pipeline'].get('sequence_length', args.sequence_length))
+    device_sequence_length = min(seq_len_base, 400)
+
+    print(f"?? Device FoM anchor ({mode}): distance={d_ref} um, Nm={nm_ref:.3g}, seeds={device_seed_count}")
+
+    frames: List[pd.DataFrame] = []
+    if gm_values:
+        cfg_gm = deepcopy(cfg_template)
+        cfg_gm['pipeline']['sequence_length'] = device_sequence_length
+        df_gm = run_sweep(
+            cfg_gm,
+            device_seeds,
+            'oect.gm_S',
+            gm_values,
+            f"Device FoM gm ({mode})",
+            progress_mode=args.progress,
+            persist_csv=None,
+            resume=False,
+            debug_calibration=args.debug_calibration,
+            cache_tag=f"device_fom_gm_{mode.lower()}",
+            pm=pm,
+            sweep_key=("sweep", mode, "DeviceFoM_gm") if (pm and mode_key is not None) else None,
+            parent_key=mode_key if (pm and mode_key is not None) else None,
+            recalibrate=args.recalibrate,
+        )
+        if not df_gm.empty:
+            df_gm = df_gm.copy()
+            df_gm['param_type'] = 'gm_S'
+            df_gm['param_value'] = pd.to_numeric(df_gm['oect.gm_S'], errors='coerce')
+            frames.append(df_gm)
+    else:
+        print("?? Device FoM gm sweep already up-to-date (resume)")
+
+    if c_values:
+        cfg_c = deepcopy(cfg_template)
+        cfg_c['pipeline']['sequence_length'] = device_sequence_length
+        df_c = run_sweep(
+            cfg_c,
+            device_seeds,
+            'oect.C_tot_F',
+            c_values,
+            f"Device FoM C_tot ({mode})",
+            progress_mode=args.progress,
+            persist_csv=None,
+            resume=False,
+            debug_calibration=args.debug_calibration,
+            cache_tag=f"device_fom_c_{mode.lower()}",
+            pm=pm,
+            sweep_key=("sweep", mode, "DeviceFoM_C") if (pm and mode_key is not None) else None,
+            parent_key=mode_key if (pm and mode_key is not None) else None,
+            recalibrate=args.recalibrate,
+        )
+        if not df_c.empty:
+            df_c = df_c.copy()
+            df_c['param_type'] = 'C_tot_F'
+            df_c['param_value'] = pd.to_numeric(df_c['oect.C_tot_F'], errors='coerce')
+            frames.append(df_c)
+    else:
+        print("?? Device FoM C_tot sweep already up-to-date (resume)")
+
+    if frames:
+        new_data = pd.concat(frames, ignore_index=True)
+    else:
+        new_data = pd.DataFrame()
+
+    if not existing.empty and not new_data.empty:
+        combined = pd.concat([existing, new_data], ignore_index=True)
+    elif existing.empty:
+        combined = new_data
+    else:
+        combined = existing
+
+    if combined.empty:
+        if not device_csv.exists() and not new_data.empty:
+            _atomic_write_csv(device_csv, combined)
+        return
+
+    if 'param_value' not in combined.columns:
+        combined['param_value'] = pd.to_numeric(combined.get('param_value', pd.Series(dtype=float)), errors='coerce')
+    subset_cols = ['param_type', 'param_value']
+    if 'use_ctrl' in combined.columns:
+        subset_cols.append('use_ctrl')
+    combined = combined.drop_duplicates(subset=subset_cols, keep='last').sort_values(by=subset_cols)
+    _atomic_write_csv(device_csv, combined)
+    print(f"?? Device FoM sweep saved to {device_csv} ({len(combined)} rows)")
+def _run_guard_frontier(
+    cfg_base: Dict[str, Any],
+    seeds: List[int],
+    mode: str,
+    data_dir: Path,
+    suffix: str,
+    df_lod: Optional[pd.DataFrame],
+    distances: List[float],
+    guard_values: List[float],
+    args: argparse.Namespace,
+    pm: Optional[ProgressManager] = None,
+    mode_key: Optional[Any] = None,
+) -> None:
+    """Compute guard-factor frontiers by maximizing IRT at each distance."""
+    if not guard_values:
+        return
+
+    desired_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
+    resume_flag = bool(getattr(args, 'resume', False))
+    tradeoff_csv = data_dir / f"guard_tradeoff_{mode.lower()}{suffix}.csv"
+    frontier_csv = data_dir / f"guard_frontier_{mode.lower()}{suffix}.csv"
+
+    try:
+        existing_tradeoff = pd.read_csv(tradeoff_csv)
+    except Exception:
+        existing_tradeoff = pd.DataFrame()
+    try:
+        existing_frontier = pd.read_csv(frontier_csv)
+    except Exception:
+        existing_frontier = pd.DataFrame()
+
+    mode_lower = mode.lower()
+    if mode_lower == "mosk":
+        bits_per_symbol = 1.0
+    elif mode_lower == "csk":
+        levels = int(cfg_base['pipeline'].get('csk_levels', 4))
+        bits_per_symbol = math.log2(max(levels, 2))
+    else:
+        bits_per_symbol = 2.0
+
+    df_lod_ref = df_lod if df_lod is not None else pd.DataFrame()
+    distance_candidates: List[float] = []
+    if not df_lod_ref.empty and 'distance_um' in df_lod_ref.columns:
+        dist_vals = pd.to_numeric(df_lod_ref['distance_um'], errors='coerce').dropna()
+        if not dist_vals.empty:
+            distance_candidates = sorted(dist_vals.unique().tolist())
+    if not distance_candidates:
+        distance_candidates = [float(d) for d in distances] if distances else []
+    if not distance_candidates:
+        distance_candidates = [float(cfg_base['pipeline'].get('distance_um', 50.0))]
+
+    guard_values_sorted = [round(float(g), 4) for g in guard_values]
+    guard_seed_count = min(len(seeds), 6) if len(seeds) > 0 else 0
+    if guard_seed_count == 0:
+        return
+    guard_seeds = seeds[:guard_seed_count]
+
+    def _nm_for_distance(distance: float) -> float:
+        if df_lod_ref.empty or 'lod_nm' not in df_lod_ref.columns:
+            return float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+        df_match = df_lod_ref.copy()
+        if 'use_ctrl' in df_match.columns:
+            df_match = df_match[df_match['use_ctrl'] == desired_ctrl]
+        if df_match.empty:
+            return float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+        df_match = df_match.assign(__dist=pd.to_numeric(df_match['distance_um'], errors='coerce'))
+        df_match = df_match.dropna(subset=['__dist'])
+        if df_match.empty:
+            return float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+        dist_arr = df_match['__dist'].to_numpy(dtype=float)
+        idx = int(np.argmin(np.abs(dist_arr - float(distance))))
+        nm_candidate = float(pd.to_numeric(df_match.iloc[idx]['lod_nm'], errors='coerce'))
+        if math.isfinite(nm_candidate) and nm_candidate > 0:
+            return nm_candidate
+        return float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+
+    frames_tradeoff: List[pd.DataFrame] = []
+    frontier_rows: List[Dict[str, Any]] = []
+    distances_recomputed: set = set()
+    distances_considered: set = set()
+
+    for dist in distance_candidates:
+        dist_float = float(dist)
+        nm_target = _nm_for_distance(dist_float)
+
+        existing_for_dist = existing_tradeoff.copy()
+        if not existing_for_dist.empty:
+            existing_for_dist['distance_um'] = pd.to_numeric(existing_for_dist['distance_um'], errors='coerce')
+            existing_for_dist = existing_for_dist.dropna(subset=['distance_um'])
+            existing_for_dist = existing_for_dist[np.isclose(existing_for_dist['distance_um'], dist_float, atol=1e-6)]
+            if 'use_ctrl' in existing_for_dist.columns:
+                existing_for_dist = existing_for_dist[existing_for_dist['use_ctrl'] == desired_ctrl]
+        else:
+            existing_for_dist = pd.DataFrame()
+
+        if not resume_flag:
+            run_values = guard_values_sorted
+            distances_recomputed.add(dist_float)
+        else:
+            done_values = {
+                round(float(v), 4)
+                for v in pd.to_numeric(
+                    existing_for_dist.get('guard_factor', existing_for_dist.get('pipeline.guard_factor', pd.Series(dtype=float))),
+                    errors='coerce',
+                ).dropna()
+            }
+            run_values = [g for g in guard_values_sorted if round(g, 4) not in done_values]
+            if run_values:
+                distances_recomputed.add(dist_float)
+
+        df_guard_new = pd.DataFrame()
+        if run_values:
+            cfg_dist = deepcopy(cfg_base)
+            cfg_dist['pipeline']['distance_um'] = dist_float
+            cfg_dist['pipeline']['Nm_per_symbol'] = nm_target
+            cfg_dist['pipeline']['enable_isi'] = True
+            Ts_ref = calculate_dynamic_symbol_period(dist_float, cfg_dist)
+            min_win = _enforce_min_window(cfg_dist, Ts_ref)
+            cfg_dist['pipeline']['symbol_period_s'] = Ts_ref
+            cfg_dist['pipeline']['time_window_s'] = max(cfg_dist['pipeline'].get('time_window_s', 0.0), min_win)
+            cfg_dist.setdefault('detection', {})['decision_window_s'] = min_win
+
+            df_guard_new = run_sweep(
+                cfg_dist,
+                guard_seeds,
+                'pipeline.guard_factor',
+                run_values,
+                f"Guard sweep ({mode}, d={dist_float:.0f} um)",
+                progress_mode=args.progress,
+                persist_csv=None,
+                resume=False,
+                debug_calibration=args.debug_calibration,
+                cache_tag=f"guard_frontier_{mode_lower}_{int(round(dist_float))}",
+                pm=pm,
+                sweep_key=("sweep", mode, f"GuardFrontier_d{int(round(dist_float))}") if (pm and mode_key is not None) else None,
+                parent_key=mode_key if (pm and mode_key is not None) else None,
+                recalibrate=args.recalibrate,
+            )
+            if not df_guard_new.empty:
+                df_guard_new = df_guard_new.copy()
+                df_guard_new['distance_um'] = dist_float
+                frames_tradeoff.append(df_guard_new)
+
+        combined_parts: List[pd.DataFrame] = []
+        if not existing_for_dist.empty:
+            if 'distance_um' not in existing_for_dist.columns:
+                existing_for_dist['distance_um'] = dist_float
+            combined_parts.append(existing_for_dist)
+        if not df_guard_new.empty:
+            combined_parts.append(df_guard_new)
+        if not combined_parts:
+            continue
+
+        df_guard_combined = pd.concat(combined_parts, ignore_index=True)
+        if 'distance_um' not in df_guard_combined.columns:
+            df_guard_combined['distance_um'] = dist_float
+
+        guard_col = 'guard_factor' if 'guard_factor' in df_guard_combined.columns else 'pipeline.guard_factor'
+        df_guard_combined[guard_col] = pd.to_numeric(df_guard_combined[guard_col], errors='coerce')
+        df_guard_combined['symbol_period_s'] = pd.to_numeric(df_guard_combined['symbol_period_s'], errors='coerce')
+        df_guard_combined['ser'] = pd.to_numeric(df_guard_combined['ser'], errors='coerce')
+        df_guard_combined = df_guard_combined.dropna(subset=[guard_col, 'symbol_period_s', 'ser'])
+        if df_guard_combined.empty:
+            continue
+
+        df_guard_combined['IRT'] = (
+            bits_per_symbol / df_guard_combined['symbol_period_s']
+        ) * (1.0 - df_guard_combined['ser'])
+
+        best_idx = int(df_guard_combined['IRT'].idxmax())
+
+        guard_val_raw = df_guard_combined.at[best_idx, guard_col]
+        guard_val = _coerce_float(guard_val_raw)
+        irt_val = _coerce_float(df_guard_combined.at[best_idx, 'IRT'])
+        ser_val = _coerce_float(df_guard_combined.at[best_idx, 'ser'])
+        symbol_period_val = _coerce_float(df_guard_combined.at[best_idx, 'symbol_period_s'])
+        if 'Nm_per_symbol' in df_guard_combined.columns:
+            nm_val_raw = df_guard_combined.at[best_idx, 'Nm_per_symbol']
+            nm_val = _coerce_float(nm_val_raw, float(nm_target))
+        else:
+            nm_val = float(nm_target)
+
+        distances_considered.add(dist_float)
+        frontier_rows.append({
+            'distance_um': dist_float,
+            'best_guard_factor': guard_val,
+            'max_irt_bps': irt_val,
+            'ser_at_best_guard': ser_val,
+            'symbol_period_s': symbol_period_val,
+            'Nm_per_symbol': nm_val,
+            'use_ctrl': desired_ctrl,
+            'mode': mode,
+            'bits_per_symbol': bits_per_symbol,
+        })
+
+    if frames_tradeoff:
+        df_new_tradeoff = pd.concat(frames_tradeoff, ignore_index=True)
+        if not existing_tradeoff.empty and distances_recomputed:
+            mask = pd.Series(True, index=existing_tradeoff.index)
+            if 'distance_um' in existing_tradeoff.columns:
+                dist_series = pd.to_numeric(existing_tradeoff['distance_um'], errors='coerce')
+                mask &= ~dist_series.apply(lambda x: any(abs(x - d) < 1e-6 for d in distances_recomputed))
+            if 'use_ctrl' in existing_tradeoff.columns:
+                mask |= existing_tradeoff['use_ctrl'] != desired_ctrl
+            existing_tradeoff = existing_tradeoff[mask]
+        combined_tradeoff = pd.concat([existing_tradeoff, df_new_tradeoff], ignore_index=True)
+    else:
+        combined_tradeoff = existing_tradeoff
+
+    if not combined_tradeoff.empty:
+        if 'distance_um' not in combined_tradeoff.columns:
+            combined_tradeoff['distance_um'] = pd.to_numeric(combined_tradeoff.get('distance_um', pd.Series(dtype=float)), errors='coerce')
+        else:
+            combined_tradeoff['distance_um'] = pd.to_numeric(combined_tradeoff['distance_um'], errors='coerce')
+        if 'guard_factor' not in combined_tradeoff.columns and 'pipeline.guard_factor' in combined_tradeoff.columns:
+            combined_tradeoff['guard_factor'] = pd.to_numeric(combined_tradeoff['pipeline.guard_factor'], errors='coerce')
+        elif 'guard_factor' in combined_tradeoff.columns:
+            combined_tradeoff['guard_factor'] = pd.to_numeric(combined_tradeoff['guard_factor'], errors='coerce')
+        subset_cols = ['distance_um', 'guard_factor']
+        if 'use_ctrl' in combined_tradeoff.columns:
+            subset_cols.append('use_ctrl')
+        combined_tradeoff = combined_tradeoff.dropna(subset=subset_cols)
+        combined_tradeoff = combined_tradeoff.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
+        _atomic_write_csv(tradeoff_csv, combined_tradeoff)
+        print(f"?? Guard trade-off data saved to {tradeoff_csv} ({len(combined_tradeoff)} rows)")
+
+    if frontier_rows:
+        df_frontier_new = pd.DataFrame(frontier_rows)
+        if not existing_frontier.empty and distances_considered:
+            mask_front = pd.Series(True, index=existing_frontier.index)
+            if 'distance_um' in existing_frontier.columns:
+                dist_series = pd.to_numeric(existing_frontier['distance_um'], errors='coerce')
+                mask_front &= ~dist_series.apply(lambda x: any(abs(x - d) < 1e-6 for d in distances_considered))
+            if 'use_ctrl' in existing_frontier.columns:
+                mask_front |= existing_frontier['use_ctrl'] != desired_ctrl
+            existing_frontier = existing_frontier[mask_front]
+        combined_frontier = pd.concat([existing_frontier, df_frontier_new], ignore_index=True)
+    else:
+        combined_frontier = existing_frontier
+
+    if not combined_frontier.empty:
+        combined_frontier['distance_um'] = pd.to_numeric(combined_frontier['distance_um'], errors='coerce')
+        subset_cols = ['distance_um']
+        if 'use_ctrl' in combined_frontier.columns:
+            subset_cols.append('use_ctrl')
+        combined_frontier = combined_frontier.dropna(subset=subset_cols)
+        combined_frontier = combined_frontier.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
+        _atomic_write_csv(frontier_csv, combined_frontier)
+        print(f"?? Guard frontier saved to {frontier_csv} ({len(combined_frontier)} rows)")
 def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any], 
                                     distances_um: List[float], 
                                     guard_grid: List[float], 
@@ -4221,7 +4794,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 cfg_d, seeds,
                 'pipeline.Nm_per_symbol',
                 grid_nm_values,
-                f"HDS grid Hybrid (d={d} μm)",
+                f"HDS grid Hybrid (d={d} um)",
                 progress_mode=args.progress,
                 persist_csv=None,  # Don't persist intermediate results
                 resume=args.resume,
@@ -4313,10 +4886,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
             if done_distances:
                 print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
-                      f"{sorted(done_distances)} μm")
+                      f"{sorted(done_distances)} um")
             if failed_distances:
                 print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
-                      f"{sorted(failed_distances)} μm")
+                      f"{sorted(failed_distances)} um")
             else:
                 # Old CSV without lod_nm → just don't prefill
                 print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
@@ -4469,7 +5042,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         """Submit one distance job to the pool."""
         wid = wid_hint % max(1, maxw)
         if hasattr(pm, "worker_update"):
-            pm.worker_update(wid, f"LoD | d={dist} μm")
+            pm.worker_update(wid, f"LoD | d={dist} um")
         q = progress_queues[dist]
         seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
         args.full_seeds = seeds
@@ -4632,7 +5205,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     ))
 
     if failed_distances:
-        print(f"⚠️  No LoD found at distances: {failed_distances} μm")
+        print(f"⚠️  No LoD found at distances: {failed_distances} um")
 
     # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
     df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
@@ -4685,6 +5258,21 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         print(f"\nLoD vs Distance (head) for {mode}:")
         print(df_lod[cols_to_show].head().to_string(index=False))
 
+    try:
+        _run_device_fom_sweeps(
+            cfg,
+            seeds,
+            mode,
+            data_dir,
+            suffix,
+            df_lod,
+            args.resume,
+            args,
+            pm=pm,
+            mode_key=mode_key if hierarchy_supported else None,
+        )
+    except Exception as device_exc:
+        print(f"??  Device FoM sweep skipped: {device_exc}")
     # ---------- 3) ISI trade-off (guard-factor sweep) ----------
     # BEFORE the sweep
     do_isi = False
@@ -4763,10 +5351,13 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             gf_key = 'guard_factor' if 'guard_factor' in existing.columns else 'pipeline.guard_factor'
             if gf_key in existing.columns:
                 combined = existing if df_isi.empty else pd.concat([existing, df_isi], ignore_index=True)
+                subset_cols: List[str] = []
+                if 'distance_um' in combined.columns:
+                    subset_cols.append('distance_um')
+                subset_cols.append(gf_key)
                 if 'use_ctrl' in combined.columns:
-                    combined = combined.drop_duplicates(subset=[gf_key, 'use_ctrl'], keep='last').sort_values([gf_key, 'use_ctrl'])
-                else:
-                    combined = combined.drop_duplicates(subset=[gf_key], keep='last').sort_values([gf_key])
+                    subset_cols.append('use_ctrl')
+                combined = combined.drop_duplicates(subset=subset_cols, keep='last').sort_values(by=subset_cols)
                 _atomic_write_csv(isi_csv, combined)
         elif not df_isi.empty:
             _atomic_write_csv(isi_csv, df_isi)
@@ -4815,6 +5406,22 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     else:
         print(f"\n3. ISI trade-off sweep skipped by --isi-sweep={args.isi_sweep}.")
 
+    try:
+        _run_guard_frontier(
+            cfg,
+            seeds,
+            mode,
+            data_dir,
+            suffix,
+            df_lod,
+            [float(d) for d in distances],
+            [float(g) for g in guard_values],
+            args,
+            pm=pm,
+            mode_key=mode_key if hierarchy_supported else None,
+        )
+    except Exception as guard_exc:
+        print(f"??  Guard frontier sweep skipped: {guard_exc}")
     elapsed = time.time() - start_time
     print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
     print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
@@ -4886,76 +5493,126 @@ def main() -> None:
 def integration_test_noise_correlation() -> None:
     """
     Step 5: Integration test for cross-channel noise correlation enhancement.
-    
-    This test validates that:
-    1. The rho_between_channels_after_ctrl parameter is properly read from config
-    2. Different correlation values produce expected sigma_diff calculations
-    3. The enhanced noise model integrates seamlessly with existing pipeline
+
+    This diagnostic validates that the simulator uses the correct correlation
+    coefficient for each modulation/control configuration and that the reported
+    differential noise matches the analytic expectation.
     """
-    print("🧪 Running Cross-Channel Noise Correlation Integration Test...")
-    
-    # Test configurations with different correlation values
-    test_cases: List[Dict[str, Union[float, str]]] = [  # FIX: Add explicit type annotation
-        {"rho_cc": 0.0, "description": "Independent channels (backward compatibility)"},
-        {"rho_cc": 0.3, "description": "Moderate cross-channel correlation"},
-        {"rho_cc": 0.7, "description": "Strong cross-channel correlation"},
+    print("Running Cross-Channel Noise Correlation Diagnostics...")
+
+    rho_cases: List[Dict[str, Union[float, str]]] = [
+        {"rho": 0.0, "description": "Independent channels"},
+        {"rho": 0.3, "description": "Moderate correlation"},
+        {"rho": 0.7, "description": "Strong correlation"},
     ]
-    
-    base_config = yaml.safe_load(open(project_root / "config" / "default.yaml", encoding='utf-8'))
+
+    mode_scenarios: List[Dict[str, Any]] = [
+        {"mode": "MoSK", "ctrl_options": [False]},
+        {"mode": "CSK", "ctrl_options": [False, True]},
+        {"mode": "Hybrid", "ctrl_options": [False, True]},
+    ]
+
+    with open(project_root / "config" / "default.yaml", encoding="utf-8") as fh:
+        base_config = yaml.safe_load(fh)
     base_config = preprocess_config_full(base_config)
+
+    tolerance = 5e-13
+    failures: List[str] = []
+
+    pipeline_logger = logging.getLogger('src.pipeline')
+    previous_level = pipeline_logger.level
+    level_changed = False
+    if pipeline_logger.getEffectiveLevel() < logging.ERROR:
+        pipeline_logger.setLevel(logging.ERROR)
+        level_changed = True
+
+    def _expected_sigma_diff_for(cfg: Dict[str, Any], sigma_da: float, sigma_sero: float) -> float:
+        pipeline_cfg = cfg.get('pipeline', {})
+        noise_cfg = cfg.get('noise', {})
+        mod = str(pipeline_cfg.get('modulation', '')).upper()
+        use_ctrl = bool(pipeline_cfg.get('use_control_channel', True))
+        rho_pre = float(noise_cfg.get('rho_corr', noise_cfg.get('rho_correlated', 0.0)))
+        rho_post = float(noise_cfg.get('rho_between_channels_after_ctrl', 0.0))
+        rho_post = float(pipeline_cfg.get('rho_cc_measured', rho_post))
+        if mod == 'MOSK' or not use_ctrl:
+            rho_target = rho_pre
+        else:
+            rho_target = rho_post
+        rho_target = max(-1.0, min(1.0, rho_target))
+        var_diff = sigma_da * sigma_da + sigma_sero * sigma_sero - 2.0 * rho_target * sigma_da * sigma_sero
+        return math.sqrt(max(var_diff, 0.0))
+
+    try:
+        for scenario in mode_scenarios:
+            mode = str(scenario['mode'])
+            ctrl_options = scenario['ctrl_options']
+            for use_ctrl in ctrl_options:
+                scenario_label = f"{mode} (CTRL {'on' if use_ctrl else 'off'})"
+                print(f"  Scenario: {scenario_label}")
     
-    # Configure test parameters
-    base_config['pipeline']['modulation'] = 'MoSK'
-    base_config['pipeline']['sequence_length'] = 10  # Small for quick test
-    base_config['pipeline']['Nm_per_symbol'] = 1e4
-    base_config['pipeline']['distance_um'] = 100
+                for case in rho_cases:
+                    rho_val = float(case['rho'])
+                    test_config = deepcopy(base_config)
+                    pipeline_cfg = test_config.setdefault('pipeline', {})
+                    pipeline_cfg.pop('rho_cc_measured', None)
+                    pipeline_cfg['modulation'] = mode
+                    pipeline_cfg['sequence_length'] = 10
+                    pipeline_cfg['Nm_per_symbol'] = 1e4
+                    pipeline_cfg['distance_um'] = 100
+                    pipeline_cfg['use_control_channel'] = bool(use_ctrl) if mode != 'MoSK' else False
+                    pipeline_cfg['channel_profile'] = 'tri' if pipeline_cfg['use_control_channel'] else 'dual'
+                    pipeline_cfg['show_progress'] = False
+                    pipeline_cfg['random_seed'] = pipeline_cfg.get('random_seed', 2025)
     
-    for case in test_cases:
-        rho_cc_value = float(case['rho_cc'])  # FIX: Extract and cast early
-        description = str(case['description'])  # FIX: Extract description with proper type
-        
-        print(f"  Testing {description} (ρcc = {rho_cc_value})...")
-        
-        # Set cross-channel correlation parameter
-        test_config = deepcopy(base_config)
-        test_config['noise']['rho_between_channels_after_ctrl'] = rho_cc_value
-        
-        try:
-            # Ensure a symbol period is present (match your dynamic Ts logic)
-            test_config['pipeline']['symbol_period_s'] = calculate_dynamic_symbol_period(
-                float(test_config['pipeline']['distance_um']), test_config
-            )
-            # Test 1: Verify sigma calculation
-            detection_window_s = 1.0  # Default value
-            test_config['pipeline']['symbol_period_s'] = detection_window_s
-            test_config['pipeline']['time_window_s'] = detection_window_s
-            test_config['detection']['decision_window_s'] = detection_window_s
-            sigma_da, sigma_sero = calculate_proper_noise_sigma(test_config, detection_window_s)
-            
-            # Manual calculation for verification
-            expected_sigma_diff = math.sqrt(sigma_da**2 + sigma_sero**2 - 2*rho_cc_value*sigma_da*sigma_sero)
-            
-            # Test 2: Run short simulation to verify integration
-            result = run_sequence(test_config)
-            actual_sigma_diff = result.get('noise_sigma_I_diff', 0.0)
-            
-            # Verify calculations match
-            tolerance = 1e-12
-            if abs(actual_sigma_diff - expected_sigma_diff) < tolerance:
-                print(f"    ✅ σ_diff calculation: {actual_sigma_diff:.2e} (expected: {expected_sigma_diff:.2e})")
-            else:
-                print(f"    ❌ σ_diff mismatch: {actual_sigma_diff:.2e} vs expected {expected_sigma_diff:.2e}")
-                
-            # Test 3: Verify correlation reduces differential noise (when rho_cc > 0)
-            if rho_cc_value > 0:
-                independent_sigma = math.sqrt(sigma_da**2 + sigma_sero**2)
-                noise_reduction = (independent_sigma - actual_sigma_diff) / independent_sigma * 100
-                print(f"    📉 Noise reduction: {noise_reduction:.1f}% vs independent assumption")
-                
-        except Exception as e:
-            print(f"    ❌ Test failed: {e}")
+                    test_config['disable_progress'] = True
     
-    print("🎯 Cross-channel noise correlation integration test completed!\n")
+                    noise_cfg = test_config.setdefault('noise', {})
+                    noise_cfg['rho_between_channels_after_ctrl'] = rho_val
+                    noise_cfg['rho_corr'] = rho_val
+                    noise_cfg['rho_correlated'] = rho_val
+    
+                    distance_um = float(pipeline_cfg['distance_um'])
+                    Ts = calculate_dynamic_symbol_period(distance_um, test_config)
+                    pipeline_cfg['symbol_period_s'] = Ts
+                    pipeline_cfg['time_window_s'] = Ts
+    
+                    sim_cfg = test_config.setdefault('sim', {})
+                    sim_cfg['time_window_s'] = Ts
+    
+                    det_cfg = test_config.setdefault('detection', {})
+                    det_cfg.setdefault('decision_window_policy', 'fraction_of_ts')
+                    det_cfg.setdefault('decision_window_fraction', 0.9)
+    
+                    dt = float(sim_cfg.get('dt_s', 0.01))
+                    detection_window_s = _resolve_decision_window(test_config, Ts, dt)
+    
+                    sigma_da, sigma_sero = calculate_proper_noise_sigma(test_config, detection_window_s)
+                    expected_sigma_diff = _expected_sigma_diff_for(test_config, sigma_da, sigma_sero)
+                    sigma_independent = math.sqrt(max(sigma_da * sigma_da + sigma_sero * sigma_sero, 0.0))
+    
+                    result = run_sequence(deepcopy(test_config))
+                    actual_sigma_diff = float(result.get('noise_sigma_I_diff', 0.0))
+                    delta = abs(actual_sigma_diff - expected_sigma_diff)
+    
+                    if delta <= tolerance:
+                        print(f"    OK rho={rho_val:.1f}: sigma_diff={actual_sigma_diff:.2e} (analytic={expected_sigma_diff:.2e})")
+                    else:
+                        print(f"    !! rho={rho_val:.1f}: sigma_diff={actual_sigma_diff:.2e} vs analytic {expected_sigma_diff:.2e} (delta={delta:.2e})")
+                        failures.append(f"{scenario_label} rho={rho_val:.1f}")
+    
+                    if rho_val > 0.0 and sigma_independent > 0.0:
+                        noise_reduction = (sigma_independent - actual_sigma_diff) / sigma_independent * 100.0
+                        print(f"       Noise reduction vs independent: {noise_reduction:.1f}%")
+    
+    finally:
+        if level_changed:
+            pipeline_logger.setLevel(previous_level)
+    if failures:
+        print("\nCross-Channel Noise Correlation Diagnostics found mismatches:")
+        for item in failures:
+            print(f"   - {item}")
+    else:
+        print("\nCross-Channel Noise Correlation Diagnostics completed successfully!\n")
 
 # ENHANCEMENT: Export canonical formatter for use by other modules
 __all__ = ["canonical_value_key"]

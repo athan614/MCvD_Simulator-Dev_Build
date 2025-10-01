@@ -136,13 +136,22 @@ def _csk_dual_channel_Q(
         # Fallback: legacy single-channel behavior
         return Qt
 
-def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float, symbol_index: int = -1) -> Tuple[float, float]:
-    """Calculate physics-based noise sigma (robust implementation)"""
+def calculate_proper_noise_sigma(
+    cfg: Dict[str, Any],
+    detection_window_s: float,
+    symbol_index: int = -1,
+    components_out: Optional[Dict[str, float]] = None
+) -> Tuple[float, float]:
+    """Calculate physics-based noise sigma (robust implementation).
+
+    Optionally populates ``components_out`` with a thermal/flicker breakdown for
+    downstream logging while keeping the return contract unchanged.
+    """
     k_B = 1.38e-23
-    
+
     # Robustly access configuration parameters with config override support
     T = cfg.get('sim', {}).get('temperature_K', 310)
-    
+
     oect_cfg = cfg.get('oect', {})
     R_ch = oect_cfg.get('R_ch_Ohm', 100)
     gm = oect_cfg.get('gm_S', 0.005)
@@ -163,20 +172,22 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
     B_det = cfg.get('detection_bandwidth_Hz', noise_cfg.get('detection_bandwidth_Hz', 100))
     T_int = detection_window_s
     f_min = 1.0 / T_int
-    f_max = min(B_det, f_samp/2)
-    
-    effective_B = 0.25 / T_int
-    
+    f_max = min(B_det, f_samp / 2)
+
     psd_johnson = 4 * k_B * T / R_ch
     johnson_charge_var = psd_johnson * T_int
-    
+
     K_f = alpha_H / N_c
-    flicker_charge_var = K_f * I_dc**2 * max(0.0, np.log(2 * np.pi * T_int)) * T_int if f_max > f_min else 0
-    
-    drift_charge_var = 0
-    
-    total_single_var = johnson_charge_var + flicker_charge_var + drift_charge_var
-    
+    flicker_charge_var = K_f * I_dc**2 * max(0.0, np.log(2 * np.pi * T_int)) * T_int if f_max > f_min else 0.0
+
+    drift_charge_var = 0.0
+
+    thermal_var_single = max(johnson_charge_var, 0.0)
+    flicker_var_single = max(flicker_charge_var, 0.0)
+    drift_var_single = max(drift_charge_var, 0.0)
+    total_single_var = thermal_var_single + flicker_var_single + drift_var_single
+    sigma_single = math.sqrt(max(total_single_var, 0.0))
+
     # Enhanced: Mode-aware noise calculation
     use_ctrl_flag = bool(cfg.get('pipeline', {}).get('use_control_channel', True))
     mod = str(cfg.get('pipeline', {}).get('modulation', '')).upper()
@@ -187,17 +198,40 @@ def calculate_proper_noise_sigma(cfg: Dict[str, Any], detection_window_s: float,
 
     if use_ctrl_for_noise:
         # Differential measurement: benefits from common-mode rejection
-        differential_var = 2 * total_single_var * (1 - effective_rho)
-        sigma = np.sqrt(differential_var)
+        rejection = max(0.0, 1.0 - effective_rho)
+        thermal_var_effective = 2.0 * thermal_var_single * rejection
+        flicker_var_effective = 2.0 * flicker_var_single * rejection
+        drift_var_effective = 2.0 * drift_var_single * rejection
     else:
         # Single-ended measurement: no common-mode rejection
-        sigma = np.sqrt(total_single_var)
-    
-    # Increased floor slightly for robustness
-    sigma = max(sigma, 1e-15)
-    
-    return sigma, sigma
+        thermal_var_effective = thermal_var_single
+        flicker_var_effective = flicker_var_single
+        drift_var_effective = drift_var_single
 
+    total_effective_var = thermal_var_effective + flicker_var_effective + drift_var_effective
+    sigma_effective = math.sqrt(max(total_effective_var, 0.0))
+
+    # Increased floor slightly for robustness
+    sigma = max(sigma_effective, 1e-15)
+
+    if components_out is not None:
+        components_out.clear()
+        total_eff = max(total_effective_var, 0.0)
+        components_out.update({
+            'thermal_sigma': float(math.sqrt(max(thermal_var_effective, 0.0))),
+            'flicker_sigma': float(math.sqrt(max(flicker_var_effective, 0.0))),
+            'drift_sigma': float(math.sqrt(max(drift_var_effective, 0.0))),
+            'thermal_fraction': float((thermal_var_effective / total_eff) if total_eff > 0 else 0.0),
+            'flicker_fraction': float((flicker_var_effective / total_eff) if total_eff > 0 else 0.0),
+            'drift_fraction': float((drift_var_effective / total_eff) if total_eff > 0 else 0.0),
+            'total_sigma': float(sigma),
+            'single_ended_sigma': float(max(sigma_single, 1e-15)),
+            'use_ctrl_for_noise': float(1.0 if use_ctrl_for_noise else 0.0),
+            'rho_used': float(effective_rho if use_ctrl_for_noise else 0.0),
+            'detection_window_s': float(T_int),
+        })
+
+    return sigma, sigma
 
 def _calculate_isi_vectorized(
     tx_history: List[Tuple[int, float]], 
@@ -579,7 +613,8 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg['pipeline']['symbol_period_s'],
         cfg['sim']['dt_s']
     )
-    sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg, detection_window_s)
+    noise_components: Dict[str, float] = {}
+    sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg, detection_window_s, components_out=noise_components)
 
     # ✨ NEW: also compute single-ended noise for MoSK statistic (even when mode='Hybrid')
     from copy import deepcopy
@@ -908,13 +943,41 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         'noise_sigma_da': float(sigma_da),
         'noise_sigma_sero': float(sigma_sero),
         'noise_sigma_I_diff': float(sigma_diff),
+        'noise_sigma_thermal': float(noise_components.get('thermal_sigma', float('nan'))),
+        'noise_sigma_flicker': float(noise_components.get('flicker_sigma', float('nan'))),
+        'noise_sigma_drift': float(noise_components.get('drift_sigma', float('nan'))),
+        'noise_thermal_fraction': float(noise_components.get('thermal_fraction', float('nan'))),
     }
 
     # Add MoSK sigma metadata for Hybrid mode
     if mod == 'Hybrid':
+        mosk_errors = int(subsymbol_errors.get('mosk', 0))
+        csk_errors = int(subsymbol_errors.get('csk', 0))
+        mosk_ser = (mosk_errors / L) if L > 0 else float('nan')
+        csk_ser = (csk_errors / L) if L > 0 else float('nan')
+        mosk_exposure_frac = (mosk_correct / L) if L > 0 else 0.0
+        conditional_csk_ser = (csk_errors / mosk_correct) if mosk_correct > 0 else float('nan')
+        M_levels = int(cfg['pipeline'].get('csk_levels', 4))
+        bits_per_symbol_csk_branch = float(math.log2(max(M_levels, 2)))
+        correct_csk = max(mosk_correct - csk_errors, 0)
+        bits_csk_realized = (correct_csk / L * bits_per_symbol_csk_branch) if L > 0 else 0.0
+        bits_mosk_realized = (1.0 - mosk_ser) if L > 0 else float('nan')
+        if L == 0:
+            bits_csk_realized = float('nan')
+
         result['mosk_sigma_diff_used'] = float(sigma_diff_mosk)
         result['mosk_stat_units'] = 'normalized_by_sigma_diff_single_ended_preCTRL'
         result['n_mosk_correct'] = int(mosk_correct)
+        result['mosk_ser'] = float(mosk_ser)
+        result['csk_ser'] = float(csk_ser)
+        result['mosk_exposure_frac'] = float(mosk_exposure_frac)
+        result['conditional_csk_ser'] = float(conditional_csk_ser) if not math.isnan(conditional_csk_ser) else float('nan')
+        result['hybrid_bits_per_symbol_mosk'] = float(bits_mosk_realized) if not math.isnan(bits_mosk_realized) else float('nan')
+        result['hybrid_bits_per_symbol_csk'] = float(bits_csk_realized) if not math.isnan(bits_csk_realized) else float('nan')
+        bits_total_realized = bits_mosk_realized + bits_csk_realized
+        if math.isnan(bits_mosk_realized) or math.isnan(bits_csk_realized):
+            bits_total_realized = float('nan')
+        result['hybrid_bits_per_symbol_total'] = float(bits_total_realized)
 
     return result
 
