@@ -52,6 +52,122 @@ from src.config_utils import preprocess_config
 from analysis.ui_progress import ProgressManager
 from analysis.log_utils import setup_tee_logging
 
+MODE_NAME_ALIASES: Dict[str, str] = {
+    "MOSK": "MoSK",
+    "CSK": "CSK",
+    "HYBRID": "Hybrid",
+    "ALL": "ALL",
+    "*": "ALL",
+}
+
+DEFAULT_MODE_DISTANCES: Dict[str, List[int]] = {
+    "MoSK": [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175, 200],
+    "CSK": [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125],
+    "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65],
+}
+
+def _canonical_mode_name(mode: str) -> str:
+    if not mode:
+        return "MoSK"
+    key = mode.strip().upper()
+    return MODE_NAME_ALIASES.get(key, mode.strip())
+
+def _parse_distance_list(spec: str) -> List[int]:
+    tokens: List[str] = []
+    cleaned = spec.strip()
+    if cleaned.startswith('[') and cleaned.endswith(']'):
+        cleaned = cleaned[1:-1]
+    for chunk in cleaned.replace(';', ',').split(','):
+        for part in chunk.split():
+            token = part.strip()
+            if token:
+                tokens.append(token.strip('[]'))
+    seen: Set[int] = set()
+    result: List[int] = []
+    for token in tokens:
+        if not token:
+            continue
+        try:
+            value = int(float(token))
+        except ValueError as exc:
+            raise ValueError(f"Invalid distance '{token}' in --distances") from exc
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+def _coerce_distance_sequence(values: Any) -> List[int]:
+    if isinstance(values, str):
+        return _parse_distance_list(values)
+    result: List[int] = []
+    seen: Set[int] = set()
+    if isinstance(values, (list, tuple)):
+        for item in values:
+            try:
+                value = int(float(item))
+            except (TypeError, ValueError):
+                continue
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+    return result
+
+def parse_distance_overrides(specs: Optional[List[str]]) -> Dict[str, List[int]]:
+    overrides: Dict[str, List[int]] = {}
+    if not specs:
+        return overrides
+    for raw in specs:
+        if raw is None:
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        if '=' in text:
+            mode_part, values_part = text.split('=', 1)
+        elif ':' in text:
+            mode_part, values_part = text.split(':', 1)
+        else:
+            mode_part, values_part = 'ALL', text
+        mode_key = _canonical_mode_name(mode_part)
+        distances = _parse_distance_list(values_part)
+        if not distances:
+            raise ValueError(f"--distances entry '{raw}' did not provide any numeric distances")
+        overrides[mode_key] = distances
+    return overrides
+
+def resolve_mode_distance_grid(mode: str, cfg: Dict[str, Any], overrides: Dict[str, List[int]]) -> List[int]:
+    canonical_mode = _canonical_mode_name(mode)
+    if canonical_mode in overrides:
+        return list(overrides[canonical_mode])
+    if 'ALL' in overrides:
+        return list(overrides['ALL'])
+    config_map: Dict[str, List[int]] = {}
+    cfg_lod = cfg.get('lod_distances_um')
+    if isinstance(cfg_lod, dict):
+        for key, seq in cfg_lod.items():
+            distances = _coerce_distance_sequence(seq)
+            if distances:
+                config_map[_canonical_mode_name(str(key))] = distances
+    elif cfg_lod is not None:
+        distances = _coerce_distance_sequence(cfg_lod)
+        if distances:
+            config_map['ALL'] = distances
+    legacy = cfg.get('distances_um')
+    if isinstance(legacy, dict):
+        for key, seq in legacy.items():
+            distances = _coerce_distance_sequence(seq)
+            if distances:
+                config_map.setdefault(_canonical_mode_name(str(key)), distances)
+    elif legacy is not None:
+        distances = _coerce_distance_sequence(legacy)
+        if distances:
+            config_map.setdefault('ALL', distances)
+    if canonical_mode in config_map:
+        return list(config_map[canonical_mode])
+    if 'ALL' in config_map:
+        return list(config_map['ALL'])
+    return list(DEFAULT_MODE_DISTANCES.get(canonical_mode, DEFAULT_MODE_DISTANCES['MoSK']))
+
 # ============= TYPE DEFINITIONS =============
 class CPUConfig(TypedDict):
     p_cores_physical: List[int]
@@ -1035,7 +1151,27 @@ def preprocess_config_full(config: Dict[str, Any]) -> Dict[str, Any]:
         'csk_leakage_frac', cfg['pipeline'].get('non_specific_binding_factor', 0.0)
     )
     cfg['pipeline']['csk_store_combiner_meta'] = cfg['pipeline'].get('csk_store_combiner_meta', True)
-    
+
+    lod_cfg = cfg.get('lod_distances_um')
+    normalized: Dict[str, List[int]] = {}
+    if isinstance(lod_cfg, dict):
+        for key, seq in lod_cfg.items():
+            distances = _coerce_distance_sequence(seq)
+            if distances:
+                normalized[_canonical_mode_name(str(key))] = distances
+    elif lod_cfg is not None:
+        distances = _coerce_distance_sequence(lod_cfg)
+        if distances:
+            normalized['ALL'] = distances
+    final_map: Dict[str, List[int]] = {mode: list(vals) for mode, vals in DEFAULT_MODE_DISTANCES.items()}
+    if 'ALL' in normalized:
+        final_map = {mode: list(normalized['ALL']) for mode in final_map}
+    for mode_key, distances in normalized.items():
+        if mode_key == 'ALL':
+            continue
+        final_map[mode_key] = list(distances)
+    cfg['lod_distances_um'] = final_map
+
     return cfg
 
 def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
@@ -1542,10 +1678,13 @@ def parse_arguments() -> argparse.Namespace:
                         help="Minimum seeds required before adaptive CI stopping can trigger.")
     parser.add_argument("--lod-screen-delta", type=float, default=1e-4,
                         help="Hoeffding screening significance (delta) for early-stop LoD tests.")
-    parser.add_argument("--distances",
-                        type=str,
-                        default="",
-                        help="Comma-separated distance grid in µm for LoD (e.g., 25,35,45,55,65,75,85,95,105,115,125,150,175,200)")
+    parser.add_argument(
+        "--distances",
+        action="append",
+        default=None,
+        metavar="MODE=LIST",
+        help=("Override LoD distance grid per mode. Example: --distances MoSK=25,35,45 --distances CSK=15,25. Use 'ALL=' to apply to all modes."),
+    )
     parser.add_argument("--lod-num-seeds",
                         type=str,
                         default="<=100:6,<=150:8,>150:10",
@@ -1640,6 +1779,15 @@ def parse_arguments() -> argparse.Namespace:
                        help="Minimum SNR gain in dB to keep CTRL enabled (default: 0.0)")
     
     args = parser.parse_args()
+    
+    raw_distance_specs = args.distances or []
+    if raw_distance_specs is None:
+        raw_distance_specs = []
+    try:
+        args.distances_by_mode = parse_distance_overrides(raw_distance_specs)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.distances = list(raw_distance_specs)
     
     # Auto-enable sleep inhibition when GUI is requested
     if args.progress == "gui":
@@ -2482,6 +2630,20 @@ def run_sweep(cfg: Dict[str, Any],
         med_delta_stat = float(np.nanmedian(np.asarray(delta_stat_values, dtype=float))) if delta_stat_values else float('nan')
         delta_I_diff = float(med_delta_stat * med_sigma_diff) if (np.isfinite(med_delta_stat) and np.isfinite(med_sigma_diff)) else float('nan')
 
+        i_dc_vals = np.asarray([r.get('I_dc_used_A', float('nan')) for r in results], dtype=float)
+        v_g_vals = np.asarray([r.get('V_g_bias_V_used', float('nan')) for r in results], dtype=float)
+        gm_vals = np.asarray([r.get('gm_S', float('nan')) for r in results], dtype=float)
+        c_tot_vals = np.asarray([r.get('C_tot_F', float('nan')) for r in results], dtype=float)
+
+        def _finite_median(arr: np.ndarray) -> float:
+            finite = arr[np.isfinite(arr)]
+            return float(np.median(finite)) if finite.size else float('nan')
+
+        med_I_dc = _finite_median(i_dc_vals)
+        med_V_g_bias = _finite_median(v_g_vals)
+        med_gm = _finite_median(gm_vals)
+        med_c_tot = _finite_median(c_tot_vals)
+
         mode_name = cfg['pipeline']['modulation']
         snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
                         if mode_name in ("MoSK", "Hybrid") else
@@ -2517,6 +2679,10 @@ def run_sweep(cfg: Dict[str, Any],
             'noise_sigma_flicker': med_sigma_flicker,
             'noise_sigma_drift': med_sigma_drift,
             'noise_thermal_fraction': med_thermal_frac,
+            'I_dc_used_A': med_I_dc,
+            'V_g_bias_V_used': med_V_g_bias,
+            'gm_S': med_gm,
+            'C_tot_F': med_c_tot,
             'delta_over_sigma': med_delta_stat,
             'delta_I_diff': delta_I_diff,
             'distance_um': current_distance,
@@ -3404,6 +3570,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'noise_sigma_flicker': float('nan'),
                 'noise_sigma_drift': float('nan'),
                 'noise_thermal_fraction': float('nan'),
+                'I_dc_used_A': float('nan'),
+                'V_g_bias_V_used': float('nan'),
+                'gm_S': float('nan'),
+                'C_tot_F': float('nan'),
                 'actual_progress': 0,
                 'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
             }
@@ -3423,6 +3593,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'mode': cfg['pipeline']['modulation'], 'noise_sigma_I_diff': float('nan'),
                 'noise_sigma_thermal': float('nan'), 'noise_sigma_flicker': float('nan'),
                 'noise_sigma_drift': float('nan'), 'noise_thermal_fraction': float('nan'),
+                'I_dc_used_A': float('nan'), 'V_g_bias_V_used': float('nan'), 'gm_S': float('nan'), 'C_tot_F': float('nan'),
                 'actual_progress': 0, 'skipped_reason': f'Ts>{cap_cli}s'
             }
     
@@ -3594,6 +3765,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         sigma_flicker_values = []
         sigma_drift_values = []
         thermal_fraction_values = []
+        i_dc_values = []
+        v_g_bias_values = []
+        gm_values = []
+        c_tot_values = []
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
                                         debug_calibration=debug_calibration, 
@@ -3609,6 +3784,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                     sigma_drift_values.append(result['noise_sigma_drift'])
                 if 'noise_thermal_fraction' in result:
                     thermal_fraction_values.append(result['noise_thermal_fraction'])
+                if 'I_dc_used_A' in result:
+                    i_dc_values.append(result['I_dc_used_A'])
+                if 'V_g_bias_V_used' in result:
+                    v_g_bias_values.append(result['V_g_bias_V_used'])
+                if 'gm_S' in result:
+                    gm_values.append(result['gm_S'])
+                if 'C_tot_F' in result:
+                    c_tot_values.append(result['C_tot_F'])
             # Progress callback for completed noise sigma seed
             if progress_cb is not None:
                 try: 
@@ -3616,17 +3799,30 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 except Exception: 
                     pass
         
-        lod_sigma_median = float(np.median(sigma_values)) if sigma_values else float('nan')
-        lod_sigma_thermal = float(np.median(sigma_thermal_values)) if sigma_thermal_values else float('nan')
-        lod_sigma_flicker = float(np.median(sigma_flicker_values)) if sigma_flicker_values else float('nan')
-        lod_sigma_drift = float(np.median(sigma_drift_values)) if sigma_drift_values else float('nan')
-        lod_thermal_fraction = float(np.median(thermal_fraction_values)) if thermal_fraction_values else float('nan')
+        def _finite_list_median(values):
+            arr = np.asarray(values, dtype=float)
+            finite = arr[np.isfinite(arr)]
+            return float(np.median(finite)) if finite.size else float('nan')
+
+        lod_sigma_median = _finite_list_median(sigma_values)
+        lod_sigma_thermal = _finite_list_median(sigma_thermal_values)
+        lod_sigma_flicker = _finite_list_median(sigma_flicker_values)
+        lod_sigma_drift = _finite_list_median(sigma_drift_values)
+        lod_thermal_fraction = _finite_list_median(thermal_fraction_values)
+        lod_I_dc = _finite_list_median(i_dc_values)
+        lod_V_g_bias = _finite_list_median(v_g_bias_values)
+        lod_gm = _finite_list_median(gm_values)
+        lod_c_tot = _finite_list_median(c_tot_values)
     else:
         lod_sigma_median = float('nan')
         lod_sigma_thermal = float('nan')
         lod_sigma_flicker = float('nan')
         lod_sigma_drift = float('nan')
         lod_thermal_fraction = float('nan')
+        lod_I_dc = float('nan')
+        lod_V_g_bias = float('nan')
+        lod_gm = float('nan')
+        lod_c_tot = float('nan')
 
     # mark LoD state as done ONLY if valid result
     try:
@@ -3672,6 +3868,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'noise_sigma_flicker': lod_sigma_flicker,
         'noise_sigma_drift': lod_sigma_drift,
         'noise_thermal_fraction': lod_thermal_fraction,
+        'I_dc_used_A': float(lod_I_dc),
+        'V_g_bias_V_used': float(lod_V_g_bias),
+        'gm_S': float(lod_gm),
+        'C_tot_F': float(lod_c_tot),
         'actual_progress': int(actual_progress),
         'skipped_reason': skipped_reason,  # ✅ Use the variable instead of None
         'lod_found': bool(not (isinstance(lod_nm, float) and (math.isnan(lod_nm) or lod_nm <= 0))),
@@ -4515,6 +4715,27 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['pipeline']['enable_isi'] = not args.disable_isi
     cfg['pipeline']['modulation'] = mode
     cfg['pipeline']['sequence_length'] = args.sequence_length
+    mode_label = _canonical_mode_name(mode)
+    distance_overrides = getattr(args, 'distances_by_mode', {})
+    lod_distance_grid = resolve_mode_distance_grid(mode, cfg, distance_overrides)
+    if not lod_distance_grid:
+        lod_distance_grid = list(DEFAULT_MODE_DISTANCES.get(mode_label, DEFAULT_MODE_DISTANCES['MoSK']))
+    else:
+        lod_distance_grid = list(lod_distance_grid)
+    cfg['pipeline']['distances_um'] = list(lod_distance_grid)
+    lod_cfg = cfg.setdefault('lod_distances_um', {})
+    if isinstance(lod_cfg, dict):
+        lod_cfg[mode_label] = list(lod_distance_grid)
+    override_label: Optional[str] = None
+    if distance_overrides:
+        if mode_label in distance_overrides:
+            override_label = mode_label
+        elif 'ALL' in distance_overrides:
+            override_label = 'ALL'
+    if override_label:
+        print(f"?? Using CLI distance grid for {mode} (source={override_label}): {lod_distance_grid}")
+    else:
+        print(f"?? Using distance grid for {mode}: {lod_distance_grid}")
     profile = str(getattr(args, 'channel_profile', 'tri')).lower()
     cfg['pipeline']['channel_profile'] = profile
     if profile == 'single':
@@ -4593,11 +4814,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     else:
         nm_values = list(cfg.get('Nm_range', [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000]))
         print(f"📋 Using YAML Nm_range: {nm_values}")
-    distances = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
     ser_jobs = len(nm_values) * args.num_seeds
     lod_seed_cap = 10
-    lod_jobs = len(distances) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
+    lod_jobs = len(lod_distance_grid) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
     isi_jobs = (len(guard_values) * args.num_seeds) if (not args.disable_isi) else 0
 
     # Hierarchy
@@ -4761,10 +4981,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         grid_csv = data_dir / "hybrid_hds_grid.csv"
         
         # Use the distances configured for LoD (or fallback to a small set)
-        try:
-            distances = list(cfg['pipeline'].get('distances_um', []))
-        except Exception:
-            distances = []
+        distances = list(lod_distance_grid)
         if not distances:
             # Fallback to a representative subset for the grid
             distances = [25, 50, 100, 150, 200]
@@ -4830,13 +5047,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     # ---------- 2) LoD vs Distance ----------
     print("\n2. Building LoD vs distance curve…")
-    if args.distances:
-        d_run = [int(x) for x in args.distances.split(",") if x.strip()]
-    else:
-        if 'distances_um' in cfg:
-            d_run = [int(x) for x in cfg['distances_um']]
-        else:
-            d_run = [25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150, 175, 200]
+    d_run = [int(x) for x in lod_distance_grid]
     lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
     pm.set_status(mode=mode, sweep="LoD vs distance")
     # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
@@ -5414,7 +5625,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             data_dir,
             suffix,
             df_lod,
-            [float(d) for d in distances],
+            [float(d) for d in lod_distance_grid],
             [float(g) for g in guard_values],
             args,
             pm=pm,

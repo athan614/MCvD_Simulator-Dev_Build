@@ -2,9 +2,10 @@
 Noise correlation analysis utilities for cross-channel correlation effects.
 
 Provides vectorized calculations for residual DA-SERO correlation after
-CTRL subtraction and ONSI sensitivity analysis.
+CTRL subtraction and charge-domain QNSI sensitivity analysis.
 """
 
+import math
 import numpy as np
 from typing import Tuple, Union
 
@@ -13,13 +14,13 @@ def sigma_I_diff_vec(sigma_da: Union[float, np.ndarray],
                      sigma_sero: Union[float, np.ndarray], 
                      rho: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
-    Vectorized σ(I_diff) with residual DA–SERO correlation rho (can be scalar or ndarray).
-    
+    Vectorized sigma_Q(diff) with residual DA-SERO correlation rho (scalar or ndarray).
+
     Args:
-        sigma_da: DA channel noise standard deviation (scalar or array)
-        sigma_sero: SERO channel noise standard deviation (scalar or array)
+        sigma_da: DA channel noise standard deviation in charge domain (scalar or array)
+        sigma_sero: SERO channel noise standard deviation in charge domain (scalar or array)
         rho: Cross-channel correlation coefficient (scalar or array)
-        
+
     Returns:
         Combined differential noise standard deviation (scalar or array)
     """
@@ -147,3 +148,27 @@ def onsi_curve_optimal_ctrl(sigmas: np.ndarray, rho_cc_grid: np.ndarray,
         result.append(sigma / sigma0)
     
     return np.asarray(result)
+
+
+def compute_qnsi(
+    delta_q_diff: Union[float, np.ndarray],
+    sigma_da_Q: Union[float, np.ndarray],
+    sigma_sero_Q: Union[float, np.ndarray],
+    rho_post: Union[float, np.ndarray]
+) -> Union[float, np.ndarray]:
+    """Compute charge-domain QNSI = DeltaQ_diff / sigma_Q_diff with clipping safeguards."""
+
+    delta = np.asarray(delta_q_diff, dtype=float)
+    sigma_da = np.asarray(sigma_da_Q, dtype=float)
+    sigma_sero = np.asarray(sigma_sero_Q, dtype=float)
+    rho = np.asarray(rho_post, dtype=float)
+
+    sigma_q_diff = sigma_I_diff_vec(sigma_da, sigma_sero, rho)
+    denom = np.maximum(sigma_q_diff, 1e-15)
+    result = delta / denom
+
+    if isinstance(result, np.ndarray):
+        return np.asarray(result, dtype=float)
+    if isinstance(result, (np.generic, float, int)):
+        return float(result)
+    raise TypeError(f"Unsupported QNSI result type: {type(result)!r}")

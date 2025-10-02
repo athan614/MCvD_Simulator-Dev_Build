@@ -133,8 +133,14 @@ def oect_trio(bound_sites_trio: np.ndarray,
     R_ch = cfg["oect"]["R_ch_Ohm"]
     gm = cfg["oect"]["gm_S"]
     C_tot = cfg["oect"]["C_tot_F"]
-    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
-    I_DC = gm * abs(V_g_bias)
+
+    o = cfg.get('oect', {})
+    I_DC_cfg = float(o.get('I_dc_A', 0.0) or 0.0)
+    if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0:
+        V_g_bias = float(o.get('V_g_bias_V', -0.2))
+        I_DC = gm * abs(V_g_bias)
+    else:
+        I_DC = I_DC_cfg
     I_DC = max(I_DC, 1e-6)
 
     # VECTORIZED: Calculate PSD envelopes
@@ -230,8 +236,13 @@ def oect_current(
     i_signal = gm * q_eff * ELEMENTARY_CHARGE * bound_sites_t / C_tot
     
     # DC current for noise calculations
-    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
-    I_DC = gm * abs(V_g_bias)
+    o = cfg.get('oect', {})
+    I_DC_cfg = float(o.get('I_dc_A', 0.0) or 0.0)
+    if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0:
+        V_g_bias = float(o.get('V_g_bias_V', -0.2))
+        I_DC = gm * abs(V_g_bias)
+    else:
+        I_DC = I_DC_cfg
     I_DC = max(I_DC, 1e-6)
     
     # VECTORIZED: Frequency vector generation
@@ -330,8 +341,13 @@ def oect_current_batch(
         }
     
     # DC current for noise calculations (use mean of each batch)
-    V_g_bias = cfg['oect'].get('V_g_bias_V', -0.2)
-    I_DC = gm * abs(V_g_bias)
+    o = cfg.get('oect', {})
+    I_DC_cfg = float(o.get('I_dc_A', 0.0) or 0.0)
+    if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0:
+        V_g_bias = float(o.get('V_g_bias_V', -0.2))
+        I_DC = gm * abs(V_g_bias)
+    else:
+        I_DC = I_DC_cfg
     I_DC = max(I_DC, 1e-6)
     
     # Frequency vector for single-sided spectrum

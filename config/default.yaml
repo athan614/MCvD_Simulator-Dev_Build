@@ -84,10 +84,14 @@ sim:
   deterministic_mode: false     # Flag: Use means instead of stochastic
 
 # ——— Simulation / figure sweeps ———
-# Publication-friendly distance grid: dense at short ranges, trimmed tail for performance
-distances_um: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150]  # optimized range (removed 115, 200)
-# High-resolution distance grid (use only if needed)
-# distances_um: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
+# Mode-specific distance grids: dense near transmitter, trimmed tails for performance
+lod_distances_um:
+  MoSK: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175, 200]
+  CSK: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125]
+  Hybrid: [15, 20, 25, 30, 35, 40, 45, 55, 65]
+# Legacy grids retained for reference
+# distances_um: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150]
+# distances_um_high_res: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
 Nm_range: [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000] # finer resolution
 
 # -------- Detection layer --------

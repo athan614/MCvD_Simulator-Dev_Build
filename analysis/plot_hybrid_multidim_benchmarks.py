@@ -1,13 +1,13 @@
 # analysis/plot_hybrid_multidim_benchmarks.py
 """
-Stage 10 — Hybrid Multi‑Dimensional Benchmarks
+Stage 10 - Hybrid Multi-Dimensional Benchmarks
 
 Panels:
   (A) Hybrid Decision Components (HDS): total SER and decomposed MoSK/CSK error
       components vs Nm. Also shows a small dominance map (which component dominates).
-  (B) OECT‑Normalized Sensitivity Index (ONSI):
-        ONSI = (ΔI_diff / σ_I_diff) / (g_m / C_tot)
-      computed from device parameters and Nm, using a light thermal‑noise proxy.
+  (B) Charge-domain QNSI:
+        QNSI = DeltaQ_diff / sigma_Q_diff
+      computed from charge-domain noise over the decision window.
   (C) ISI‑Robust Throughput (IRT): R_eff(Ts) = (bits/symbol)/Ts * (1 - SER(Ts))
       from the ISI guard‑factor sweep for Hybrid mode.
 
@@ -30,9 +30,11 @@ References to data/columns & style follow the Stage 1–9 code paths:
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from copy import deepcopy
+from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import pandas as pd
@@ -45,12 +47,9 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
-# For default OECT parameters (gm, C_tot, R_ch, etc.) used in ONSI proxy
-# and to keep the notation aligned with the device model.
-try:
-    from src.mc_receiver import oect as oect_mod  # project layout
-except Exception:  # fallback for local flat layouts
-    from src.mc_receiver import oect as oect_mod  # keep same symbol
+from src.pipeline import calculate_proper_noise_sigma, _resolve_decision_window
+from src.config_utils import preprocess_config
+from analysis.noise_correlation import compute_qnsi
 
 # ------------------------- Helpers (data/columns) ----------------------------
 
@@ -183,366 +182,179 @@ def _plot_component_dominance(ax: Axes, comp: Dict[str, np.ndarray]) -> None:
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Dominance (1.0 = active)")
 
-# -------------------------- Panel B: ONSI proxy -----------------------------
+# -------------------------- Panel B: QNSI proxy -----------------------------
 
-def _compute_onsi_from_nm(
-    nm: np.ndarray,
-    gm_S: float,
-    C_tot_F: float,
-    R_ch_ohm: float,
-    temperature_K: float,
-    bits_per_symbol: float = 2.0,
-    q_eff_abs_e: float = 1.0,
-    detection_B_Hz: float = 100.0,
-) -> Dict[str, np.ndarray]:
-    """
-    Compute ONSI(Nm) = (ΔI_diff / σ_I_diff) / (g_m / C_tot).
 
-    Modeling notes (kept simple and explicit for a figure-level proxy):
-      • ΔI_diff  ≈ g_m * (q_eff_abs * e) * (ΔN_b) / C_tot  (magnitude)
-         For a two-level amplitude bit in Hybrid, ΔN_b ≈ 0.5 * Nm (low=½, high=1),
-         so ΔI_diff ∝ (0.5 * Nm). We use magnitude (sign not informative here).
-      • σ_I_diff ≈ sqrt(4 k_B T / R_ch * B_det)  (white/thermal proxy; one-sided)
-      • (g_m / C_tot) comes from device mapping; normalizing removes first-order device scaling.
+def _load_base_config(results_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    candidates: List[Path] = []
+    if results_dir is not None:
+        candidates.append(results_dir / "config" / "run_config.yaml")
+        candidates.append(results_dir / "config" / "default.yaml")
+    candidates.append(project_root / "config" / "default.yaml")
 
-    The proportionality constants cancel in the ratio; this is intended for
-    **comparative** visualization across Nm and device settings (not absolute metrology).
-    """
-    kB = 1.380649e-23
-    e = 1.602176634e-19
-
-    nm_arr = np.asarray(nm, dtype=np.float64)
-    # ΔN_b ~ 0.5 * Nm for the amplitude bit (2-level)
-    delta_N = 0.5 * nm_arr
-
-    delta_I = gm_S * (q_eff_abs_e * e) * delta_N / C_tot_F  # magnitude
-    sigma_I = np.sqrt(4.0 * kB * temperature_K / R_ch_ohm * detection_B_Hz)
-
-    gm_over_C = gm_S / C_tot_F
-    with np.errstate(divide="ignore", invalid="ignore"):
-        onsi = (delta_I / sigma_I) / gm_over_C
-    onsi = np.where(np.isfinite(onsi), onsi, 0.0)
-
-    return {"Nm": nm_arr, "ONSI": onsi.astype(np.float64)}
-
-def _value_key(v):
-    """
-    Canonicalize numeric values to consistent string representation.
-    Must match analysis/run_final_analysis.py implementation.
-    """
-    try:
-        vf = float(v)
-        return str(int(vf)) if vf.is_integer() else f"{vf:.6g}"
-    except Exception:
-        return str(v)
-
-def _load_device_params(results_dir: Path) -> Tuple[float, float, float]:
-    """
-    Load device parameters with priority: CSV data > config/default.yaml > module defaults.
-    Returns (gm_S, C_tot_F, R_ch) tuple for complete consistency.
-    """
-    import yaml
-    
-    # Initialize variables with None to track what we've found
-    gm_S: Optional[float] = None
-    C_tot_F: Optional[float] = None
-    R_ch: Optional[float] = None
-    
-    data_dir = results_dir / "data"
-    
-    # 1) Try to load from recent CSV data (most accurate)
-    for csv_name in ["ser_vs_nm_hybrid.csv", "ser_vs_nm_mosk.csv", "ser_vs_nm_csk.csv"]:
-        csv_path = data_dir / csv_name
-        if csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-                # Look for device parameter columns
-                gm_col = None
-                c_col = None
-                r_col = None
-                
-                for col in df.columns:
-                    if 'gm_s' in col.lower() or (col.lower() == 'gm' and 'gm_s' not in df.columns):
-                        gm_col = col
-                    if 'c_tot_f' in col.lower() or 'c_tot' in col.lower():
-                        c_col = col
-                    if 'r_ch' in col.lower() or 'r_ch_ohm' in col.lower():
-                        r_col = col
-                
-                if gm_col and c_col:
-                    gm_val = pd.to_numeric(df[gm_col], errors='coerce').dropna()
-                    c_val = pd.to_numeric(df[c_col], errors='coerce').dropna()
-                    
-                    if len(gm_val) > 0 and len(c_val) > 0:
-                        gm_S = float(gm_val.iloc[0])
-                        C_tot_F = float(c_val.iloc[0])
-                        
-                        # Try to get R_ch from CSV too
-                        if r_col:
-                            r_val = pd.to_numeric(df[r_col], errors='coerce').dropna()
-                            if len(r_val) > 0:
-                                R_ch = float(r_val.iloc[0])
-                        
-                        # If we got gm and C, break from loop
-                        break
-                        
-            except Exception as e:
-                print(f"⚠️  Could not read device params from {csv_name}: {e}")
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
                 continue
-    
-    # 2) Try to load from config/default.yaml 
-    try:
-        config_path = project_root / "config" / "default.yaml"
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            
-            # Extract OECT parameters from config
-            oect_config = config.get('oect', {})
-            gm_S_config = oect_config.get('gm_S')
-            C_tot_F_config = oect_config.get('C_tot_F') 
-            R_ch_config = oect_config.get('R_ch_Ohm')
-            
-            # Use config values if we don't have them from CSV
-            if gm_S is None and gm_S_config is not None:
-                gm_S = float(gm_S_config)
-            if C_tot_F is None and C_tot_F_config is not None:
-                C_tot_F = float(C_tot_F_config)
-            if R_ch is None and R_ch_config is not None:
-                R_ch = float(R_ch_config)
-                
-    except Exception as e:
-        print(f"⚠️  Could not load config/default.yaml: {e}")
-    
-    # 3) Fallback to module defaults for any missing values
-    try:
-        defaults = oect_mod.default_params()
-        if gm_S is None:
-            gm_S = float(defaults["gm_S"])
-        if C_tot_F is None:
-            C_tot_F = float(defaults["C_tot_F"])
-        if R_ch is None:
-            R_ch = float(defaults.get("R_ch_Ohm", 500.0))  # with fallback
-    except Exception:
-        # Use module defaults failed, apply hardcoded fallbacks
-        if gm_S is None:
-            gm_S = 2e-3
-        if C_tot_F is None:
-            C_tot_F = 18e-9
-        if R_ch is None:
-            R_ch = 500.0
-    
-    # 4) Final safety check - ensure all values are set
-    if gm_S is None:
-        gm_S = 2e-3  # Conservative hardcoded fallback
-    if C_tot_F is None:
-        C_tot_F = 18e-9  # Conservative hardcoded fallback  
-    if R_ch is None:
-        R_ch = 500.0  # Conservative hardcoded fallback
-    
-    # Determine source for logging
-    if gm_S == 2e-3 and C_tot_F == 18e-9 and R_ch == 500.0:
-        source = "hardcoded fallback"
-    else:
-        source = "mixed sources (CSV/config/module)"
-    
-    print(f"📊 ONSI: Using device params from {source}: gm={gm_S:.3e} S, C={C_tot_F:.3e} F, R={R_ch:.0f} Ω")
-    return gm_S, C_tot_F, R_ch
-
-def _compute_onsi_from_cache(
-    nm_values: np.ndarray,
-    cache_dir: Path,
-    gm_S: float,
-    C_tot_F: float
-) -> Dict[str, np.ndarray]:
-    """
-    Read ONSI from cached simulation data for realistic noise statistics.
-    
-    Cache field compatibility notes:
-    - Current runner writes: stats_da, stats_sero (raw statistics)
-    - Future Stage 14 will write: noise_sigma, sigma_I_diff (processed noise)
-    - This function tries multiple fallback strategies for robustness
-    """
-    import json
-    e = 1.602176634e-19
-    nm_arr = np.asarray(nm_values, dtype=np.float64)
-    onsi_values = []
-    
-    # Thermal noise fallback function
-    def _thermal_noise_proxy(gm_S: float, T_K: float, R_ch: float, B_Hz: float) -> float:
-        kB = 1.380649e-23
-        return float(np.sqrt(4.0 * kB * T_K / R_ch * B_Hz))
-    
-    for nm in nm_arr:
-        # Look for cached simulation results at this Nm
-        vk = _value_key(nm)
-        
-        # Stage 14+: First try to get noise_sigma_I_diff from CSV if available
-        # (More efficient than crawling per-seed JSONs)
-        sigma_I_diff = None
-        
-        # Check if we have direct noise column in any CSV
-        for csv_name in ["ser_vs_nm_hybrid.csv", "ser_vs_nm_mosk.csv", "ser_vs_nm_csk.csv"]:
-            csv_path = cache_dir.parent / "data" / csv_name  # results/data/
-            if csv_path.exists():
-                try:
-                    df = pd.read_csv(csv_path)
-                    nm_col = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df.columns else 'pipeline.Nm_per_symbol'
-                    if nm_col in df.columns and 'noise_sigma_I_diff' in df.columns:
-                        # Find matching Nm row
-                        nm_matches = df[df[nm_col] == nm]
-                        if not nm_matches.empty:
-                            sigma_I_diff = float(nm_matches['noise_sigma_I_diff'].iloc[0])
-                            break
-                except Exception:
-                    continue
-        
-        # If CSV lookup succeeded, use it directly
-        if sigma_I_diff is not None:
-            delta_N = 0.5 * nm
-            delta_I = gm_S * e * delta_N / C_tot_F
-            onsi_value = (delta_I / sigma_I_diff) / (gm_S / C_tot_F)
-            onsi_values.append(onsi_value)
-            print(f"📊 ONSI: Using CSV noise_sigma_I_diff for Nm={nm:.0e}: σ={sigma_I_diff:.2e}")
+            with candidate.open("r", encoding="utf-8") as fh:
+                raw_cfg = yaml.safe_load(fh)
+            if not isinstance(raw_cfg, dict):
+                continue
+            processed = preprocess_config(raw_cfg)
+            if isinstance(processed, dict):
+                return processed
+        except Exception:
             continue
-        
-        # Fallback: existing JSON cache crawling logic starts here
-        # Try both CTRL variants
-        cache_paths = [
-            cache_dir / "hybrid" / "ser_vs_nm_wctrl" / vk,
-            cache_dir / "hybrid" / "ser_vs_nm_noctrl" / vk,
-            cache_dir / "hybrid" / "ser_vs_nm_ctrl_unspecified" / vk
-        ]
-        
-        sigma_measured = []
-        delta_measured = []
-        
-        for cache_path in cache_paths:
-            if cache_path.exists():
-                for seed_file in cache_path.glob("seed_*.json"):
-                    try:
-                        with open(seed_file, 'r') as f:
-                            data = json.load(f)
-                        
-                        # Extract noise and signal from cached results
-                        # TODO: Stage 14 will standardize these field names
-                        # For now, try multiple possible field names
-                        sigma_fields = ['noise_sigma', 'sigma_I_diff', 'std_da', 'std_sero']
-                        delta_fields = ['signal_delta', 'delta_I_diff', 'mean_diff']
-                        
-                        sigma_val = None
-                        delta_val = None
-                        
-                        for field in sigma_fields:
-                            if field in data:
-                                sigma_val = float(data[field])
-                                break
-                        
-                        for field in delta_fields:
-                            if field in data:
-                                delta_val = float(data[field])
-                                break
-                        
-                        # If we don't have direct noise/signal, try to compute from stats
-                        if sigma_val is None and 'stats_da' in data and 'stats_sero' in data:
-                            stats_da = np.array(data['stats_da'])
-                            stats_sero = np.array(data['stats_sero'])
-                            if len(stats_da) > 0 and len(stats_sero) > 0:
-                                # Combined standard deviation
-                                diff_stats = np.array(stats_da) - np.array(stats_sero)
-                                sigma_val = float(np.std(diff_stats))
-                                delta_val = float(abs(np.mean(stats_da) - np.mean(stats_sero)))
-                        
-                        if sigma_val is not None and delta_val is not None:
-                            sigma_measured.append(sigma_val)
-                            delta_measured.append(delta_val)
-                            
-                    except Exception:
-                        continue
-                
-                # If we found data in this cache path, break
-                if sigma_measured:
-                    break
-        
-        if sigma_measured and delta_measured:
-            # Use median across seeds for stability
-            sigma_I = float(np.median(sigma_measured))
-            delta_I = float(np.median(delta_measured))
-            print(f"📊 ONSI: Using cached noise for Nm={nm:.0e}: σ={sigma_I:.2e}, Δ={delta_I:.2e}")
-        else:
-            # Fallback to thermal proxy
-            sigma_I = _thermal_noise_proxy(gm_S, 310.0, 1e6, 100.0)
-            delta_I = gm_S * e * 0.5 * nm / C_tot_F  # Use resolved device C
-            print(f"⚠️  ONSI: No cached noise for Nm={nm:.0e}, using thermal proxy")
-        
-        # Calculate ONSI for this Nm
-        gm_over_C = gm_S / C_tot_F
-        if sigma_I > 0 and gm_over_C > 0:
-            onsi = (delta_I / sigma_I) / gm_over_C
-        else:
-            onsi = 0.0
-        
-        onsi_values.append(onsi)
-    
-    return {"Nm": nm_arr, "ONSI": np.array(onsi_values, dtype=np.float64)}
+    return None
 
-def _prepare_onsi(
+
+def _extract_rho_post(row: Optional[pd.Series], cfg: Optional[Dict[str, Any]]) -> float:
+    if row is not None:
+        for key in ("rho_cc_measured", "rho_cc"):
+            if key in row and pd.notna(row[key]):
+                try:
+                    return float(row[key])
+                except (TypeError, ValueError):
+                    pass
+    if cfg is None:
+        return 0.0
+    noise_cfg = cfg.get("noise", {})
+    rho_val = noise_cfg.get("rho_between_channels_after_ctrl",
+                            noise_cfg.get("effective_correlation",
+                                           noise_cfg.get("rho_corr", 0.0)))
+    try:
+        rho_float = float(rho_val)
+    except (TypeError, ValueError):
+        rho_float = 0.0
+    return max(-1.0, min(1.0, rho_float))
+
+
+def _prepare_qnsi(
     df_ser_nm: Optional[pd.DataFrame],
     use_simulation_noise: bool = False,
-    cache_dir: Optional[Path] = None,
     results_dir: Optional[Path] = None
 ) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Pulls Nm grid from ser_vs_nm_hybrid.csv and builds ONSI curve.
-    
-    Args:
-        df_ser_nm: SER vs Nm data
-        use_simulation_noise: If True, use cached σ from simulation; if False, use thermal proxy
-        cache_dir: Directory containing cached simulation results
-        results_dir: Results directory for device parameter loading
-    """
-    # Enhanced: Load device parameters consistently including R_ch
-    if results_dir is not None:
-        gm_S, C_tot_F, R_ch = _load_device_params(results_dir)
-    else:
-        # Fallback to original method
-        try:
-            defaults = oect_mod.default_params()
-            gm_S = float(defaults["gm_S"])
-            C_tot_F = float(defaults["C_tot_F"])
-            R_ch = float(defaults.get("R_ch_Ohm", 500.0))
-        except Exception:
-            gm_S, C_tot_F, R_ch = 2e-3, 18e-9, 500.0
-
-    temperature_K = 310.0
-    detection_B_Hz = 100.0
-
     if df_ser_nm is None or df_ser_nm.empty:
-        # build a reasonable Nm grid if data are absent
-        Nm = np.logspace(2.0, 5.0, 20, dtype=np.float64)
-    else:
-        nmcol = _nm_col(df_ser_nm)
-        if nmcol is None:
-            return None
-        Nm = pd.to_numeric(df_ser_nm[nmcol], errors="coerce").dropna().to_numpy(dtype=np.float64)
-        Nm = np.unique(np.clip(Nm, 1.0, np.inf))
-        if Nm.size == 0:
-            return None
+        return None
 
-    if use_simulation_noise and cache_dir is not None:
-        return _compute_onsi_from_cache(Nm, cache_dir, gm_S, C_tot_F)
-    else:
-        return _compute_onsi_from_nm(
-            Nm, gm_S=gm_S, C_tot_F=C_tot_F, R_ch_ohm=R_ch, temperature_K=temperature_K, detection_B_Hz=detection_B_Hz
-        )
+    nmcol = _nm_col(df_ser_nm)
+    if nmcol is None:
+        return None
 
-def _plot_onsi(ax: Axes, onsi: Dict[str, np.ndarray], use_realistic: bool = False) -> None:
-    Nm = onsi["Nm"]; O = onsi["ONSI"]
-    ax.semilogx(Nm, O, marker="o", linewidth=2)
+    summary = (
+        df_ser_nm.groupby(nmcol, as_index=False)
+                .median(numeric_only=True)
+                .sort_values(by=nmcol)
+    )
+
+    Nm = pd.to_numeric(summary[nmcol], errors="coerce").to_numpy(dtype=np.float64)
+    mask = np.isfinite(Nm)
+    if not mask.any():
+        return None
+
+    summary = summary.loc[mask]
+    Nm = Nm[mask]
+
+    base_cfg = _load_base_config(results_dir)
+    qnsi_values: List[float] = []
+
+    for _, row in summary.iterrows():
+        nm_value = float(row[nmcol])
+        cfg = deepcopy(base_cfg) if base_cfg is not None else None
+        sigma_da_Q: Optional[float] = None
+        sigma_sero_Q: Optional[float] = None
+        rho_post = 0.0
+        delta_q_diff = math.nan
+
+        if cfg is not None:
+            pipeline_cfg = cfg.setdefault("pipeline", {})
+            pipeline_cfg["Nm_per_symbol"] = nm_value
+
+            Ts_candidate = row.get("symbol_period_s")
+            if pd.notna(Ts_candidate):
+                try:
+                    Ts_new = float(Ts_candidate)
+                    if Ts_new > 0.0:
+                        pipeline_cfg["symbol_period_s"] = Ts_new
+                        pipeline_cfg["time_window_s"] = max(float(pipeline_cfg.get("time_window_s", Ts_new)), Ts_new)
+                        sim_cfg = cfg.setdefault("sim", {})
+                        sim_cfg["time_window_s"] = max(float(sim_cfg.get("time_window_s", Ts_new)), Ts_new)
+                except (TypeError, ValueError):
+                    pass
+
+            Ts = float(cfg.get("pipeline", {}).get("symbol_period_s", 0.0))
+            sim_cfg = cfg.setdefault("sim", {})
+            dt = float(sim_cfg.get("dt_s", 0.01))
+            detection_window_s = _resolve_decision_window(cfg, Ts, dt)
+
+            measured_sigma_da = row.get("noise_sigma_da")
+            measured_sigma_sero = row.get("noise_sigma_sero")
+            if use_simulation_noise and pd.notna(measured_sigma_da) and pd.notna(measured_sigma_sero):
+                sigma_da_Q = float(measured_sigma_da)
+                sigma_sero_Q = float(measured_sigma_sero)
+            else:
+                calc_da, calc_sero = calculate_proper_noise_sigma(cfg, detection_window_s)
+                sigma_da_Q = float(calc_da)
+                sigma_sero_Q = float(calc_sero)
+
+            rho_post = _extract_rho_post(row, cfg)
+            sigma_q_diff = math.sqrt(max(
+                sigma_da_Q**2 + sigma_sero_Q**2 - 2.0 * rho_post * sigma_da_Q * sigma_sero_Q,
+                0.0
+            )) if (sigma_da_Q is not None and sigma_sero_Q is not None) else math.nan
+
+            delta_over_sigma = row.get("delta_over_sigma")
+            if pd.notna(delta_over_sigma) and math.isfinite(sigma_q_diff):
+                delta_q_diff = float(delta_over_sigma) * sigma_q_diff
+            else:
+                delta_I_diff = row.get("delta_I_diff")
+                gm_S = cfg.get("oect", {}).get("gm_S")
+                C_tot_F = cfg.get("oect", {}).get("C_tot_F")
+                if (pd.notna(delta_I_diff) and gm_S not in (None, 0.0) and
+                        C_tot_F not in (None, 0.0)):
+                    try:
+                        delta_q_diff = float(delta_I_diff) * (float(C_tot_F) / float(gm_S))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        delta_q_diff = math.nan
+
+        else:
+            delta_over_sigma = row.get("delta_over_sigma")
+            if pd.notna(delta_over_sigma):
+                qnsi_values.append(float(delta_over_sigma))
+                continue
+
+        if (sigma_da_Q is None or sigma_sero_Q is None or
+                not math.isfinite(delta_q_diff)):
+            qnsi_value = math.nan
+        else:
+            qnsi_value = float(compute_qnsi(delta_q_diff, sigma_da_Q, sigma_sero_Q, rho_post))
+        qnsi_values.append(qnsi_value)
+
+    qnsi_arr = np.asarray(qnsi_values, dtype=np.float64)
+    finite_mask = np.isfinite(qnsi_arr)
+    Nm_filtered = Nm[finite_mask] if finite_mask.any() else Nm
+    qnsi_filtered = qnsi_arr[finite_mask] if finite_mask.any() else qnsi_arr
+
+    return {"Nm": Nm_filtered.astype(np.float64), "QNSI": qnsi_filtered}
+
+
+def _plot_qnsi(ax: Axes, qnsi: Dict[str, np.ndarray], use_realistic: bool = False) -> None:
+    Nm = qnsi["Nm"]
+    Q = qnsi["QNSI"]
+    mask = np.isfinite(Nm) & np.isfinite(Q)
+    if not mask.any():
+        ax.set_title("(B) QNSI (charge-domain SNR)")
+        ax.text(0.5, 0.5, "QNSI data unavailable", ha="center", va="center", transform=ax.transAxes)
+        ax.axis("off")
+        return
+
+    Nm_clean = Nm[mask]
+    Q_clean = Q[mask]
+    ax.semilogx(Nm_clean, Q_clean, marker="o", linewidth=2)
     ax.set_xlabel("Number of Molecules per Symbol (Nm)")
-    ax.set_ylabel("ONSI (arb. unit)")
-    title_suffix = "(cached σ)" if use_realistic else "(thermal proxy)"
-    ax.set_title(f"(B) OECT‑Normalized Sensitivity Index {title_suffix}")
+    ax.set_ylabel("QNSI (charge-domain SNR)")
+    title_suffix = "(cached sigma)" if use_realistic else "(analytic noise model)"
+    ax.set_title(f"(B) QNSI (charge-domain SNR) {title_suffix}")
     ax.grid(True, which="both", ls="--", alpha=0.3)
 
 # ------------------------ Panel C: IRT (ISI throughput) ----------------------
@@ -644,8 +456,9 @@ def _plot_irt(ax: Axes, irt: Dict[str, np.ndarray]) -> None:
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Generate Hybrid Multi-Dimensional Benchmarks")
-    parser.add_argument("--realistic-onsi", action="store_true", 
-                        help="Use simulation-measured noise for ONSI (vs thermal proxy)")
+    parser.add_argument("--realistic-qnsi", dest="realistic_qnsi", action="store_true", 
+                        help="Use simulation-measured noise for QNSI (vs analytic model)")
+    parser.add_argument("--realistic-onsi", dest="realistic_qnsi", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--hds-csk-mode",
         choices=["additive", "conditional", "effective"],
@@ -658,7 +471,6 @@ def main() -> None:
 
     results_dir = project_root / "results"
     data_dir = results_dir / "data"
-    cache_dir = results_dir / "cache"  # NEW: add cache directory
     fig_dir = results_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -671,8 +483,7 @@ def main() -> None:
     # ---- Prepare panels ----
     comp = _prepare_hds(ser_nm)
     # NEW: Pass results_dir for device parameter consistency
-    onsi = _prepare_onsi(ser_nm, use_simulation_noise=args.realistic_onsi, 
-                         cache_dir=cache_dir, results_dir=results_dir)
+    qnsi = _prepare_qnsi(ser_nm, use_simulation_noise=args.realistic_qnsi, results_dir=results_dir)
     irt  = _prepare_irt_from_isi(isi_df)
 
     # ---- Build figure ----
@@ -789,13 +600,13 @@ def main() -> None:
                   ha="center", va="center", transform=axA2.transAxes)
         axA2.axis("off")
 
-    # (B) ONSI
+    # (B) QNSI
     axB = fig.add_subplot(2, 2, 3)  # type: Axes
-    if onsi is not None:
-        _plot_onsi(axB, onsi, use_realistic=args.realistic_onsi)
+    if qnsi is not None:
+        _plot_qnsi(axB, qnsi, use_realistic=args.realistic_qnsi)
     else:
-        axB.set_title("(B) OECT‑Normalized Sensitivity Index (proxy)")
-        axB.text(0.5, 0.5, "ONSI input missing", ha="center", va="center", transform=axB.transAxes)
+        axB.set_title("(B) QNSI (charge-domain SNR)")
+        axB.text(0.5, 0.5, "QNSI input missing", ha="center", va="center", transform=axB.transAxes)
         axB.axis("off")
 
     # (C) IRT - Enhanced with 2D grid if available
@@ -856,10 +667,12 @@ def main() -> None:
                     valid_levels = [l for l in levels if l <= max_val and l >= vmin]
                     
                     if valid_levels:
-                        X = np.linspace(pivot.columns.min(), pivot.columns.max(), pivot.shape[1])
-                        Y = np.linspace(pivot.index.min(), pivot.index.max(), pivot.shape[0])
-                        Xg, Yg = np.meshgrid(X, Y)
-                        cs = axC.contour(Xg, Yg, pivot.values, levels=valid_levels, 
+                        col_values = pd.to_numeric(pd.Series(pivot.columns, dtype='object'), errors='coerce').to_numpy(dtype=np.float64)
+                        row_values = pd.to_numeric(pd.Series(pivot.index, dtype='object'), errors='coerce').to_numpy(dtype=np.float64)
+                        if not (np.isfinite(col_values).all() and np.isfinite(row_values).all()):
+                            raise ValueError('Non-numeric ISI grid axes')
+                        Xg, Yg = np.meshgrid(col_values, row_values)
+                        cs = axC.contour(Xg, Yg, pivot.values.astype(float), levels=valid_levels, 
                                         colors='white', alpha=0.8, linewidths=1.5)
                         
                         # Enhanced contour labels
@@ -871,9 +684,11 @@ def main() -> None:
                     p_eff = df_grid.pivot_table(index='distance_um', columns='guard_factor',
                                                 values='csk_ser_eff', aggfunc='median')
                     if p_eff.size > 0 and np.isfinite(p_eff.values).any():
-                        X = np.linspace(float(p_eff.columns.min()), float(p_eff.columns.max()), p_eff.shape[1])
-                        Y = np.linspace(float(p_eff.index.min()), float(p_eff.index.max()), p_eff.shape[0])
-                        Xg, Yg = np.meshgrid(X, Y)
+                        col_eff = pd.to_numeric(pd.Series(p_eff.columns, dtype='object'), errors='coerce').to_numpy(dtype=np.float64)
+                        row_eff = pd.to_numeric(pd.Series(p_eff.index, dtype='object'), errors='coerce').to_numpy(dtype=np.float64)
+                        if not (np.isfinite(col_eff).all() and np.isfinite(row_eff).all()):
+                            raise ValueError('Non-numeric CSK grid axes')
+                        Xg, Yg = np.meshgrid(col_eff, row_eff)
                         Z = p_eff.values.astype(float)
                         # Pick levels relative to observed range
                         nz = Z[np.isfinite(Z)]
@@ -931,7 +746,7 @@ def main() -> None:
                      ha="center", va="center", transform=axC.transAxes)
             axC.axis("off")
 
-    fig.suptitle("Hybrid Multi‑Dimensional Benchmarks (HDS • ONSI • IRT)", fontsize=10, y=0.99)
+    fig.suptitle("Hybrid Multi-Dimensional Benchmarks (HDS | QNSI | IRT)", fontsize=10, y=0.99)
     fig.tight_layout()
     out_path = fig_dir / "fig_hybrid_multidim_benchmarks.png"
     fig.savefig(out_path, dpi=300)

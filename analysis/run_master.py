@@ -119,7 +119,7 @@ def _get_run_fingerprint(args: argparse.Namespace) -> str:
         args.parallel_modes,
         getattr(args, 'preset', None),
         getattr(args, 'nm_grid', ''),
-        getattr(args, 'distances', ''),
+        '|'.join(getattr(args, 'distances', []) or []),
         getattr(args, 'nt_pairs', ''),
         args.target_ci,
         args.min_ci_seeds,
@@ -256,7 +256,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--nm-grid", args.nm_grid])
     # Forward new optimization flags
     if args.distances:
-        cmd.extend(["--distances", args.distances])
+        for dist_spec in args.distances:
+            cmd.extend(["--distances", dist_spec])
     if args.lod_num_seeds is not None:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
@@ -380,7 +381,8 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--nm-grid", args.nm_grid])
     # Forward new optimization flags
     if args.distances:
-        cmd.extend(["--distances", args.distances])
+        for dist_spec in args.distances:
+            cmd.extend(["--distances", dist_spec])
     if args.lod_num_seeds is not None:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
@@ -495,7 +497,8 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
     if args.nm_grid:
         cmd.extend(["--nm-grid", args.nm_grid])
     if args.distances:
-        cmd.extend(["--distances", args.distances])
+        for dist_spec in args.distances:
+            cmd.extend(["--distances", dist_spec])
     if args.lod_num_seeds is not None:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
@@ -535,7 +538,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Master pipeline for tri-channel OECT paper")
     p.add_argument("--progress", choices=["gui", "rich", "tqdm", "none"], default="rich")
     p.add_argument("--resume", action="store_true", help="Resume completed steps")
-    p.add_argument("--preset", choices=["ieee", "verify"], help="Apply preset configurations (ieee: publication-grade, verify: fast sanity)")
+    p.add_argument("-preset", "--preset", choices=["ieee", "verify", "production"], help="Apply preset configurations (ieee: publication-grade, verify: fast sanity, production: long-run batch)")
     p.add_argument("--num-seeds", type=int, default=20)
     p.add_argument("--sequence-length", type=int, default=1000)
     p.add_argument("--recalibrate", action="store_true", help="Force recalibration (ignore JSON cache)")
@@ -600,8 +603,13 @@ def main() -> None:
                    help="Minimum seeds before CI stopping can trigger (pass-through)")
     p.add_argument("--lod-screen-delta", type=float, default=1e-4,
                    help="Hoeffding screening significance for LoD binary search (pass-through)")
-    p.add_argument("--distances", type=str, default="",
-                   help="Comma-separated distance grid in µm for LoD (pass-through)")
+    p.add_argument(
+        "--distances",
+        action="append",
+        default=None,
+        metavar="MODE=LIST",
+        help=("Comma-separated distance grid in um for LoD (pass-through). Example: --distances MoSK=25,35,45 --distances CSK=15,25"),
+    )
     p.add_argument("--lod-num-seeds", type=str, default=None,
                 help=("LoD seed schedule. N | min,max | rules like "
                         "'<=100:6,<=150:8,>150:10' (pass-through)"))
@@ -671,6 +679,11 @@ def main() -> None:
 
     args = p.parse_args()
 
+    if args.distances is None:
+        args.distances = []
+    else:
+        args.distances = [spec for spec in args.distances if spec]
+
     # Auto-enable sleep inhibition when GUI is requested
     if args.progress == "gui":
         args.inhibit_sleep = True
@@ -685,29 +698,13 @@ def main() -> None:
             except Exception:
                 pass
 
-        if args.preset == "verify":
-            # Fast sanity check: minimal computation for quick verification
-            _set_if_default("num_seeds", 4)
-            _set_if_default("sequence_length", 200)
-            _set_if_default("target_ci", 0.02)        # 95% CI half-width ≤ 2%
-            _set_if_default("min_ci_seeds", 4)
-            _set_if_default("lod_screen_delta", 1e-3) # more aggressive screening
-            _set_if_default("parallel_modes", 3)      # interleave MoSK/CSK/Hybrid
-            args.ablation = "on"                      # CTRL only (always override)
-            args.modes = "all"                        # Test all modes (always override)
-            
-            print("🔧 Verify preset applied: fast sanity check configuration")
-            print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
-            print(f"   • Target CI: {args.target_ci}, Parallel modes: {args.parallel_modes}")
-            print(f"   • CTRL only, All modes, Aggressive screening")
-
-        elif args.preset == "ieee":
+        def _apply_ieee_base(lock_modes: bool = True) -> None:
             # Publication-grade statistical parameters
             _set_if_default("num_seeds", 50)
             _set_if_default("sequence_length", 2000)
             _set_if_default("target_ci", 0.004)       # Updated: align with new default (0.4%)
             _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
-            
+
             # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
             _set_if_default("lod_num_seeds", "<=100:6,<=150:8,>150:10")  # distance-aware schedule
             _set_if_default("lod_seq_len", 250)     # Updated: align with new default (250 symbols/seed)
@@ -718,14 +715,19 @@ def main() -> None:
             _set_if_default("max_lod_validation_seeds", 12)    # Cap expensive validation retries
             _set_if_default("max_symbol_duration_s", 180.0)    # Skip when Ts > 3 minutes
             _set_if_default("min_ci_seeds", 8)    # Match run_final_analysis.py default
-            
+
             # Avoid infeasible tails: skip LoD when Ts is too large (no physics change)
-            if not hasattr(args, 'distances') or args.distances == "":
+            if not args.distances:
                 # keep long points optional; user can restore by passing --max-ts-for-lod=None
-                args.distances = "15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150"
-            
+                args.distances = [
+                    "MoSK=25,35,45,55,65,75,85,95,105,125,150,175,200",
+                    "CSK=15,25,35,45,55,65,75,85,95,105,115,125",
+                    "Hybrid=15,20,25,30,35,40,45,55,65",
+                ]
+
             # Force comprehensive coverage
-            args.modes = "all"
+            if lock_modes:
+                args.modes = "all"
             args.ablation = "both"
             args.supplementary = True
             _set_if_default("channel_suite", True)
@@ -733,11 +735,30 @@ def main() -> None:
             _set_if_default("validate_theory", True)
             _set_if_default("baseline_isi", "off")
             _set_if_default("studies", "sensitivity,capacity,isi-analytic")
-            
+
             # Optimize performance (but allow manual override)
             if args.max_workers is None and not args.extreme_mode and not args.beast_mode:
                 args.extreme_mode = True  # Use max P-core threads (changed from beast_mode)
-            
+
+        if args.preset == "verify":
+            # Fast sanity check: minimal computation for quick verification
+            _set_if_default("num_seeds", 4)
+            _set_if_default("sequence_length", 200)
+            _set_if_default("target_ci", 0.02)        # 95% CI half-width ≤ 2%
+            _set_if_default("min_ci_seeds", 4)
+            _set_if_default("lod_screen_delta", 1e-3) # more aggressive screening
+            _set_if_default("parallel_modes", 3)      # interleave MoSK/CSK/Hybrid
+            args.ablation = "on"                      # CTRL only (always override)
+            args.modes = "all"                        # Test all modes (always override)
+
+            print("🔧 Verify preset applied: fast sanity check configuration")
+            print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
+            print(f"   • Target CI: {args.target_ci}, Parallel modes: {args.parallel_modes}")
+            print(f"   • CTRL only, All modes, Aggressive screening")
+
+        elif args.preset == "ieee":
+            _apply_ieee_base(lock_modes=True)
+
             print("🏆 IEEE preset applied: publication-grade configuration")
             print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}")
             lod_seeds_display = getattr(args, 'lod_num_seeds', '8')
@@ -746,6 +767,30 @@ def main() -> None:
             print(f"   • LoD search: {lod_seeds_display} × {getattr(args, 'lod_seq_len', 250)} symbols")
             print(f"   • Target CI: {args.target_ci}, All modes, Both ablations")
             print(f"   • Supplementary: {args.supplementary}, Performance: {'extreme-mode' if args.extreme_mode else 'default'}")
+
+        elif args.preset == "production":
+            _apply_ieee_base(lock_modes=False)
+            _set_if_default("progress", "rich")
+            _set_if_default("allow_ts_exceed", True)
+            _set_if_default("lod_distance_timeout_s", 0.0)
+            _set_if_default("watchdog_secs", 0)
+            _set_if_default("ts_warn_only", True)
+            _set_if_default("lod_max_nm", 1000000)
+            _set_if_default("lod_seq_len", 600)
+            _set_if_default("lod_validate_seq_len", 1000)
+            _set_if_default("lod_distance_concurrency", 16)
+            _set_if_default("ser_refine", True)
+            if getattr(args, "max_symbol_duration_s", None) in (None, 180.0):
+                args.max_symbol_duration_s = 0.0
+
+            search_len = getattr(args, "lod_seq_len", 250)
+            validate_len = getattr(args, "lod_validate_seq_len", None)
+            validate_display = validate_len if validate_len is not None else "full"
+            print("🚀 Production preset applied: batch run configuration")
+            print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}, Progress: {args.progress}")
+            print(f"   • LoD search: {search_len} → validate {validate_display}, concurrency {args.lod_distance_concurrency}")
+            print(f"   • Timeouts: per-distance {args.lod_distance_timeout_s}s, watchdog {args.watchdog_secs}s, max Ts {args.max_symbol_duration_s}s")
+            print(f"   • Flags: allow-ts-exceed={args.allow_ts_exceed}, ts-warn-only={args.ts_warn_only}, ser-refine={args.ser_refine}")
 
     # Initialize master-level logging
     if not args.no_log:

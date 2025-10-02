@@ -153,11 +153,16 @@ def calculate_proper_noise_sigma(
     T = cfg.get('sim', {}).get('temperature_K', 310)
 
     oect_cfg = cfg.get('oect', {})
-    R_ch = oect_cfg.get('R_ch_Ohm', 100)
-    gm = oect_cfg.get('gm_S', 0.005)
-    V_g_bias = oect_cfg.get('V_g_bias_V', -0.02)
+    R_ch = float(oect_cfg.get('R_ch_Ohm', 100))
+    gm = float(oect_cfg.get('gm_S', 0.005))
+    C_tot = float(oect_cfg.get('C_tot_F', 5e-8))
+    V_g_bias = float(oect_cfg.get('V_g_bias_V', -0.2))
 
-    I_dc = gm * abs(V_g_bias)
+    I_dc_cfg = float(oect_cfg.get('I_dc_A', 0.0) or 0.0)
+    if not np.isfinite(I_dc_cfg) or I_dc_cfg <= 0:
+        I_dc = gm * abs(V_g_bias)
+    else:
+        I_dc = I_dc_cfg
     I_dc = max(I_dc, 1e-6)
 
     noise_cfg = cfg.get('noise', {})
@@ -229,6 +234,10 @@ def calculate_proper_noise_sigma(
             'use_ctrl_for_noise': float(1.0 if use_ctrl_for_noise else 0.0),
             'rho_used': float(effective_rho if use_ctrl_for_noise else 0.0),
             'detection_window_s': float(T_int),
+            'I_dc_used_A': float(I_dc),
+            'V_g_bias_used_V': float(V_g_bias),
+            'gm_S': float(gm),
+            'C_tot_F': float(C_tot),
         })
 
     return sigma, sigma
@@ -261,7 +270,7 @@ def _calculate_isi_vectorized(
     conc_at_ctrl_ch = np.zeros_like(t_vec)  # Always zero (no signal contamination)
     
     # Calculate all time offsets at once
-    k_indices = np.arange(n_history)
+    k_indices = np.arange(0, n_history, dtype=np.int32)
     time_offsets = (k_indices + 1) * Ts
     
     if mod == "MoSK":
@@ -347,7 +356,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
     dt = cfg['sim']['dt_s']
     Ts = cfg['pipeline']['symbol_period_s']
     n_samples = int(Ts / dt)
-    t_vec = np.arange(n_samples) * dt
+    t_vec = np.arange(0, n_samples, dtype=float) * dt
     
     # Initialize concentration at each channel location
     conc_at_da_ch = np.zeros(n_samples)
@@ -392,7 +401,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             mean_amp = float((M + 1) / (2 * M))
         else:  # zero-based
             if M > 1:
-                mean_amp = float(np.mean(np.arange(M) / (M - 1)))
+                mean_amp = float(np.mean(np.arange(0, M, dtype=float) / (M - 1)))
             else:
                 mean_amp = 0.5
         Nm_peak = cfg['pipeline']['Nm_per_symbol'] / mean_amp
@@ -947,6 +956,10 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         'noise_sigma_flicker': float(noise_components.get('flicker_sigma', float('nan'))),
         'noise_sigma_drift': float(noise_components.get('drift_sigma', float('nan'))),
         'noise_thermal_fraction': float(noise_components.get('thermal_fraction', float('nan'))),
+        'I_dc_used_A': float(noise_components.get('I_dc_used_A', float('nan'))),
+        'V_g_bias_V_used': float(noise_components.get('V_g_bias_used_V', float('nan'))),
+        'gm_S': float(noise_components.get('gm_S', float('nan'))),
+        'C_tot_F': float(noise_components.get('C_tot_F', float('nan'))),
     }
 
     # Add MoSK sigma metadata for Hybrid mode
