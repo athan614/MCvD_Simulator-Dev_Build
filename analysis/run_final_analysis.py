@@ -5367,10 +5367,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                             pm.update_total(key=overall_key, total=new_overall_total,
                                             label=f"Overall ({mode})", kind="overall")
             
-            remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
-            if remaining > 0: 
-                bar.update(remaining)
             if bar:
+                remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
+                if remaining > 0:
+                    bar.update(remaining)
                 bar.close()
 
         # Top up with next distance if available
