@@ -304,6 +304,10 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--ts-warn-only")
     if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
+    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != 3600:
+        cmd.extend(["--nonlod-watchdog-secs", str(args.nonlod_watchdog_secs)])
+    if hasattr(args, 'guard_max_ts') and args.guard_max_ts != 0.0:
+        cmd.extend(["--guard-max-ts", str(args.guard_max_ts)])
     if getattr(args, 'lod_max_nm', None) is not None:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
     if getattr(args, 'lod_distance_concurrency', None) is not None:
@@ -429,6 +433,10 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.append("--ts-warn-only")
     if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
+    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != 3600:
+        cmd.extend(["--nonlod-watchdog-secs", str(args.nonlod_watchdog_secs)])
+    if hasattr(args, 'guard_max_ts') and args.guard_max_ts != 0.0:
+        cmd.extend(["--guard-max-ts", str(args.guard_max_ts)])
     if getattr(args, 'lod_max_nm', None) is not None:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
     if getattr(args, 'lod_distance_concurrency', None) is not None:
@@ -630,7 +638,11 @@ def main() -> None:
     p.add_argument("--ts-warn-only", action="store_true",
                 help="Issue warnings for long Ts instead of skipping (overrides all Ts limits; pass-through)")
     p.add_argument("--watchdog-secs", type=int, default=1800,
-                help="Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through)")
+                   help="Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through)")
+    p.add_argument("--nonlod-watchdog-secs", type=int, default=3600,
+                   help="Timeout for non-LoD sweeps (pass-through).")
+    p.add_argument("--guard-max-ts", type=float, default=0.0,
+                   help="Cap guard-factor sweeps when symbol period exceeds this many seconds (0 disables; pass-through).")
     p.add_argument("--lod-max-nm", type=int, default=1000000,
                 help="Upper bound for Nm during LoD search (default: 1000000; pass-through)")
     # Optimization tuning (pass-through to run_final_analysis.py)
@@ -704,6 +716,7 @@ def main() -> None:
             _set_if_default("sequence_length", 2000)
             _set_if_default("target_ci", 0.004)       # Updated: align with new default (0.4%)
             _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
+            _set_if_default("nonlod_watchdog_secs", 3600)
 
             # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
             _set_if_default("lod_num_seeds", "<=100:6,<=150:8,>150:10")  # distance-aware schedule
@@ -774,6 +787,7 @@ def main() -> None:
             _set_if_default("allow_ts_exceed", True)
             _set_if_default("lod_distance_timeout_s", 0.0)
             _set_if_default("watchdog_secs", 0)
+            _set_if_default("nonlod_watchdog_secs", 3600)
             _set_if_default("ts_warn_only", True)
             _set_if_default("lod_max_nm", 1000000)
             _set_if_default("lod_seq_len", 600)
@@ -788,7 +802,7 @@ def main() -> None:
             print("🚀 Production preset applied: batch run configuration")
             print(f"   • Seeds: {args.num_seeds}, Sequences: {args.sequence_length}, Progress: {args.progress}")
             print(f"   • LoD search: {search_len} → validate {validate_display}, concurrency {args.lod_distance_concurrency}")
-            print(f"   • Timeouts: per-distance {args.lod_distance_timeout_s}s, watchdog {args.watchdog_secs}s, max Ts {args.max_symbol_duration_s}s")
+            print(f"   • Timeouts: per-distance {args.lod_distance_timeout_s}s, watchdog {args.watchdog_secs}s, non-LoD watchdog {args.nonlod_watchdog_secs}s, max Ts {args.max_symbol_duration_s}s")
             print(f"   • Flags: allow-ts-exceed={args.allow_ts_exceed}, ts-warn-only={args.ts_warn_only}, ser-refine={args.ser_refine}")
 
     # Initialize master-level logging
@@ -1125,6 +1139,8 @@ def main() -> None:
                                 'extreme_mode': getattr(args, 'extreme_mode', False),
                                 'resume': getattr(args, 'resume', False),
                                 'watchdog_secs': getattr(args, 'watchdog_secs', 1800),
+                                'nonlod_watchdog_secs': getattr(args, 'nonlod_watchdog_secs', 3600),
+                                'guard_max_ts': getattr(args, 'guard_max_ts', 0.0),
                                 'target_ci': getattr(args, 'target_ci', 0.004),
                                 'min_ci_seeds': getattr(args, 'min_ci_seeds', 8),
                                 'lod_screen_delta': getattr(args, 'lod_screen_delta', 1e-4),

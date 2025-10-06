@@ -63,7 +63,7 @@ MODE_NAME_ALIASES: Dict[str, str] = {
 DEFAULT_MODE_DISTANCES: Dict[str, List[int]] = {
     "MoSK": [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175, 200],
     "CSK": [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125],
-    "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65],
+    "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95],
 }
 
 def _canonical_mode_name(mode: str) -> str:
@@ -1671,7 +1671,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Force dual-channel CSK combiner on/off for this run."
     )
     parser.add_argument("--watchdog-secs", type=int, default=1800,
-                        help="Soft timeout for seed completion before retry hint (default: 1800s/30min)") 
+                        help="Soft timeout for seed completion before retry hint (default: 1800s/30min)")
+    parser.add_argument("--nonlod-watchdog-secs", type=int, default=3600,
+                        help="Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.); <=0 disables.")
+    parser.add_argument("--guard-max-ts", type=float, default=0.0,
+                        help="Cap guard-factor sweeps when symbol period exceeds this many seconds (0 disables).")
     parser.add_argument("--target-ci", type=float, default=0.004,
                         help="If >0, stop adding seeds once Wilson 95% CI half-width <= target. 0 disables.")
     parser.add_argument("--min-ci-seeds", type=int, default=8,
@@ -2287,482 +2291,490 @@ def run_sweep(cfg: Dict[str, Any],
 
     # Pre-calibrate thresholds once per sweep value (hoisted from per-seed)
     thresholds_map: Dict[Union[float, int], Dict[str, Union[float, List[float], str]]] = {}
+    cal_seeds: List[int] = []
     if cfg['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
        sweep_param in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
         cal_seeds = list(range(10))
+    job_bar: Optional[Any] = None
+    try:
         for v in values_to_run:
-            cfg_v = deepcopy(cfg)
-            if '.' in sweep_param:
-                keys = sweep_param.split('.')
-                tgt = cfg_v
-                for k in keys[:-1]:
-                    tgt = tgt[k]
-                tgt[keys[-1]] = v
-            else:
-                cfg_v[sweep_param] = v
-            # keep detection window consistent with the parameter being swept
-            if sweep_param == 'pipeline.distance_um':
-                Ts = calculate_dynamic_symbol_period(cast(float, v), cfg_v)
-                cfg_v['pipeline']['symbol_period_s'] = Ts
-                dt = float(cfg_v['sim']['dt_s'])
-                min_pts = int(cfg_v.get('_min_decision_points', 4))
-                min_win = _enforce_min_window(cfg_v, Ts)
-                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                cfg_v['detection']['decision_window_s'] = min_win
-            elif sweep_param == 'pipeline.guard_factor':
-                dist = float(cfg_v['pipeline']['distance_um'])
-                Ts = calculate_dynamic_symbol_period(dist, cfg_v)
-                cfg_v['pipeline']['symbol_period_s'] = Ts
-                dt = float(cfg_v['sim']['dt_s'])
-                min_pts = int(cfg_v.get('_min_decision_points', 4))
-                min_win = _enforce_min_window(cfg_v, Ts)
-                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                cfg_v['detection']['decision_window_s'] = min_win
-            elif sweep_param in ['oect.gm_S', 'oect.C_tot_F']:
-                Ts = float(cfg_v['pipeline'].get('symbol_period_s', calculate_dynamic_symbol_period(float(cfg_v['pipeline'].get('distance_um', 50.0)), cfg_v)))
-                min_win = _enforce_min_window(cfg_v, Ts)
-                cfg_v['pipeline']['symbol_period_s'] = Ts
-                cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                cfg_v.setdefault('detection', {})['decision_window_s'] = min_win
-            thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
-
-    # Determine how many seed-jobs remain (for progress accounting)
-    # --- NEW: resolve sweep folder early (for seed cache lookups) ---
-    if "Nm_per_symbol" in sweep_param:
-        sweep_folder = "ser_vs_nm"
-    elif "distance_um" in sweep_param:
-        sweep_folder = "lod_vs_distance"  # (only used for aggregated CSV; LoD search is handled elsewhere)
-    elif "guard_factor" in sweep_param:
-        sweep_folder = "isi_tradeoff"
-    else:
-        sweep_folder = "custom_sweep"
-
-    mode_name = cfg['pipeline']['modulation']
-    use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-
-    # --- NEW: compute "planned total" and "already done" for prefill ---
-    planned_total_jobs = len(sweep_values) * len(seeds)
-    done_jobs = 0
-
-    def _value_done_in_csv(val) -> bool:
-        if persist_csv is None or not persist_csv.exists():
-            return False
-        try:
-            df = pd.read_csv(persist_csv)
-            if sweep_param == 'pipeline.Nm_per_symbol':
-                csv_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df.columns else 'pipeline.Nm_per_symbol'
-            elif sweep_param == 'pipeline.guard_factor':
-                csv_key = 'guard_factor' if 'guard_factor' in df.columns else 'pipeline.guard_factor'
-            else:
-                csv_key = sweep_param
-            if csv_key not in df.columns:
-                return False
-            df2 = df
-            if 'use_ctrl' in df2.columns:
-                df2 = df2[df2['use_ctrl'] == use_ctrl]
-            vals = pd.to_numeric(df2[csv_key], errors='coerce').dropna().tolist()
-            return _value_key(val) in { _value_key(v) for v in vals }
-        except Exception:
-            return False
-
-    # Count completed seed-jobs across ALL sweep values
-    for v in sweep_values:
-        if _value_done_in_csv(v):
-            done_jobs += len(seeds)
-        else:
-            for s in seeds:
-                if read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None:
-                    done_jobs += 1
-
-    def _seed_done(v, s):
-        return read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None if resume else False
-
-    # Original "total_jobs" only counts remaining (we keep it for batching logic)
-    total_jobs_remaining = sum(1 for v in values_to_run for s in seeds if not _seed_done(v, s))
-
-    # --- Create/bind the bar with the FULL total, and prefill ---
-    display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({'CTRL' if use_ctrl else 'NoCtrl'})"
-    if sweep_key and pm:
-        # Update totals for the already-created keyed row
-        job_bar = pm.task(total=planned_total_jobs, description=display_name,
-                        key=sweep_key, parent=parent_key, kind="sweep")
-    else:
-        job_bar = local_pm.task(total=planned_total_jobs, description=display_name)
-
-    if done_jobs > 0:
-        # Jump the bar to reflect completed work
-        job_bar.update(done_jobs)
-
-    # Collect rows
-    aggregated_rows: List[Dict[str, Any]] = []
-
-    for v in values_to_run:
-        # FIX: Get effective CTRL state for this value
-        use_ctrl_for_v = bool(thresholds_map.get(v, {}).get('use_control_channel',
-                            cfg['pipeline'].get('use_control_channel', True)))
-        
-        # Split cached vs missing seeds
-        cached_results: List[Dict[str, Any]] = []
-        seeds_to_run: List[int] = []
-        if resume:
-            for s in seeds:
-                r = read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl_for_v, cache_tag)  # FIX: use effective
-                if r is not None:
-                    cached_results.append(r)
+                cfg_v = deepcopy(cfg)
+                if '.' in sweep_param:
+                    keys = sweep_param.split('.')
+                    tgt = cfg_v
+                    for k in keys[:-1]:
+                        tgt = tgt[k]
+                    tgt[keys[-1]] = v
                 else:
-                    seeds_to_run.append(s)
+                    cfg_v[sweep_param] = v
+                # keep detection window consistent with the parameter being swept
+                if sweep_param == 'pipeline.distance_um':
+                    Ts = calculate_dynamic_symbol_period(cast(float, v), cfg_v)
+                    cfg_v['pipeline']['symbol_period_s'] = Ts
+                    dt = float(cfg_v['sim']['dt_s'])
+                    min_pts = int(cfg_v.get('_min_decision_points', 4))
+                    min_win = _enforce_min_window(cfg_v, Ts)
+                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                    cfg_v['detection']['decision_window_s'] = min_win
+                elif sweep_param == 'pipeline.guard_factor':
+                    dist = float(cfg_v['pipeline']['distance_um'])
+                    Ts = calculate_dynamic_symbol_period(dist, cfg_v)
+                    cfg_v['pipeline']['symbol_period_s'] = Ts
+                    dt = float(cfg_v['sim']['dt_s'])
+                    min_pts = int(cfg_v.get('_min_decision_points', 4))
+                    min_win = _enforce_min_window(cfg_v, Ts)
+                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                    cfg_v['detection']['decision_window_s'] = min_win
+                elif sweep_param in ['oect.gm_S', 'oect.C_tot_F']:
+                    Ts = float(cfg_v['pipeline'].get('symbol_period_s', calculate_dynamic_symbol_period(float(cfg_v['pipeline'].get('distance_um', 50.0)), cfg_v)))
+                    min_win = _enforce_min_window(cfg_v, Ts)
+                    cfg_v['pipeline']['symbol_period_s'] = Ts
+                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
+                    cfg_v.setdefault('detection', {})['decision_window_s'] = min_win
+                thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
+    
+        # Determine how many seed-jobs remain (for progress accounting)
+        # --- NEW: resolve sweep folder early (for seed cache lookups) ---
+        if "Nm_per_symbol" in sweep_param:
+            sweep_folder = "ser_vs_nm"
+        elif "distance_um" in sweep_param:
+            sweep_folder = "lod_vs_distance"  # (only used for aggregated CSV; LoD search is handled elsewhere)
+        elif "guard_factor" in sweep_param:
+            sweep_folder = "isi_tradeoff"
         else:
-            seeds_to_run = list(seeds)
-
-        # Submit only missing seeds
-        thresholds_override = thresholds_map.get(v)
-        
-        # Account instantly for cached seeds in the bar
-        results: List[Dict[str, Any]] = list(cached_results)
-
-        # Stage 13: adaptive seed batches
-        target_ci = float(cfg.get("_stage13_target_ci", 0.0))
-        min_ci_seeds = int(cfg.get("_stage13_min_ci_seeds", 6))
-        seq_len = int(cfg['pipeline']['sequence_length'])
-        
-        # internal helper to compute current half-width
-        def _current_halfwidth() -> float:
-            n = len(results) * seq_len
-            k = sum(int(r.get('errors', 0)) for r in results)
-            return _wilson_halfwidth(k, n) if n > 0 else float('inf')
-        
-        # PRE-SUBMISSION CI CHECK: Skip launching futures if cached results already satisfy CI
-        if target_ci > 0.0 and len(results) >= min_ci_seeds and len(seeds_to_run) > 0:
-            if _current_halfwidth() <= target_ci:
-                print(f"        ✓ Pre-submission CI satisfied: halfwidth {_current_halfwidth():.6f} ≤ {target_ci}")
-                # Skip all future submissions for this value
-                seeds_to_run = []
-        
-        # batch size: keep pool busy but allow early-stop
-        max_workers = getattr(global_pool, "_max_workers", None) or os.cpu_count() or 4
-        batch_size = max(1, min(len(seeds_to_run), max_workers))
-        
-        idx = 0
-        pending: set = set()
-        # NEW: stable worker-slot mapping (use a real queue to avoid duplicate assignment)
-        from collections import deque
-        slot_count = max(1, getattr(global_pool, "_max_workers", CPU_COUNT or 4))
-        free_slots = deque(range(slot_count))
-        fut_slot: Dict[Any, int] = {}
-        fut_seed: Dict[Any, int] = {}  # NEW: Track which seed each future handles
-        
-        while (idx < len(seeds_to_run) or pending) and not CANCEL.is_set():
-            # top-up
-            while idx < len(seeds_to_run) and len(pending) < batch_size and not CANCEL.is_set():
-                s = seeds_to_run[idx]
-                fut = pool.submit(
-                    run_param_seed_combo, cfg, sweep_param, v, s, debug_calibration, thresholds_override,
-                    sweep_name=sweep_folder, cache_tag=cache_tag, recalibrate=recalibrate
-                )
-                pending.add(fut)
-                fut_seed[fut] = s  # NEW: Track which seed this future handles
-                
-                # Assign a stable slot
-                if pm:
-                    if not free_slots:
-                        # No idle UI slot available (more concurrency than slots); reuse slot 0 visually.
-                        slot = 0
-                    else:
-                        slot = free_slots.popleft()
-                    fut_slot[fut] = slot
-                    if hasattr(pm, "worker_update"):
-                        pm.worker_update(slot, f"{sweep_name} | {sweep_param}={v} | seed {s}")
-                idx += 1
-            # wait for one to finish
-            if pending and not CANCEL.is_set():  # Only process if we have pending futures
-                wd = int(cfg.get('_watchdog_secs', 600))  # NEW: Configurable timeout
-                try:
-                    done_fut = next(as_completed(pending, timeout=wd if (wd and wd > 0) else None))
-                    # capture seed before removing from map
-                    sid = fut_seed.pop(done_fut, -1)
-                    pending.remove(done_fut)
-                    try:
-                        res = done_fut.result(timeout=10)  # Quick result extraction
-                        if res is not None:
-                            # Ensure tag is present even if worker missed it
-                            try:
-                                res.setdefault("__seed", int(sid))
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        print(f"        ⚠️  Result extraction failed for {sweep_param}={v}: {e}")
-                        res = None
-                    if res is not None:
-                        results.append(res)
-                            
-                    # Update worker status to idle (stable slot)
-                    if pm:
-                        slot = fut_slot.pop(done_fut, -1)  # Use -1 as default instead of None
-                        if slot >= 0:  # Only update if we had a valid slot
-                            if hasattr(pm, "worker_update"):
-                                pm.worker_update(slot, "idle")
-                            free_slots.append(slot)
-                    
-                    job_bar.update(1)
-                except TimeoutError:
-                    print(f"        ⚠️  Timeout ({wd}s) for {sweep_param}={v}, {len(pending)} futures pending")
-                    # Pick a reproducible future to retry: the one with the smallest seed
-                    if pending:
-                        to_retry = min(pending, key=lambda f: fut_seed.get(f, 1<<31))
-                        seed_r = fut_seed.get(to_retry, seeds_to_run[0] if seeds_to_run else 12345)  # FIX: Provide default seed
-                        
-                        # Enhanced logging for timeout retry tracking
-                        print(f"        🔍 Timeout details: {sweep_param}={v}, seed={seed_r}, "
-                              f"timeout={wd}s, pending_count={len(pending)}, worker_count={getattr(global_pool, '_max_workers', 'unknown')}")
-                        
-                        # Try to cancel the old future if it hasn't started
-                        if to_retry.cancel():
-                            print(f"        ✅ Cancelled stale future for seed {seed_r}")
-                            pending.remove(to_retry)
-                            fut_seed.pop(to_retry, None)
-                        else:
-                            print(f"        ⚠️  Could not cancel running future for seed {seed_r}")
-                        
-                        print(f"        🔄 Retrying seed {seed_r} for {sweep_param}={v}")
-                        retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
-                        retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
-                                            debug_calibration, thresholds_override,
-                                            sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate)
-                        pending.add(retry_fut)
-                        fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
-                    continue  # NEW: Skip to next iteration after timeout handling
-
-                # adaptive early-stop when enough seeds and CI small enough
-                if target_ci > 0.0 and len(results) >= min_ci_seeds:
-                    if _current_halfwidth() <= target_ci:
-                        print(f"        ✓ Early stop: CI halfwidth {_current_halfwidth():.6f} ≤ {target_ci}")
-                        # Progress bar nicety: complete the bar when stopping early
-                        remaining_not_submitted = len(seeds_to_run) - idx
-                        still_pending = len(pending)
-                        remaining = remaining_not_submitted + still_pending
-                        if remaining > 0:
-                            job_bar.update(remaining)
-                        # Cancel remaining pending futures
-                        for fut in pending:
-                            fut.cancel()
-                        pending.clear()
-                        break
-                    
-        # If cancellation was requested, try to cancel any still-pending futures
-        if CANCEL.is_set():
-            global_pool.cancel_pending()  # Optional: immediate GUI feedback
-            for f in list(pending):
-                f.cancel()
-            break  # stop processing more values
-
-        if not results:
-            continue
-
-        # --- Aggregate across unique seeds (drop duplicate retries) ---
-        if any("__seed" in r for r in results):
-            by_seed: Dict[int, Dict[str, Any]] = {}
-            for r in results:
-                sid = int(r.get("__seed", -1))
-                if sid not in by_seed:
-                    by_seed[sid] = r
-                else:
-                    # Prefer the later write (e.g., retry) if you want; either is fine
-                    by_seed[sid] = r
-            results = list(by_seed.values())
-
-        # Aggregate across seeds for this value
-        total_symbols = len(results) * cfg['pipeline']['sequence_length']
-        total_errors = sum(cast(int, r['errors']) for r in results)
-        ser = total_errors / total_symbols if total_symbols > 0 else 1.0
-
-        # pooled decision stats for SNR proxy
-        all_a: List[float] = []
-        all_b: List[float] = []
-        for r in results:
-            all_a.extend(cast(List[float], r.get('stats_da', [])))
-            all_b.extend(cast(List[float], r.get('stats_sero', [])))
-        snr_lin = calculate_snr_from_stats(all_a, all_b) if all_a and all_b else 0.0
-        snr_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
-
-        # ISI context
-        isi_enabled = any(bool(r.get('isi_enabled', False)) for r in results)
-        isi_memory_symbols = int(np.nanmedian([float(r.get('isi_memory_symbols', np.nan)) for r in results if r is not None])) if isi_enabled else 0
-        symbol_period_s = float(np.nanmedian([float(r.get('symbol_period_s', np.nan)) for r in results]))
-        decision_window_s = float(np.nanmedian([float(r.get('decision_window_s', np.nan)) for r in results]))
-        isi_overlap_mean = float(np.nanmean([float(r.get('isi_overlap_ratio', 0.0)) for r in results]))
-
-        # Stage 14: aggregate noise sigmas across seeds
-        ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
-        ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
-        ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
-        ns_thermal = [float(r.get('noise_sigma_thermal', float('nan'))) for r in results]
-        ns_flicker = [float(r.get('noise_sigma_flicker', float('nan'))) for r in results]
-        ns_drift = [float(r.get('noise_sigma_drift', float('nan'))) for r in results]
-        thermal_fracs = [float(r.get('noise_thermal_fraction', float('nan'))) for r in results]
-        arr_da = np.asarray(ns_da, dtype=float)
-        arr_sero = np.asarray(ns_sero, dtype=float)
-        arr_diff = np.asarray(ns_diff, dtype=float)
-        arr_thermal = np.asarray(ns_thermal, dtype=float)
-        arr_flicker = np.asarray(ns_flicker, dtype=float)
-        arr_drift = np.asarray(ns_drift, dtype=float)
-        arr_thermal_frac = np.asarray(thermal_fracs, dtype=float)
-        med_sigma_da = float(np.nanmedian(arr_da)) if np.isfinite(arr_da).any() else float('nan')
-        med_sigma_sero = float(np.nanmedian(arr_sero)) if np.isfinite(arr_sero).any() else float('nan')
-        med_sigma_diff = float(np.nanmedian(arr_diff)) if np.isfinite(arr_diff).any() else float('nan')
-        med_sigma_thermal = float(np.nanmedian(arr_thermal)) if np.isfinite(arr_thermal).any() else float('nan')
-        med_sigma_flicker = float(np.nanmedian(arr_flicker)) if np.isfinite(arr_flicker).any() else float('nan')
-        med_sigma_drift = float(np.nanmedian(arr_drift)) if np.isfinite(arr_drift).any() else float('nan')
-        med_thermal_frac = float(np.nanmedian(arr_thermal_frac)) if np.isfinite(arr_thermal_frac).any() else float('nan')
-
-        delta_stat_values: List[float] = []
-        for r in results:
-            stats_da = np.asarray(r.get('stats_da', []), dtype=float)
-            stats_sero = np.asarray(r.get('stats_sero', []), dtype=float)
-            if stats_da.size == 0 or stats_sero.size == 0:
-                continue
-            mean_da = float(np.nanmean(stats_da))
-            mean_sero = float(np.nanmean(stats_sero))
-            if not (np.isfinite(mean_da) and np.isfinite(mean_sero)):
-                continue
-            delta_val = mean_da - mean_sero
-            if np.isfinite(delta_val):
-                delta_stat_values.append(delta_val)
-        med_delta_stat = float(np.nanmedian(np.asarray(delta_stat_values, dtype=float))) if delta_stat_values else float('nan')
-        delta_I_diff = float(med_delta_stat * med_sigma_diff) if (np.isfinite(med_delta_stat) and np.isfinite(med_sigma_diff)) else float('nan')
-
-        i_dc_vals = np.asarray([r.get('I_dc_used_A', float('nan')) for r in results], dtype=float)
-        v_g_vals = np.asarray([r.get('V_g_bias_V_used', float('nan')) for r in results], dtype=float)
-        gm_vals = np.asarray([r.get('gm_S', float('nan')) for r in results], dtype=float)
-        c_tot_vals = np.asarray([r.get('C_tot_F', float('nan')) for r in results], dtype=float)
-
-        def _finite_median(arr: np.ndarray) -> float:
-            finite = arr[np.isfinite(arr)]
-            return float(np.median(finite)) if finite.size else float('nan')
-
-        med_I_dc = _finite_median(i_dc_vals)
-        med_V_g_bias = _finite_median(v_g_vals)
-        med_gm = _finite_median(gm_vals)
-        med_c_tot = _finite_median(c_tot_vals)
-
+            sweep_folder = "custom_sweep"
+    
         mode_name = cfg['pipeline']['modulation']
-        snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
-                        if mode_name in ("MoSK", "Hybrid") else
-                        "CSK Q-statistic (dual-channel combiner)")
-
-        # Extract rho_cc_measured safely before creating the dictionary
-        rho_cc_raw = thresholds_map.get(v, {}).get('rho_cc_measured', float('nan'))
-        
-        current_distance = float(cfg['pipeline'].get('distance_um', float('nan')))
-        current_nm = float(cfg['pipeline'].get('Nm_per_symbol', float('nan')))
-        if sweep_param == 'pipeline.distance_um':
-            current_distance = float(v)
-        if sweep_param == 'pipeline.Nm_per_symbol':
-            current_nm = float(v)
-
-        row: Dict[str, Any] = {
-            sweep_param: v,
-            'ser': ser,
-            'snr_db': snr_db,
-            'snr_semantics': snr_semantics,
-            'num_runs': len(results),
-            'symbols_evaluated': int(total_symbols),
-            'sequence_length': int(cfg['pipeline']['sequence_length']),
-            'isi_enabled': isi_enabled,
-            'isi_memory_symbols': isi_memory_symbols,
-            'symbol_period_s': symbol_period_s,
-            'decision_window_s': decision_window_s,
-            'isi_overlap_ratio': isi_overlap_mean,
-            'noise_sigma_da': med_sigma_da,
-            'noise_sigma_sero': med_sigma_sero,
-            'noise_sigma_I_diff': med_sigma_diff,
-            'noise_sigma_thermal': med_sigma_thermal,
-            'noise_sigma_flicker': med_sigma_flicker,
-            'noise_sigma_drift': med_sigma_drift,
-            'noise_thermal_fraction': med_thermal_frac,
-            'I_dc_used_A': med_I_dc,
-            'V_g_bias_V_used': med_V_g_bias,
-            'gm_S': med_gm,
-            'C_tot_F': med_c_tot,
-            'delta_over_sigma': med_delta_stat,
-            'delta_I_diff': delta_I_diff,
-            'distance_um': current_distance,
-            'Nm_per_symbol': current_nm,
-            'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
-            'use_ctrl': bool(thresholds_map.get(v, {}).get('use_control_channel',
-                            cfg['pipeline'].get('use_control_channel', True))),
-            'ctrl_auto_applied': bool(thresholds_map.get(v, {}).get('ctrl_auto_applied', False)),
-            'rho_cc_measured': float(rho_cc_raw) if isinstance(rho_cc_raw, (int, float)) else float('nan'),
-            'mode': mode_name,
-        }
-        # Duplicate Nm column name for plotting compatibility
-        if sweep_param == 'pipeline.Nm_per_symbol':
-            row['pipeline_Nm_per_symbol'] = v
-        # Duplicate guard factor to a simple key for easier plotting
-        if sweep_param == 'pipeline.guard_factor':
-            row['guard_factor'] = float(v)
-
-        if cfg['pipeline']['modulation'] == 'Hybrid':
-            mosk_errors = sum(cast(int, r.get('subsymbol_errors', {}).get('mosk', 0)) for r in results)
-            csk_errors = sum(cast(int, r.get('subsymbol_errors', {}).get('csk', 0)) for r in results)
-            row['mosk_ser'] = mosk_errors / total_symbols
-            row['csk_ser'] = csk_errors / total_symbols
-
-            # Enhancement A: Add conditional CSK error for Hybrid mode
-            if mode_name == 'Hybrid':
-                total_hybrid_errors = mosk_errors + csk_errors
-                
-                # PATCH 2: Enhanced MoSK exposure tracking and conditional CSK aggregation
-                # Extract MoSK correct count from results for exposure analysis
-                mosk_correct_total = sum(cast(int, r.get('n_mosk_correct', 0)) for r in results)
-                
-                # FIX: Move the Option A changes HERE, inside the Hybrid block
-                row['conditional_csk_ser'] = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
-                row['mosk_exposure_frac'] = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
-                
-                # Track conditional CSK errors given MoSK exposure
-                row['mosk_correct_total'] = mosk_correct_total
-                row['csk_exposure_rate'] = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
-                row['conditional_csk_error_given_exposure'] = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
-                
-                # Compute hybrid error attribution percentages
-                if total_symbols > 0:
-                    row['mosk_error_pct'] = (mosk_errors / total_symbols) * 100.0
-                    row['csk_error_pct'] = (csk_errors / total_symbols) * 100.0
-                    row['hybrid_total_error_pct'] = ((mosk_errors + csk_errors) / total_symbols) * 100.0
-                bits_per_symbol_csk_branch = float(math.log2(max(cfg['pipeline'].get('csk_levels', 4), 2)))
-                if total_symbols > 0:
-                    bits_mosk_realized = (total_symbols - mosk_errors) / total_symbols
-                    bits_csk_realized = ((mosk_correct_total - csk_errors) / total_symbols) * bits_per_symbol_csk_branch
+        use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+    
+        # --- NEW: compute "planned total" and "already done" for prefill ---
+        planned_total_jobs = len(sweep_values) * len(seeds)
+        done_jobs = 0
+    
+        def _value_done_in_csv(val) -> bool:
+            if persist_csv is None or not persist_csv.exists():
+                return False
+            try:
+                df = pd.read_csv(persist_csv)
+                if sweep_param == 'pipeline.Nm_per_symbol':
+                    csv_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df.columns else 'pipeline.Nm_per_symbol'
+                elif sweep_param == 'pipeline.guard_factor':
+                    csv_key = 'guard_factor' if 'guard_factor' in df.columns else 'pipeline.guard_factor'
                 else:
-                    bits_mosk_realized = float('nan')
-                    bits_csk_realized = float('nan')
-                row['hybrid_bits_per_symbol_mosk'] = bits_mosk_realized
-                row['hybrid_bits_per_symbol_csk'] = bits_csk_realized
-                if math.isnan(bits_mosk_realized) or math.isnan(bits_csk_realized):
-                    row['hybrid_bits_per_symbol_total'] = float('nan')
-                else:
-                    row['hybrid_bits_per_symbol_total'] = bits_mosk_realized + bits_csk_realized
-
-                # Enhancement C: Optional assertion during sweeps
-                if total_symbols > 0:
-                    total_reported_errors = sum(cast(int, r['errors']) for r in results)
+                    csv_key = sweep_param
+                if csv_key not in df.columns:
+                    return False
+                df2 = df
+                if 'use_ctrl' in df2.columns:
+                    df2 = df2[df2['use_ctrl'] == use_ctrl]
+                vals = pd.to_numeric(df2[csv_key], errors='coerce').dropna().tolist()
+                return _value_key(val) in { _value_key(v) for v in vals }
+            except Exception:
+                return False
+    
+        # Count completed seed-jobs across ALL sweep values
+        for v in sweep_values:
+            if _value_done_in_csv(v):
+                done_jobs += len(seeds)
+            else:
+                for s in seeds:
+                    if read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None:
+                        done_jobs += 1
+    
+        def _seed_done(v, s):
+            return read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl, cache_tag) is not None if resume else False
+    
+        # Original "total_jobs" only counts remaining (we keep it for batching logic)
+        total_jobs_remaining = sum(1 for v in values_to_run for s in seeds if not _seed_done(v, s))
+    
+        # --- Create/bind the bar with the FULL total, and prefill ---
+        display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({'CTRL' if use_ctrl else 'NoCtrl'})"
+        if sweep_key and pm:
+            # Update totals for the already-created keyed row
+            job_bar = pm.task(total=planned_total_jobs, description=display_name,
+                            key=sweep_key, parent=parent_key, kind="sweep")
+        else:
+            job_bar = local_pm.task(total=planned_total_jobs, description=display_name)
+    
+        if done_jobs > 0:
+            # Jump the bar to reflect completed work
+            job_bar.update(done_jobs)
+    
+        # Collect rows
+        aggregated_rows: List[Dict[str, Any]] = []
+        is_lod_sweep = (sweep_param == 'pipeline.distance_um')
+        if is_lod_sweep:
+            timeout_s = int(cfg.get('_watchdog_secs', 600))
+        else:
+            timeout_s = int(cfg.get('_nonlod_watchdog_secs', cfg.get('_watchdog_secs', 600)))
+        timeout_wait = timeout_s if timeout_s and timeout_s > 0 else None
+    
+        for v in values_to_run:
+            # FIX: Get effective CTRL state for this value
+            use_ctrl_for_v = bool(thresholds_map.get(v, {}).get('use_control_channel',
+                                cfg['pipeline'].get('use_control_channel', True)))
+            
+            # Split cached vs missing seeds
+            cached_results: List[Dict[str, Any]] = []
+            seeds_to_run: List[int] = []
+            if resume:
+                for s in seeds:
+                    r = read_seed_cache(mode_name, sweep_folder, v, s, use_ctrl_for_v, cache_tag)  # FIX: use effective
+                    if r is not None:
+                        cached_results.append(r)
+                    else:
+                        seeds_to_run.append(s)
+            else:
+                seeds_to_run = list(seeds)
+    
+            # Submit only missing seeds
+            thresholds_override = thresholds_map.get(v)
+            
+            # Account instantly for cached seeds in the bar
+            results: List[Dict[str, Any]] = list(cached_results)
+    
+            # Stage 13: adaptive seed batches
+            target_ci = float(cfg.get("_stage13_target_ci", 0.0))
+            min_ci_seeds = int(cfg.get("_stage13_min_ci_seeds", 6))
+            seq_len = int(cfg['pipeline']['sequence_length'])
+            
+            # internal helper to compute current half-width
+            def _current_halfwidth() -> float:
+                n = len(results) * seq_len
+                k = sum(int(r.get('errors', 0)) for r in results)
+                return _wilson_halfwidth(k, n) if n > 0 else float('inf')
+            
+            # PRE-SUBMISSION CI CHECK: Skip launching futures if cached results already satisfy CI
+            if target_ci > 0.0 and len(results) >= min_ci_seeds and len(seeds_to_run) > 0:
+                if _current_halfwidth() <= target_ci:
+                    print(f"        ✓ Pre-submission CI satisfied: halfwidth {_current_halfwidth():.6f} ≤ {target_ci}")
+                    # Skip all future submissions for this value
+                    seeds_to_run = []
+            
+            # batch size: keep pool busy but allow early-stop
+            max_workers = getattr(global_pool, "_max_workers", None) or os.cpu_count() or 4
+            batch_size = max(1, min(len(seeds_to_run), max_workers))
+            
+            idx = 0
+            pending: set = set()
+            # NEW: stable worker-slot mapping (use a real queue to avoid duplicate assignment)
+            from collections import deque
+            slot_count = max(1, getattr(global_pool, "_max_workers", CPU_COUNT or 4))
+            free_slots = deque(range(slot_count))
+            fut_slot: Dict[Any, int] = {}
+            fut_seed: Dict[Any, int] = {}  # NEW: Track which seed each future handles
+            
+            while (idx < len(seeds_to_run) or pending) and not CANCEL.is_set():
+                # top-up
+                while idx < len(seeds_to_run) and len(pending) < batch_size and not CANCEL.is_set():
+                    s = seeds_to_run[idx]
+                    fut = pool.submit(
+                        run_param_seed_combo, cfg, sweep_param, v, s, debug_calibration, thresholds_override,
+                        sweep_name=sweep_folder, cache_tag=cache_tag, recalibrate=recalibrate
+                    )
+                    pending.add(fut)
+                    fut_seed[fut] = s  # NEW: Track which seed this future handles
                     
-                    # Relaxed assertion allowing for potential edge cases
-                    if total_hybrid_errors > total_reported_errors * 1.1:  # 10% tolerance
-                        print(f"Warning: Component errors ({total_hybrid_errors}) exceed total errors "
-                              f"({total_reported_errors}) by >10% at {sweep_param}={v}")
-
-        aggregated_rows.append(row)
-        
-        # Append this value's aggregated row immediately (crash‑safe)
-        if persist_csv is not None:
-            append_row_atomic(persist_csv, row, list(row.keys()))
-
-    job_bar.close()
-    if not pm:  # Only stop if we created our own local_pm
-        local_pm.stop()
-    # Don't stop pm if it was provided by caller
-
+                    # Assign a stable slot
+                    if pm:
+                        if not free_slots:
+                            # No idle UI slot available (more concurrency than slots); reuse slot 0 visually.
+                            slot = 0
+                        else:
+                            slot = free_slots.popleft()
+                        fut_slot[fut] = slot
+                        if hasattr(pm, "worker_update"):
+                            pm.worker_update(slot, f"{sweep_name} | {sweep_param}={v} | seed {s}")
+                    idx += 1
+                # wait for one to finish
+                if pending and not CANCEL.is_set():  # Only process if we have pending futures
+                    try:
+                        done_fut = next(as_completed(pending, timeout=timeout_wait))
+                        # capture seed before removing from map
+                        sid = fut_seed.pop(done_fut, -1)
+                        pending.remove(done_fut)
+                        try:
+                            res = done_fut.result(timeout=10)  # Quick result extraction
+                            if res is not None:
+                                # Ensure tag is present even if worker missed it
+                                try:
+                                    res.setdefault("__seed", int(sid))
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            print(f"        ??  Result extraction failed for {sweep_param}={v}: {e}")
+                            res = None
+                        if res is not None:
+                            results.append(res)
+                        # Update worker status to idle (stable slot)
+                        if pm:
+                            slot = fut_slot.pop(done_fut, -1)  # Use -1 as default instead of None
+                            if slot >= 0:  # Only update if we had a valid slot
+                                if hasattr(pm, "worker_update"):
+                                    pm.worker_update(slot, "idle")
+                                free_slots.append(slot)
+                        job_bar.update(1)
+                    except TimeoutError:
+                        timeout_desc = f"{timeout_s}s" if timeout_wait is not None else "inf"
+                        print(f"        ??  Timeout ({timeout_desc}) for {sweep_param}={v}, {len(pending)} futures pending")
+                        # Pick a reproducible future to retry: the one with the smallest seed
+                        if pending:
+                            to_retry = min(pending, key=lambda f: fut_seed.get(f, 1<<31))
+                            seed_r = fut_seed.get(to_retry, seeds_to_run[0] if seeds_to_run else 12345)  # FIX: Provide default seed
+                            # Enhanced logging for timeout retry tracking
+                            print(f"        ?? Timeout details: {sweep_param}={v}, seed={seed_r}, timeout={timeout_desc}, pending_count={len(pending)}, worker_count={getattr(global_pool, '_max_workers', 'unknown')}")
+                            # Try to cancel the old future if it hasn't started
+                            if to_retry.cancel():
+                                print(f"        ? Cancelled stale future for seed {seed_r}")
+                                pending.remove(to_retry)
+                                fut_seed.pop(to_retry, None)
+                            else:
+                                print(f"        ??  Could not cancel running future for seed {seed_r}")
+                            print(f"        ?? Retrying seed {seed_r} for {sweep_param}={v}")
+                            retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
+                            retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
+                                                    debug_calibration, thresholds_override,
+                                                    sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate)
+                            pending.add(retry_fut)
+                            fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
+                        continue  # NEW: Skip to next iteration after timeout handling
+                    # adaptive early-stop when enough seeds and CI small enough
+                    if target_ci > 0.0 and len(results) >= min_ci_seeds:
+                        if _current_halfwidth() <= target_ci:
+                            print(f"        ✓ Early stop: CI halfwidth {_current_halfwidth():.6f} ≤ {target_ci}")
+                            # Progress bar nicety: complete the bar when stopping early
+                            remaining_not_submitted = len(seeds_to_run) - idx
+                            still_pending = len(pending)
+                            remaining = remaining_not_submitted + still_pending
+                            if remaining > 0:
+                                job_bar.update(remaining)
+                            # Cancel remaining pending futures
+                            for fut in pending:
+                                fut.cancel()
+                            pending.clear()
+                            break
+                        
+            # If cancellation was requested, try to cancel any still-pending futures
+            if CANCEL.is_set():
+                global_pool.cancel_pending()  # Optional: immediate GUI feedback
+                for f in list(pending):
+                    f.cancel()
+                break  # stop processing more values
+    
+            if not results:
+                continue
+    
+            # --- Aggregate across unique seeds (drop duplicate retries) ---
+            if any("__seed" in r for r in results):
+                by_seed: Dict[int, Dict[str, Any]] = {}
+                for r in results:
+                    sid = int(r.get("__seed", -1))
+                    if sid not in by_seed:
+                        by_seed[sid] = r
+                    else:
+                        # Prefer the later write (e.g., retry) if you want; either is fine
+                        by_seed[sid] = r
+                results = list(by_seed.values())
+    
+            # Aggregate across seeds for this value
+            total_symbols = len(results) * cfg['pipeline']['sequence_length']
+            total_errors = sum(cast(int, r['errors']) for r in results)
+            ser = total_errors / total_symbols if total_symbols > 0 else 1.0
+    
+            # pooled decision stats for SNR proxy
+            all_a: List[float] = []
+            all_b: List[float] = []
+            for r in results:
+                all_a.extend(cast(List[float], r.get('stats_da', [])))
+                all_b.extend(cast(List[float], r.get('stats_sero', [])))
+            snr_lin = calculate_snr_from_stats(all_a, all_b) if all_a and all_b else 0.0
+            snr_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
+    
+            # ISI context
+            isi_enabled = any(bool(r.get('isi_enabled', False)) for r in results)
+            isi_memory_symbols = int(np.nanmedian([float(r.get('isi_memory_symbols', np.nan)) for r in results if r is not None])) if isi_enabled else 0
+            symbol_period_s = float(np.nanmedian([float(r.get('symbol_period_s', np.nan)) for r in results]))
+            decision_window_s = float(np.nanmedian([float(r.get('decision_window_s', np.nan)) for r in results]))
+            isi_overlap_mean = float(np.nanmean([float(r.get('isi_overlap_ratio', 0.0)) for r in results]))
+    
+            # Stage 14: aggregate noise sigmas across seeds
+            ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
+            ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
+            ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
+            ns_thermal = [float(r.get('noise_sigma_thermal', float('nan'))) for r in results]
+            ns_flicker = [float(r.get('noise_sigma_flicker', float('nan'))) for r in results]
+            ns_drift = [float(r.get('noise_sigma_drift', float('nan'))) for r in results]
+            thermal_fracs = [float(r.get('noise_thermal_fraction', float('nan'))) for r in results]
+            arr_da = np.asarray(ns_da, dtype=float)
+            arr_sero = np.asarray(ns_sero, dtype=float)
+            arr_diff = np.asarray(ns_diff, dtype=float)
+            arr_thermal = np.asarray(ns_thermal, dtype=float)
+            arr_flicker = np.asarray(ns_flicker, dtype=float)
+            arr_drift = np.asarray(ns_drift, dtype=float)
+            arr_thermal_frac = np.asarray(thermal_fracs, dtype=float)
+            med_sigma_da = float(np.nanmedian(arr_da)) if np.isfinite(arr_da).any() else float('nan')
+            med_sigma_sero = float(np.nanmedian(arr_sero)) if np.isfinite(arr_sero).any() else float('nan')
+            med_sigma_diff = float(np.nanmedian(arr_diff)) if np.isfinite(arr_diff).any() else float('nan')
+            med_sigma_thermal = float(np.nanmedian(arr_thermal)) if np.isfinite(arr_thermal).any() else float('nan')
+            med_sigma_flicker = float(np.nanmedian(arr_flicker)) if np.isfinite(arr_flicker).any() else float('nan')
+            med_sigma_drift = float(np.nanmedian(arr_drift)) if np.isfinite(arr_drift).any() else float('nan')
+            med_thermal_frac = float(np.nanmedian(arr_thermal_frac)) if np.isfinite(arr_thermal_frac).any() else float('nan')
+    
+            delta_stat_values: List[float] = []
+            for r in results:
+                stats_da = np.asarray(r.get('stats_da', []), dtype=float)
+                stats_sero = np.asarray(r.get('stats_sero', []), dtype=float)
+                if stats_da.size == 0 or stats_sero.size == 0:
+                    continue
+                mean_da = float(np.nanmean(stats_da))
+                mean_sero = float(np.nanmean(stats_sero))
+                if not (np.isfinite(mean_da) and np.isfinite(mean_sero)):
+                    continue
+                delta_val = mean_da - mean_sero
+                if np.isfinite(delta_val):
+                    delta_stat_values.append(delta_val)
+            med_delta_stat = float(np.nanmedian(np.asarray(delta_stat_values, dtype=float))) if delta_stat_values else float('nan')
+            delta_I_diff = float(med_delta_stat * med_sigma_diff) if (np.isfinite(med_delta_stat) and np.isfinite(med_sigma_diff)) else float('nan')
+    
+            i_dc_vals = np.asarray([r.get('I_dc_used_A', float('nan')) for r in results], dtype=float)
+            v_g_vals = np.asarray([r.get('V_g_bias_V_used', float('nan')) for r in results], dtype=float)
+            gm_vals = np.asarray([r.get('gm_S', float('nan')) for r in results], dtype=float)
+            c_tot_vals = np.asarray([r.get('C_tot_F', float('nan')) for r in results], dtype=float)
+    
+            def _finite_median(arr: np.ndarray) -> float:
+                finite = arr[np.isfinite(arr)]
+                return float(np.median(finite)) if finite.size else float('nan')
+    
+            med_I_dc = _finite_median(i_dc_vals)
+            med_V_g_bias = _finite_median(v_g_vals)
+            med_gm = _finite_median(gm_vals)
+            med_c_tot = _finite_median(c_tot_vals)
+    
+            mode_name = cfg['pipeline']['modulation']
+            snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
+                            if mode_name in ("MoSK", "Hybrid") else
+                            "CSK Q-statistic (dual-channel combiner)")
+    
+            # Extract rho_cc_measured safely before creating the dictionary
+            rho_cc_raw = thresholds_map.get(v, {}).get('rho_cc_measured', float('nan'))
+            
+            current_distance = float(cfg['pipeline'].get('distance_um', float('nan')))
+            current_nm = float(cfg['pipeline'].get('Nm_per_symbol', float('nan')))
+            if sweep_param == 'pipeline.distance_um':
+                current_distance = float(v)
+            if sweep_param == 'pipeline.Nm_per_symbol':
+                current_nm = float(v)
+    
+            row: Dict[str, Any] = {
+                sweep_param: v,
+                'ser': ser,
+                'snr_db': snr_db,
+                'snr_semantics': snr_semantics,
+                'num_runs': len(results),
+                'symbols_evaluated': int(total_symbols),
+                'sequence_length': int(cfg['pipeline']['sequence_length']),
+                'isi_enabled': isi_enabled,
+                'isi_memory_symbols': isi_memory_symbols,
+                'symbol_period_s': symbol_period_s,
+                'decision_window_s': decision_window_s,
+                'isi_overlap_ratio': isi_overlap_mean,
+                'noise_sigma_da': med_sigma_da,
+                'noise_sigma_sero': med_sigma_sero,
+                'noise_sigma_I_diff': med_sigma_diff,
+                'noise_sigma_thermal': med_sigma_thermal,
+                'noise_sigma_flicker': med_sigma_flicker,
+                'noise_sigma_drift': med_sigma_drift,
+                'noise_thermal_fraction': med_thermal_frac,
+                'I_dc_used_A': med_I_dc,
+                'V_g_bias_V_used': med_V_g_bias,
+                'gm_S': med_gm,
+                'C_tot_F': med_c_tot,
+                'delta_over_sigma': med_delta_stat,
+                'delta_I_diff': delta_I_diff,
+                'distance_um': current_distance,
+                'Nm_per_symbol': current_nm,
+                'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
+                'use_ctrl': bool(thresholds_map.get(v, {}).get('use_control_channel',
+                                cfg['pipeline'].get('use_control_channel', True))),
+                'ctrl_auto_applied': bool(thresholds_map.get(v, {}).get('ctrl_auto_applied', False)),
+                'rho_cc_measured': float(rho_cc_raw) if isinstance(rho_cc_raw, (int, float)) else float('nan'),
+                'mode': mode_name,
+            }
+            # Duplicate Nm column name for plotting compatibility
+            if sweep_param == 'pipeline.Nm_per_symbol':
+                row['pipeline_Nm_per_symbol'] = v
+            # Duplicate guard factor to a simple key for easier plotting
+            if sweep_param == 'pipeline.guard_factor':
+                row['guard_factor'] = float(v)
+    
+            if cfg['pipeline']['modulation'] == 'Hybrid':
+                mosk_errors = sum(cast(int, r.get('subsymbol_errors', {}).get('mosk', 0)) for r in results)
+                csk_errors = sum(cast(int, r.get('subsymbol_errors', {}).get('csk', 0)) for r in results)
+                row['mosk_ser'] = mosk_errors / total_symbols
+                row['csk_ser'] = csk_errors / total_symbols
+    
+                # Enhancement A: Add conditional CSK error for Hybrid mode
+                if mode_name == 'Hybrid':
+                    total_hybrid_errors = mosk_errors + csk_errors
+                    
+                    # PATCH 2: Enhanced MoSK exposure tracking and conditional CSK aggregation
+                    # Extract MoSK correct count from results for exposure analysis
+                    mosk_correct_total = sum(cast(int, r.get('n_mosk_correct', 0)) for r in results)
+                    
+                    # FIX: Move the Option A changes HERE, inside the Hybrid block
+                    row['conditional_csk_ser'] = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
+                    row['mosk_exposure_frac'] = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
+                    
+                    # Track conditional CSK errors given MoSK exposure
+                    row['mosk_correct_total'] = mosk_correct_total
+                    row['csk_exposure_rate'] = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
+                    row['conditional_csk_error_given_exposure'] = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
+                    
+                    # Compute hybrid error attribution percentages
+                    if total_symbols > 0:
+                        row['mosk_error_pct'] = (mosk_errors / total_symbols) * 100.0
+                        row['csk_error_pct'] = (csk_errors / total_symbols) * 100.0
+                        row['hybrid_total_error_pct'] = ((mosk_errors + csk_errors) / total_symbols) * 100.0
+                    bits_per_symbol_csk_branch = float(math.log2(max(cfg['pipeline'].get('csk_levels', 4), 2)))
+                    if total_symbols > 0:
+                        bits_mosk_realized = (total_symbols - mosk_errors) / total_symbols
+                        bits_csk_realized = ((mosk_correct_total - csk_errors) / total_symbols) * bits_per_symbol_csk_branch
+                    else:
+                        bits_mosk_realized = float('nan')
+                        bits_csk_realized = float('nan')
+                    row['hybrid_bits_per_symbol_mosk'] = bits_mosk_realized
+                    row['hybrid_bits_per_symbol_csk'] = bits_csk_realized
+                    if math.isnan(bits_mosk_realized) or math.isnan(bits_csk_realized):
+                        row['hybrid_bits_per_symbol_total'] = float('nan')
+                    else:
+                        row['hybrid_bits_per_symbol_total'] = bits_mosk_realized + bits_csk_realized
+    
+                    # Enhancement C: Optional assertion during sweeps
+                    if total_symbols > 0:
+                        total_reported_errors = sum(cast(int, r['errors']) for r in results)
+                        
+                        # Relaxed assertion allowing for potential edge cases
+                        if total_hybrid_errors > total_reported_errors * 1.1:  # 10% tolerance
+                            print(f"Warning: Component errors ({total_hybrid_errors}) exceed total errors "
+                                  f"({total_reported_errors}) by >10% at {sweep_param}={v}")
+    
+            aggregated_rows.append(row)
+            
+            # Append this value's aggregated row immediately (crash‑safe)
+            if persist_csv is not None:
+                append_row_atomic(persist_csv, row, list(row.keys()))
+    
+    finally:
+        if job_bar is not None:
+            try:
+                job_bar.close()
+            except Exception:
+                pass
+        if not pm:
+            try:
+                local_pm.stop()
+            except Exception:
+                pass
     return pd.DataFrame(aggregated_rows)
 
 # ============= LOD SEARCH =============
@@ -4313,10 +4325,22 @@ def _run_guard_frontier(
         distance_candidates = [float(cfg_base['pipeline'].get('distance_um', 50.0))]
 
     guard_values_sorted = [round(float(g), 4) for g in guard_values]
+    guard_max_ts = float(cfg_base.get('_guard_max_ts', 0.0))
     guard_seed_count = min(len(seeds), 6) if len(seeds) > 0 else 0
     if guard_seed_count == 0:
         return
     guard_seeds = seeds[:guard_seed_count]
+    distance_task = None
+    if pm:
+        try:
+            pm.set_status(mode=mode, sweep='Guard Frontier')
+        except Exception:
+            pass
+        try:
+            distance_task = pm.task(total=len(distance_candidates), description=f'{mode} Guard frontier',
+                                      parent=mode_key if mode_key is not None else None, kind='stage')
+        except Exception:
+            distance_task = None
 
     def _nm_for_distance(distance: float) -> float:
         if df_lod_ref.empty or 'lod_nm' not in df_lod_ref.columns:
@@ -4342,120 +4366,166 @@ def _run_guard_frontier(
     distances_recomputed: set = set()
     distances_considered: set = set()
 
-    for dist in distance_candidates:
-        dist_float = float(dist)
-        nm_target = _nm_for_distance(dist_float)
-
-        existing_for_dist = existing_tradeoff.copy()
-        if not existing_for_dist.empty:
-            existing_for_dist['distance_um'] = pd.to_numeric(existing_for_dist['distance_um'], errors='coerce')
-            existing_for_dist = existing_for_dist.dropna(subset=['distance_um'])
-            existing_for_dist = existing_for_dist[np.isclose(existing_for_dist['distance_um'], dist_float, atol=1e-6)]
-            if 'use_ctrl' in existing_for_dist.columns:
-                existing_for_dist = existing_for_dist[existing_for_dist['use_ctrl'] == desired_ctrl]
-        else:
-            existing_for_dist = pd.DataFrame()
-
-        if not resume_flag:
-            run_values = guard_values_sorted
-            distances_recomputed.add(dist_float)
-        else:
-            done_values = {
-                round(float(v), 4)
-                for v in pd.to_numeric(
-                    existing_for_dist.get('guard_factor', existing_for_dist.get('pipeline.guard_factor', pd.Series(dtype=float))),
-                    errors='coerce',
-                ).dropna()
-            }
-            run_values = [g for g in guard_values_sorted if round(g, 4) not in done_values]
-            if run_values:
+    try:
+        for dist in distance_candidates:
+            dist_float = float(dist)
+            nm_target = _nm_for_distance(dist_float)
+    
+            existing_for_dist = existing_tradeoff.copy()
+            if not existing_for_dist.empty:
+                existing_for_dist['distance_um'] = pd.to_numeric(existing_for_dist['distance_um'], errors='coerce')
+                existing_for_dist = existing_for_dist.dropna(subset=['distance_um'])
+                existing_for_dist = existing_for_dist[np.isclose(existing_for_dist['distance_um'], dist_float, atol=1e-6)]
+                if 'use_ctrl' in existing_for_dist.columns:
+                    existing_for_dist = existing_for_dist[existing_for_dist['use_ctrl'] == desired_ctrl]
+            else:
+                existing_for_dist = pd.DataFrame()
+    
+            if not resume_flag:
+                run_values = guard_values_sorted
                 distances_recomputed.add(dist_float)
-
-        df_guard_new = pd.DataFrame()
-        if run_values:
-            cfg_dist = deepcopy(cfg_base)
-            cfg_dist['pipeline']['distance_um'] = dist_float
-            cfg_dist['pipeline']['Nm_per_symbol'] = nm_target
-            cfg_dist['pipeline']['enable_isi'] = True
-            Ts_ref = calculate_dynamic_symbol_period(dist_float, cfg_dist)
-            min_win = _enforce_min_window(cfg_dist, Ts_ref)
-            cfg_dist['pipeline']['symbol_period_s'] = Ts_ref
-            cfg_dist['pipeline']['time_window_s'] = max(cfg_dist['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_dist.setdefault('detection', {})['decision_window_s'] = min_win
-
-            df_guard_new = run_sweep(
-                cfg_dist,
-                guard_seeds,
-                'pipeline.guard_factor',
-                run_values,
-                f"Guard sweep ({mode}, d={dist_float:.0f} um)",
-                progress_mode=args.progress,
-                persist_csv=None,
-                resume=False,
-                debug_calibration=args.debug_calibration,
-                cache_tag=f"guard_frontier_{mode_lower}_{int(round(dist_float))}",
-                pm=pm,
-                sweep_key=("sweep", mode, f"GuardFrontier_d{int(round(dist_float))}") if (pm and mode_key is not None) else None,
-                parent_key=mode_key if (pm and mode_key is not None) else None,
-                recalibrate=args.recalibrate,
-            )
+            else:
+                done_values = {
+                    round(float(v), 4)
+                    for v in pd.to_numeric(
+                        existing_for_dist.get('guard_factor', existing_for_dist.get('pipeline.guard_factor', pd.Series(dtype=float))),
+                        errors='coerce',
+                    ).dropna()
+                }
+                run_values = [g for g in guard_values_sorted if round(g, 4) not in done_values]
+                if run_values:
+                    distances_recomputed.add(dist_float)
+    
+            df_guard_new = pd.DataFrame()
+            guard_analysis: List[Tuple[float, float]] = []
+            for g in run_values:
+                cfg_probe = deepcopy(cfg_base)
+                cfg_probe['pipeline']['distance_um'] = dist_float
+                cfg_probe['pipeline']['guard_factor'] = g
+                ts_est = calculate_dynamic_symbol_period(dist_float, cfg_probe)
+                guard_analysis.append((g, ts_est))
+            if guard_max_ts > 0.0:
+                skipped_values = [(g, ts) for g, ts in guard_analysis if ts > guard_max_ts]
+                if skipped_values:
+                    preview = ', '.join(f'g={g:.1f}(Ts={ts:.1f}s)' for g, ts in skipped_values[:5])
+                    more = '...' if len(skipped_values) > 5 else ''
+                    print(f'??  Guard frontier: skipping guard factors {preview}{more} at {dist_float:.0f}um (Ts limit {guard_max_ts:.1f}s).')
+                run_values = [g for g, ts in guard_analysis if ts <= guard_max_ts]
+            else:
+                warn_values = [(g, ts) for g, ts in guard_analysis if ts > 900.0]
+                if warn_values:
+                    warn_g, warn_ts = warn_values[0]
+                    print(f'??  Guard frontier: guard {warn_g:.1f} at {dist_float:.0f}um yields Ts={warn_ts:.1f}s; consider --guard-max-ts to cap runtime.')
+                run_values = [g for g, _ in guard_analysis]
+            if not run_values:
+                if guard_max_ts > 0.0:
+                    print(f'??  Guard frontier: all guard factors skipped at {dist_float:.0f}um (Ts limit {guard_max_ts:.1f}s).')
+                if distance_task:
+                    try:
+                        distance_task.update(1, description=f'{mode} d={dist_float:.0f}um (skipped)')
+                    except Exception:
+                        pass
+                continue
+            if run_values:
+                cfg_dist = deepcopy(cfg_base)
+                cfg_dist['pipeline']['distance_um'] = dist_float
+                cfg_dist['pipeline']['Nm_per_symbol'] = nm_target
+                cfg_dist['pipeline']['enable_isi'] = True
+                Ts_ref = calculate_dynamic_symbol_period(dist_float, cfg_dist)
+                min_win = _enforce_min_window(cfg_dist, Ts_ref)
+                cfg_dist['pipeline']['symbol_period_s'] = Ts_ref
+                cfg_dist['pipeline']['time_window_s'] = max(cfg_dist['pipeline'].get('time_window_s', 0.0), min_win)
+                cfg_dist.setdefault('detection', {})['decision_window_s'] = min_win
+    
+                df_guard_new = run_sweep(
+                    cfg_dist,
+                    guard_seeds,
+                    'pipeline.guard_factor',
+                    run_values,
+                    f"Guard sweep ({mode}, d={dist_float:.0f} um)",
+                    progress_mode=args.progress,
+                    persist_csv=tradeoff_csv,
+                    resume=resume_flag,
+                    debug_calibration=args.debug_calibration,
+                    cache_tag=f"guard_frontier_{mode_lower}_{int(round(dist_float))}",
+                    pm=pm,
+                    sweep_key=("sweep", mode, f"GuardFrontier_d{int(round(dist_float))}") if (pm and mode_key is not None) else None,
+                    parent_key=mode_key if (pm and mode_key is not None) else None,
+                    recalibrate=args.recalibrate,
+                )
+                if not df_guard_new.empty:
+                    df_guard_new = df_guard_new.copy()
+                    df_guard_new['distance_um'] = dist_float
+                    frames_tradeoff.append(df_guard_new)
+    
+            combined_parts: List[pd.DataFrame] = []
+            if not existing_for_dist.empty:
+                if 'distance_um' not in existing_for_dist.columns:
+                    existing_for_dist['distance_um'] = dist_float
+                combined_parts.append(existing_for_dist)
             if not df_guard_new.empty:
-                df_guard_new = df_guard_new.copy()
-                df_guard_new['distance_um'] = dist_float
-                frames_tradeoff.append(df_guard_new)
-
-        combined_parts: List[pd.DataFrame] = []
-        if not existing_for_dist.empty:
-            if 'distance_um' not in existing_for_dist.columns:
-                existing_for_dist['distance_um'] = dist_float
-            combined_parts.append(existing_for_dist)
-        if not df_guard_new.empty:
-            combined_parts.append(df_guard_new)
-        if not combined_parts:
-            continue
-
-        df_guard_combined = pd.concat(combined_parts, ignore_index=True)
-        if 'distance_um' not in df_guard_combined.columns:
-            df_guard_combined['distance_um'] = dist_float
-
-        guard_col = 'guard_factor' if 'guard_factor' in df_guard_combined.columns else 'pipeline.guard_factor'
-        df_guard_combined[guard_col] = pd.to_numeric(df_guard_combined[guard_col], errors='coerce')
-        df_guard_combined['symbol_period_s'] = pd.to_numeric(df_guard_combined['symbol_period_s'], errors='coerce')
-        df_guard_combined['ser'] = pd.to_numeric(df_guard_combined['ser'], errors='coerce')
-        df_guard_combined = df_guard_combined.dropna(subset=[guard_col, 'symbol_period_s', 'ser'])
-        if df_guard_combined.empty:
-            continue
-
-        df_guard_combined['IRT'] = (
-            bits_per_symbol / df_guard_combined['symbol_period_s']
-        ) * (1.0 - df_guard_combined['ser'])
-
-        best_idx = int(df_guard_combined['IRT'].idxmax())
-
-        guard_val_raw = df_guard_combined.at[best_idx, guard_col]
-        guard_val = _coerce_float(guard_val_raw)
-        irt_val = _coerce_float(df_guard_combined.at[best_idx, 'IRT'])
-        ser_val = _coerce_float(df_guard_combined.at[best_idx, 'ser'])
-        symbol_period_val = _coerce_float(df_guard_combined.at[best_idx, 'symbol_period_s'])
-        if 'Nm_per_symbol' in df_guard_combined.columns:
-            nm_val_raw = df_guard_combined.at[best_idx, 'Nm_per_symbol']
-            nm_val = _coerce_float(nm_val_raw, float(nm_target))
-        else:
-            nm_val = float(nm_target)
-
-        distances_considered.add(dist_float)
-        frontier_rows.append({
-            'distance_um': dist_float,
-            'best_guard_factor': guard_val,
-            'max_irt_bps': irt_val,
-            'ser_at_best_guard': ser_val,
-            'symbol_period_s': symbol_period_val,
-            'Nm_per_symbol': nm_val,
-            'use_ctrl': desired_ctrl,
-            'mode': mode,
-            'bits_per_symbol': bits_per_symbol,
-        })
-
+                combined_parts.append(df_guard_new)
+            if not combined_parts:
+                if distance_task:
+                    try:
+                        distance_task.update(1, description=f'{mode} d={dist_float:.0f}um (no data)')
+                    except Exception:
+                        pass
+                continue
+    
+            df_guard_combined = pd.concat(combined_parts, ignore_index=True)
+            if 'distance_um' not in df_guard_combined.columns:
+                df_guard_combined['distance_um'] = dist_float
+    
+            guard_col = 'guard_factor' if 'guard_factor' in df_guard_combined.columns else 'pipeline.guard_factor'
+            df_guard_combined[guard_col] = pd.to_numeric(df_guard_combined[guard_col], errors='coerce')
+            df_guard_combined['symbol_period_s'] = pd.to_numeric(df_guard_combined['symbol_period_s'], errors='coerce')
+            df_guard_combined['ser'] = pd.to_numeric(df_guard_combined['ser'], errors='coerce')
+            df_guard_combined = df_guard_combined.dropna(subset=[guard_col, 'symbol_period_s', 'ser'])
+            if df_guard_combined.empty:
+                continue
+    
+            df_guard_combined['IRT'] = (
+                bits_per_symbol / df_guard_combined['symbol_period_s']
+            ) * (1.0 - df_guard_combined['ser'])
+    
+            best_idx = int(df_guard_combined['IRT'].idxmax())
+    
+            guard_val_raw = df_guard_combined.at[best_idx, guard_col]
+            guard_val = _coerce_float(guard_val_raw)
+            irt_val = _coerce_float(df_guard_combined.at[best_idx, 'IRT'])
+            ser_val = _coerce_float(df_guard_combined.at[best_idx, 'ser'])
+            symbol_period_val = _coerce_float(df_guard_combined.at[best_idx, 'symbol_period_s'])
+            if 'Nm_per_symbol' in df_guard_combined.columns:
+                nm_val_raw = df_guard_combined.at[best_idx, 'Nm_per_symbol']
+                nm_val = _coerce_float(nm_val_raw, float(nm_target))
+            else:
+                nm_val = float(nm_target)
+    
+            distances_considered.add(dist_float)
+            frontier_rows.append({
+                'distance_um': dist_float,
+                'best_guard_factor': guard_val,
+                'max_irt_bps': irt_val,
+                'ser_at_best_guard': ser_val,
+                'symbol_period_s': symbol_period_val,
+                'Nm_per_symbol': nm_val,
+                'use_ctrl': desired_ctrl,
+                'mode': mode,
+                'bits_per_symbol': bits_per_symbol,
+            })
+            if distance_task:
+                try:
+                    distance_task.update(1, description=f'{mode} d={dist_float:.0f}um')
+                except Exception:
+                    pass
+    
+    finally:
+        if distance_task is not None:
+            try:
+                distance_task.close()
+            except Exception:
+                pass
     if frames_tradeoff:
         df_new_tradeoff = pd.concat(frames_tradeoff, ignore_index=True)
         if not existing_tradeoff.empty and distances_recomputed:
@@ -4514,7 +4584,9 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                                     distances_um: List[float], 
                                     guard_grid: List[float], 
                                     out_csv: Path, 
-                                    seeds: List[int]) -> None:
+                                    seeds: List[int], 
+                                    pm: Optional[ProgressManager] = None, 
+                                    parent_key: Optional[Any] = None) -> None:
     """
     Generate ISI-distance grid for Hybrid mode 2D visualization.
     Creates a CSV with (distance_um, guard_factor, symbol_period_s, ser, use_ctrl) for heatmaps.
@@ -4525,9 +4597,45 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
     use_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
     
     rows = []
+    guard_max_ts = float(cfg_base.get('_guard_max_ts', 0.0))
+    mode_label = str(cfg_base.get('pipeline', {}).get('modulation', 'Hybrid'))
+    combos: List[Tuple[float, float, float]] = []
+    skipped: List[Tuple[float, float, float]] = []
     for d in distances_um:
         for g in guard_grid:
-            # Use median across a few seeds for stability
+            cfg_probe = deepcopy(cfg_base)
+            cfg_probe['pipeline']['distance_um'] = d
+            cfg_probe['pipeline']['guard_factor'] = g
+            ts_est = calculate_dynamic_symbol_period(d, cfg_probe)
+            if guard_max_ts > 0.0 and ts_est > guard_max_ts:
+                skipped.append((d, g, ts_est))
+            else:
+                combos.append((d, g, ts_est))
+    if guard_max_ts > 0.0 and skipped:
+        preview = ', '.join(f'{dist:.0f}um:g={gf:.1f}(Ts={ts:.1f}s)' for dist, gf, ts in skipped[:5])
+        more = '...' if len(skipped) > 5 else ''
+        print(f'??  Hybrid grid: skipping guard factors {preview}{more} (Ts limit {guard_max_ts:.1f}s).')
+    elif guard_max_ts <= 0.0:
+        warn_cases = [(dist, gf, ts) for dist, gf, ts in combos if ts > 900.0]
+        if warn_cases:
+            sample_dist, sample_gf, sample_ts = warn_cases[0]
+            print(f'??  Hybrid grid: guard {sample_gf:.1f} at {sample_dist:.0f}um yields Ts={sample_ts:.1f}s; consider --guard-max-ts to cap runtime.')
+    total_points = len(combos)
+    if total_points == 0:
+        if guard_max_ts > 0.0:
+            print(f'??  Hybrid ISI-distance grid skipped: no guard factors meet Ts <= {guard_max_ts:.1f}s.')
+        else:
+            print('??  Hybrid ISI-distance grid skipped: no valid guard factors available.')
+        return
+    grid_task = None
+    if pm:
+        desc = f'{mode_label} ISI-distance grid ({total_points} pts)'
+        try:
+            grid_task = pm.task(total=total_points, description=desc, parent=parent_key, kind='stage')
+        except Exception:
+            grid_task = None
+    try:
+        for d, g, ts_hint in combos:
             seed_results = []
             for seed in seeds[:3]:  # Use first 3 seeds for speed
                 try:
@@ -4537,18 +4645,12 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     cfg['pipeline']['sequence_length'] = 200  # Faster for grid generation
                     cfg['pipeline']['enable_isi'] = True
                     cfg['pipeline']['random_seed'] = int(seed)  # Set seed in config
-                    
-                    # NEW: Recompute symbol period and decision window for this distance
-                    Ts = calculate_dynamic_symbol_period(d, cfg)
+                    Ts = ts_hint
                     cfg['pipeline']['symbol_period_s'] = Ts
-                    dt = float(cfg['sim']['dt_s'])
-                    min_pts = int(cfg.get('_min_decision_points', 4))
                     min_win = _enforce_min_window(cfg, Ts)
                     cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
                     cfg.setdefault('detection', {})
                     cfg['detection']['decision_window_s'] = min_win  # FIXED: use min_win for consistency
-                    
-                    # NEW: Calibrate thresholds for this specific (distance, guard_factor) point
                     try:
                         cal_seeds = list(range(4))  # Fast calibration with 4 seeds
                         th = calibrate_thresholds_cached(cfg, cal_seeds)
@@ -4556,60 +4658,58 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                             cfg['pipeline'][k] = v
                     except Exception:
                         pass  # Fallback to default thresholds if calibration fails
-                    
-                    # FIXED: Use run_single_instance for normalized keys and metadata
                     res = run_single_instance(cfg, seed, attach_isi_meta=True)
                     if res is not None:
-                        # Use normalized 'ser' key (run_single_instance converts 'SER' → 'ser')
-                        # and attached 'symbol_period_s' metadata
-                        ser_val = float(res.get('ser', res.get('SER', 1.0)))  # fallback chain
+                        ser_val = float(res.get('ser', res.get('SER', 1.0)))
                         mosk_err = int(res.get('subsymbol_errors', {}).get('mosk', 0))
-                        csk_err  = int(res.get('subsymbol_errors', {}).get('csk', 0))
-                        L        = int(cfg['pipeline']['sequence_length'])
-                        # Best-effort: convert component error counts to SER fractions
+                        csk_err = int(res.get('subsymbol_errors', {}).get('csk', 0))
+                        L = int(cfg['pipeline']['sequence_length'])
                         mosk_ser_val = (mosk_err / L) if L > 0 else float('nan')
-                        csk_ser_val  = (csk_err  / L) if L > 0 else float('nan')
-                        ts_val = float(res.get('symbol_period_s', cfg['pipeline']['symbol_period_s']))
-                        # Enhanced seed collection with conditional CSK metrics
-                        exposures = max(L - mosk_err, 0)  # number of symbols where CSK was actually used
-                        den = max(exposures, 1)           # guard against divide-by-zero (exposures can be 0)
+                        csk_ser_val = (csk_err / L) if L > 0 else float('nan')
+                        ts_val = float(res.get('symbol_period_s', Ts))
+                        exposures = max(L - mosk_err, 0)
+                        den = max(exposures, 1)
                         csk_ser_cond_seed = (csk_err / den)
                         mosk_exposure_frac_seed = (exposures / L) if L > 0 else float('nan')
-                        # Effective CSK contribution (comparable with additive view):
-                        csk_ser_eff_seed = mosk_exposure_frac_seed * csk_ser_cond_seed  # equals csk_err/L per seed
-
+                        csk_ser_eff_seed = mosk_exposure_frac_seed * csk_ser_cond_seed
                         seed_results.append({
-                            'ser': ser_val,
-                            'mosk_ser': mosk_ser_val,          # unconditional MoSK error fraction
-                            'csk_ser': csk_ser_val,            # unconditional CSK error fraction (= csk_err/L)
-                            'csk_ser_cond': csk_ser_cond_seed, # conditional CSK error given correct MoSK
-                            'mosk_exposure_frac': mosk_exposure_frac_seed,
-                            'csk_ser_eff': csk_ser_eff_seed,   # exposure-weighted conditional CSK (for contouring)
-                            'symbol_period_s': ts_val
+                            'ser': ser_val
+                            , 'mosk_ser': mosk_ser_val
+                            , 'csk_ser': csk_ser_val
+                            , 'csk_ser_cond': csk_ser_cond_seed
+                            , 'mosk_exposure_frac': mosk_exposure_frac_seed
+                            , 'csk_ser_eff': csk_ser_eff_seed
+                            , 'symbol_period_s': ts_val
                         })
                 except Exception as e:
-                    print(f"⚠️  Grid point failed (d={d}, g={g}, seed={seed}): {e}")
+                    print(f'??  Grid point failed (d={d}, g={g}, seed={seed}): {e}')
                     continue
-            
             if seed_results:
-                # Take median across seeds
                 median_ser = np.median([r['ser'] for r in seed_results])
                 median_ts = np.median([r['symbol_period_s'] for r in seed_results])
-                
                 rows.append({
-                    'distance_um': d,
-                    'guard_factor': g,
-                    'symbol_period_s': median_ts,
-                    'ser': median_ser,
-                    'mosk_ser': float(np.nanmedian([r['mosk_ser'] for r in seed_results])),
-                    'csk_ser':  float(np.nanmedian([r['csk_ser']  for r in seed_results])),
-                    # NEW conditional view columns:
-                    'csk_ser_cond': float(np.nanmedian([r['csk_ser_cond'] for r in seed_results])),
-                    'mosk_exposure_frac': float(np.nanmedian([r['mosk_exposure_frac'] for r in seed_results])),
-                    'csk_ser_eff': float(np.nanmedian([r['csk_ser_eff'] for r in seed_results])),
-                    'use_ctrl': use_ctrl
+                    'distance_um': d
+                    , 'guard_factor': g
+                    , 'symbol_period_s': median_ts
+                    , 'ser': median_ser
+                    , 'mosk_ser': float(np.nanmedian([r['mosk_ser'] for r in seed_results]))
+                    , 'csk_ser': float(np.nanmedian([r['csk_ser'] for r in seed_results]))
+                    , 'csk_ser_cond': float(np.nanmedian([r['csk_ser_cond'] for r in seed_results]))
+                    , 'mosk_exposure_frac': float(np.nanmedian([r['mosk_exposure_frac'] for r in seed_results]))
+                    , 'csk_ser_eff': float(np.nanmedian([r['csk_ser_eff'] for r in seed_results]))
+                    , 'use_ctrl': use_ctrl
                 })
-    
+            if grid_task:
+                try:
+                    grid_task.update(1, description=f'{mode_label} d={d:.0f}um g={g:.1f}')
+                except Exception:
+                    pass
+    finally:
+        if grid_task is not None:
+            try:
+                grid_task.close()
+            except Exception:
+                pass
     if rows:
         # Load existing data and merge with current CTRL state
         existing_df = pd.DataFrame()
@@ -4752,6 +4852,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_min_ci_seeds'] = int(args.min_ci_seeds)
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
+    cfg['_nonlod_watchdog_secs'] = int(args.nonlod_watchdog_secs)
+    cfg['_guard_max_ts'] = float(args.guard_max_ts)
     cfg['_analytic_lod_bracket'] = getattr(args, 'analytic_lod_bracket', False)
     # Apply CLI optimization parameters to config
     cfg['_cal_eps_rel'] = args.cal_eps_rel
@@ -5095,11 +5197,11 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                         # NaN or <= 0 means failed
                         failed_distances.add(dist)
 
-            if done_distances:
-                print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
+                if done_distances:
+                    print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
                       f"{sorted(done_distances)} um")
-            if failed_distances:
-                print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
+                if failed_distances:
+                    print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
                       f"{sorted(failed_distances)} um")
             else:
                 # Old CSV without lod_nm → just don't prefill
@@ -5431,11 +5533,16 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             combined['__is_valid__'] = pd.to_numeric(combined['lod_nm'], errors='coerce').gt(0) & np.isfinite(pd.to_numeric(combined['lod_nm'], errors='coerce'))
             keys = ['distance_um'] + (['use_ctrl'] if 'use_ctrl' in combined.columns else [])
             # within each (distance, ctrl) group: prefer last valid; else last row
-            combined = (
-                combined
-                .sort_index()  # resume appends at higher index
+            sorted_combined = combined.sort_index()  # resume appends at higher index
+            latest_per_group = sorted_combined.groupby(keys, as_index=False, group_keys=False).tail(1)
+            valid_latest = (
+                sorted_combined[sorted_combined['__is_valid__']]
                 .groupby(keys, as_index=False, group_keys=False)
-                .apply(lambda g: g[g['__is_valid__']].tail(1) if g['__is_valid__'].any() else g.tail(1))
+                .tail(1)
+            )
+            combined = (
+                pd.concat([latest_per_group, valid_latest])
+                .drop_duplicates(subset=keys, keep='last')
                 .drop(columns=['__is_valid__'])
                 .sort_values(keys)
             )
@@ -5610,7 +5717,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                     distances_um=dist_grid,
                     guard_grid=guard_grid,
                     out_csv=isi_grid_csv,
-                    seeds=seeds
+                    seeds=seeds,
+                    pm=pm,
+                    parent_key=mode_key if hierarchy_supported else None
                 )
             else:
                 print(f"✓ ISI grid exists: {isi_grid_csv}")
