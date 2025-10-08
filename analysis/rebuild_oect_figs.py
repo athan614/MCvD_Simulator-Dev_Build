@@ -42,7 +42,7 @@ def _load_cfg() -> dict:
     cfg: dict[str, Any] = {}
     cfg_path = project_root / "config" / "default.yaml"
     if cfg_path.exists():
-        with open(cfg_path, "r") as f:
+        with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
     # reasoned defaults to be safe
     cfg.setdefault("sim", {}).setdefault("dt_s", 0.01)
@@ -63,7 +63,7 @@ def _psd(x: np.ndarray, fs: float):
 def _atomic_save(fig, outpath: Path):
     outpath.parent.mkdir(parents=True, exist_ok=True)
     tmp = outpath.with_suffix(outpath.suffix + ".tmp")
-    fig.savefig(tmp, dpi=300, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp, dpi=300, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp, outpath)
     print(f"✓ Saved: {outpath}")

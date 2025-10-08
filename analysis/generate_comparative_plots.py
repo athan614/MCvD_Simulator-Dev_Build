@@ -128,7 +128,10 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                         ci = _get_ci_for_df(grp_sorted)
                         if ci is not None:
                             low, high = ci
-                            yerr = np.vstack([grp_sorted['ser'].to_numpy() - low, high - grp_sorted['ser'].to_numpy()])
+                            ser_vals = pd.to_numeric(grp_sorted['ser'], errors='coerce').to_numpy()
+                            lower_err = np.nan_to_num(np.maximum(ser_vals - low, 0.0))
+                            upper_err = np.nan_to_num(np.maximum(high - ser_vals, 0.0))
+                            yerr = np.vstack([lower_err, upper_err])
                             ax1.errorbar(grp_sorted[nmcol], grp_sorted['ser'], yerr=yerr,
                                          fmt='none', ecolor=colors[mode], alpha=0.25 if ctrl_state else 0.15, capsize=2)
                 else:
@@ -151,7 +154,10 @@ def plot_figure_7(results: Dict[str, Dict[str, pd.DataFrame]], save_path: Path):
                     ci = _get_ci_for_df(df_sorted)
                     if ci is not None:
                         low, high = ci
-                        yerr = np.vstack([df_sorted['ser'].to_numpy() - low, high - df_sorted['ser'].to_numpy()])
+                        ser_vals = pd.to_numeric(df_sorted['ser'], errors='coerce').to_numpy()
+                        lower_err = np.nan_to_num(np.maximum(ser_vals - low, 0.0))
+                        upper_err = np.nan_to_num(np.maximum(high - ser_vals, 0.0))
+                        yerr = np.vstack([lower_err, upper_err])
                         ax1.errorbar(df_sorted[nmcol], df_sorted['ser'], yerr=yerr,
                                      fmt='none', ecolor=colors[mode], alpha=0.35, capsize=2)
 
@@ -571,6 +577,7 @@ def main():
     print(f"\nModes with data: {', '.join(modes_found) if modes_found else '(none)'}")
     if len(modes_found) < 2:
         print("\nWarning: Need at least 2 modes to generate comparative plots.")
+        return
     print("\nGenerating plots...")
     plot_figure_7(results, figures_dir / "fig7_comparative_ser.png")
     print("✓ Figure 7 saved")

@@ -144,7 +144,7 @@ def _plot_param(df: pd.DataFrame, x: str, y_cols: Sequence[str], out_png: Path, 
         ax.legend()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_png.with_suffix(out_png.suffix + ".tmp")
-    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp, out_png)
     print(f"[saved] {out_png}")

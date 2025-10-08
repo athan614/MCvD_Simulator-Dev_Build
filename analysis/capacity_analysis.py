@@ -375,7 +375,7 @@ def _plot_capacity(df_mode: pd.DataFrame, mode: str) -> None:
     out_png = project_root / "results" / "figures" / f"fig_capacity_{mode.lower()}.png"
     out_png.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_png.with_suffix(out_png.suffix + ".tmp")
-    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp, out_png)
     print(f"[saved] {out_png}")
@@ -416,7 +416,7 @@ def _plot_capacity_dashboard(df: pd.DataFrame) -> None:
     out_png = project_root / "results" / "figures" / "fig_capacity_all.png"
     out_png.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_png.with_suffix(out_png.suffix + ".tmp")
-    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp, dpi=400, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp, out_png)
     print(f"[saved] {out_png}")

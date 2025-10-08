@@ -37,7 +37,7 @@ except Exception:
 
 def _load_cfg() -> dict:
     p = project_root / "config" / "default.yaml"
-    with open(p, "r") as f:
+    with open(p, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     # minimal sanity defaults
     cfg.setdefault("sim", {}).setdefault("dt_s", 0.01)
@@ -51,7 +51,7 @@ def _load_cfg() -> dict:
 def _atomic_save(fig, outpath: Path):
     outpath.parent.mkdir(parents=True, exist_ok=True)
     tmp = outpath.with_suffix(outpath.suffix + ".tmp")
-    fig.savefig(tmp, dpi=300, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp, dpi=300, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp, outpath)
     print(f"✓ Saved: {outpath}")

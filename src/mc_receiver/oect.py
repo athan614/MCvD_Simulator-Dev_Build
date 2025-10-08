@@ -13,7 +13,7 @@ from ..constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
 
 
 def _cholesky_matrix(rho: float) -> np.ndarray:
-    """Return 3×3 lower-triangular L s.t. L @ L.T = Σ. (Unchanged)"""
+    """Return 3Ã—3 lower-triangular L s.t. L @ L.T = Î£. (Unchanged)"""
     return np.linalg.cholesky(np.array([[1.0, rho, rho],
                                         [rho, 1.0, rho],
                                         [rho, rho, 1.0]]))
@@ -195,6 +195,7 @@ def oect_trio(bound_sites_trio: np.ndarray,
     return result
 
 
+
 def oect_current(
     bound_sites_t: np.ndarray,
     nt: str,
@@ -203,92 +204,91 @@ def oect_current(
 ) -> Dict[str, np.ndarray]:
     """
     Convert bound aptamer trajectory to OECT drain current with noise.
-    
+
     VECTORIZED: Optimized FFT-based noise generation.
     """
-    # Set random seed if provided
     if seed is not None:
         rng = np.random.default_rng(seed)
     else:
         rng = np.random.default_rng()
-    
-    # Get parameters
-    nt_params = get_nt_params(cfg, nt)
-    q_eff = get_nt_params(cfg, nt)["q_eff_e"] if nt != "CTRL" else 0.0
-    
-    # ✅ FIXED: Device parameters - support both nested and flat config
-    oect = cfg.get('oect', cfg)  # Use nested if available, fallback to flat
-    gm = oect['gm_S']
-    C_tot = oect['C_tot_F']
-    R_ch = oect['R_ch_Ohm']
-    alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
-    N_c = oect.get('N_c', cfg.get('N_c'))
-    K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
-    T = cfg['sim'].get('temperature_K', 310)
-    
-    # Time parameters
-    dt = cfg['sim']['dt_s']
-    fs = 1 / dt
-    n_samples = len(bound_sites_t)
+
+    bound_sites = np.asarray(bound_sites_t, dtype=float)
+
+    oect_cfg = cfg.get('oect', cfg)
+    noise_cfg = cfg.get('noise', {})
+    gm = float(oect_cfg['gm_S'])
+    C_tot = float(oect_cfg['C_tot_F'])
+    R_ch = float(oect_cfg['R_ch_Ohm'])
+    alpha_H = float(oect_cfg.get('alpha_H', noise_cfg.get('alpha_H', 0.0)) or 0.0)
+    N_c = float(oect_cfg.get('N_c', noise_cfg.get('N_c', 1.0)) or 1.0)
+    if not np.isfinite(N_c) or N_c == 0.0:
+        N_c = 1.0
+    K_d = float(oect_cfg.get('K_d_Hz', noise_cfg.get('K_d_Hz', 0.0)) or 0.0)
+    T = float(cfg['sim'].get('temperature_K', 310.0))
+
+    dt = float(cfg['sim']['dt_s'])
+    fs = 1.0 / dt
+    n_samples = bound_sites.size
+    if n_samples == 0:
+        zeros = np.zeros(0, dtype=float)
+        return {
+            'signal': zeros,
+            'thermal': zeros,
+            'flicker': zeros,
+            'drift': zeros,
+            'total': zeros,
+        }
     duration = n_samples * dt
-    
-    # VECTORIZED: Signal current calculation
-    i_signal = gm * q_eff * ELEMENTARY_CHARGE * bound_sites_t / C_tot
-    
-    # DC current for noise calculations
+
+    q_eff = float(get_nt_params(cfg, nt)["q_eff_e"]) if nt != "CTRL" else 0.0
+    i_signal = gm * q_eff * ELEMENTARY_CHARGE * bound_sites / C_tot
+
     o = cfg.get('oect', {})
     I_DC_cfg = float(o.get('I_dc_A', 0.0) or 0.0)
-    if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0:
+    if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0.0:
         V_g_bias = float(o.get('V_g_bias_V', -0.2))
         I_DC = gm * abs(V_g_bias)
     else:
         I_DC = I_DC_cfg
     I_DC = max(I_DC, 1e-6)
-    
-    # VECTORIZED: Frequency vector generation
+
     freqs = np.fft.rfftfreq(n_samples, dt)
-    freqs[0] = 1 / duration
-    n_freqs = len(freqs)
-    
-    # VECTORIZED: Generate all noise components at once
+    if duration > 0.0:
+        freqs[0] = 1.0 / duration
+    freqs_safe = np.maximum(freqs, 1e-12)
+    n_freqs = freqs_safe.size
+
     if cfg.get('deterministic_mode', False):
-        # No noise in deterministic mode
-        i_thermal = np.zeros(n_samples, dtype=np.float64)
-        i_flicker = np.zeros(n_samples, dtype=np.float64)
-        i_drift = np.zeros(n_samples, dtype=np.float64)
+        i_thermal = np.zeros(n_samples, dtype=float)
+        i_flicker = np.zeros(n_samples, dtype=float)
+        i_drift = np.zeros(n_samples, dtype=float)
     else:
-        # Generate complex noise for all components
         complex_noise = rng.normal(size=(3, n_freqs)) + 1j * rng.normal(size=(3, n_freqs))
-        
-        # 1. Thermal noise
-        B_det = cfg.get('detection_bandwidth_Hz', 100)
-        psd_thermal = 4 * BOLTZMANN * T / R_ch
-        effective_B = min(B_det, fs / 2)
-        thermal_scale = np.sqrt(psd_thermal * effective_B / 2)
+
+        B_det = float(cfg.get('detection_bandwidth_Hz', noise_cfg.get('detection_bandwidth_Hz', 100.0)))
+        psd_thermal = 4.0 * BOLTZMANN * T / R_ch
+        effective_B = min(B_det, fs / 2.0)
+        thermal_scale = np.sqrt(psd_thermal * effective_B / 2.0)
         i_thermal = cast(np.ndarray, np.fft.irfft(complex_noise[0] * thermal_scale, n=n_samples))
-        
-        # 2. Flicker noise
+
         K_f = alpha_H / N_c
-        psd_flicker = K_f * I_DC**2 / freqs
-        flicker_scale = np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_samples)
+        psd_flicker = K_f * I_DC**2 / freqs_safe
+        flicker_scale = np.sqrt(psd_flicker * fs / 2.0) / np.sqrt(n_samples)
         i_flicker = cast(np.ndarray, np.fft.irfft(complex_noise[1] * flicker_scale, n=n_samples))
-        
-        # 3. Drift noise
-        psd_drift = K_d * I_DC**2 / (freqs**2)
-        drift_scale = np.sqrt(psd_drift * fs / 2) / np.sqrt(n_samples)
+
+        psd_drift = K_d * I_DC**2 / (freqs_safe ** 2)
+        drift_scale = np.sqrt(psd_drift * fs / 2.0) / np.sqrt(n_samples)
         i_drift = cast(np.ndarray, np.fft.irfft(complex_noise[2] * drift_scale, n=n_samples))
-    
-    # Total current
+
     i_total = i_signal + i_thermal + i_flicker + i_drift
-    
+
     return {
         'signal': i_signal,
         'thermal': i_thermal,
         'flicker': i_flicker,
         'drift': i_drift,
-        'total': i_total
+        'total': i_total,
     }
-
 
 def oect_current_batch(
     bound_sites_batch: np.ndarray,
@@ -300,6 +300,7 @@ def oect_current_batch(
     FULLY VECTORIZED: Process multiple bound site trajectories in batch.
     All noise generation and signal processing done in parallel.
     """
+    bound_sites_batch = np.asarray(bound_sites_batch, dtype=float)
     n_batch, n_time = bound_sites_batch.shape
     
     # Set random seed if provided
@@ -312,19 +313,22 @@ def oect_current_batch(
     nt_params = get_nt_params(cfg, nt)
     q_eff = nt_params["q_eff_e"] if nt != "CTRL" else 0.0
     
-    # ✅ FIXED: Device parameters - support both nested and flat config
+    # âœ… FIXED: Device parameters - support both nested and flat config
     oect = cfg.get('oect', cfg)  # Use nested if available, fallback to flat
-    gm = oect['gm_S']
-    C_tot = oect['C_tot_F']
-    R_ch = oect['R_ch_Ohm']
-    alpha_H = oect.get('alpha_H', cfg.get('alpha_H'))  # Handle noise params too
-    N_c = oect.get('N_c', cfg.get('N_c'))
-    K_d = oect.get('K_d_Hz', cfg.get('K_d_Hz'))
-    T = cfg['sim'].get('temperature_K', 310)
+    noise_cfg = cfg.get('noise', {})
+    gm = float(oect['gm_S'])
+    C_tot = float(oect['C_tot_F'])
+    R_ch = float(oect['R_ch_Ohm'])
+    alpha_H = float(oect.get('alpha_H', noise_cfg.get('alpha_H', 0.0)) or 0.0)
+    N_c = float(oect.get('N_c', noise_cfg.get('N_c', 1.0)) or 1.0)
+    if not np.isfinite(N_c) or N_c == 0.0:
+        N_c = 1.0
+    K_d = float(oect.get('K_d_Hz', noise_cfg.get('K_d_Hz', 0.0)) or 0.0)
+    T = float(cfg['sim'].get('temperature_K', 310.0))
     
     # Time parameters
-    dt = cfg['sim']['dt_s']
-    fs = 1 / dt
+    dt = float(cfg['sim']['dt_s'])
+    fs = 1.0 / dt
     duration = n_time * dt
     
     # FULLY VECTORIZED: Signal current for all batches at once
@@ -352,15 +356,17 @@ def oect_current_batch(
     
     # Frequency vector for single-sided spectrum
     freqs = np.fft.rfftfreq(n_time, dt)
-    freqs[0] = 1 / duration
-    n_freqs = len(freqs)
+    if duration > 0.0:
+        freqs[0] = 1.0 / duration
+    freqs_safe = np.maximum(freqs, 1e-12)
+    n_freqs = len(freqs_safe)
     
     # FULLY VECTORIZED: Generate noise for all batches at once
     # Shape: (n_batch, 3 noise types, n_freqs)
     complex_noise_all = rng.normal(size=(n_batch, 3, n_freqs)) + 1j * rng.normal(size=(n_batch, 3, n_freqs))
     
     # 1. Thermal noise (white) - same PSD for all batches
-    B_det = cfg.get('detection_bandwidth_Hz', 100)
+    B_det = float(cfg.get('detection_bandwidth_Hz', noise_cfg.get('detection_bandwidth_Hz', 100.0)))
     psd_thermal = 4 * BOLTZMANN * T / R_ch
     effective_B = min(B_det, fs / 2)
     thermal_scale = np.sqrt(psd_thermal * effective_B / 2)
@@ -371,15 +377,15 @@ def oect_current_batch(
     
     # 2. Flicker (1/f) noise - same PSD shape for all batches
     K_f = alpha_H / N_c
-    psd_flicker = K_f * I_DC**2 / freqs
+    psd_flicker = K_f * I_DC**2 / freqs_safe
     flicker_scale = np.sqrt(psd_flicker * fs / 2) / np.sqrt(n_time)
     
     # Apply flicker scaling and transform for all batches
     flicker_fft_batch = complex_noise_all[:, 1, :] * flicker_scale[np.newaxis, :]
     i_flicker_batch = np.fft.irfft(flicker_fft_batch, n=n_time, axis=1)
     
-    # 3. Drift (1/f²) noise - same PSD shape for all batches
-    psd_drift = K_d * I_DC**2 / (freqs**2)
+    # 3. Drift (1/fÂ²) noise - same PSD shape for all batches
+    psd_drift = K_d * I_DC**2 / (freqs_safe**2)
     drift_scale = np.sqrt(psd_drift * fs / 2) / np.sqrt(n_time)
     
     # Apply drift scaling and transform for all batches

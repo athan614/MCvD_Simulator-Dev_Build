@@ -627,7 +627,7 @@ def plot_figure_s6_energy_per_bit(results_dir: Path, save_path: Path) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     # Load config for parameters
-    with open(project_root / "config" / "default.yaml", "r") as f:
+    with open(project_root / "config" / "default.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     cfg = preprocess_config(config)
 

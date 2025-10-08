@@ -91,8 +91,13 @@ def gamma_release_rate(t: float, Nm: float, k: float, theta: float) -> float:
     """Release rate for gamma-distributed burst profile. (Unchanged)"""
     if t < 0:
         return 0.0
-    pdf = gamma_dist.pdf(t, a=k, scale=theta)
-    return float(Nm * pdf)
+    # Safeguard against YAML/string propagation by forcing numeric types
+    tau = np.asarray(t, dtype=float)
+    shape = float(k)
+    scale = float(theta)
+    pdf = gamma_dist.pdf(tau, a=shape, scale=scale)
+    Nm_val = float(Nm)
+    return Nm_val * pdf
 
 
 def finite_burst_concentration(
@@ -114,9 +119,9 @@ def finite_burst_concentration(
     lam = nt_params['lambda']
     
     # Get general parameters
-    alpha = config['alpha']
-    k_clear = config['clearance_rate']
-    T_release = config['T_release_ms'] * MS_TO_S
+    alpha = float(config['alpha'])
+    k_clear = float(config['clearance_rate'])
+    T_release = float(config['T_release_ms']) * MS_TO_S
     burst_shape = config['burst_shape']
     
     # Calculate effective diffusion coefficient
@@ -155,8 +160,8 @@ def finite_burst_concentration(
     
     elif burst_shape == 'gamma':
         # Gamma burst - optimize with vectorized integration where possible
-        k = config['gamma_shape_k']
-        theta = config['gamma_scale_theta']
+        k = float(config['gamma_shape_k'])
+        theta = float(config['gamma_scale_theta'])
         
         def release_rate(tau):
             return gamma_release_rate(tau, Nm, k, theta)
@@ -203,7 +208,7 @@ def finite_burst_concentration(
         
         if len(t_pos) > 0:
             # Apply Green's function (pure 3D diffusion + clearance)
-            prefactor = Nm / (alpha * (4 * np.pi * D_eff * t_pos) ** 1.5)
+            prefactor = float(Nm) / (alpha * (4 * np.pi * D_eff * t_pos) ** 1.5)
             exponential = np.exp(-(r ** 2) / (4 * D_eff * t_pos) - k_clear * t_pos)
             
             # ✅ FIXED: No erfc term for instantaneous source

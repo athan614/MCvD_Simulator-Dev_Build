@@ -262,6 +262,12 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    if getattr(args, 'guard_samples_cap', None) is not None:
+        cmd.extend(["--guard-samples-cap", str(args.guard_samples_cap)])
+    if getattr(args, 'lod_skip_retry', False):
+        cmd.append("--lod-skip-retry")
+    if getattr(args, 'guard_samples_cap', None) is not None:
+        cmd.extend(["--guard-samples-cap", str(args.guard_samples_cap)])
     if getattr(args, 'lod_validate_seq_len', None) is not None:
         cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
@@ -298,6 +304,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--isi-memory-cap", str(args.isi_memory_cap)])
     if args.guard_factor is not None:
         cmd.extend(["--guard-factor", str(args.guard_factor)])
+    if getattr(args, 'guard_samples_cap', None) is not None:
+        cmd.extend(["--guard-samples-cap", str(args.guard_samples_cap)])
     if getattr(args, 'lod_distance_timeout_s', None) is not None:
         cmd.extend(["--lod-distance-timeout-s", str(args.lod_distance_timeout_s)])
     if args.ts_warn_only:
@@ -312,6 +320,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
     if getattr(args, 'lod_distance_concurrency', None) is not None:
         cmd.extend(["--lod-distance-concurrency", str(args.lod_distance_concurrency)])
+    if getattr(args, 'lod_skip_retry', False):
+        cmd.append("--lod-skip-retry")
 
     # NEW: Forward SER auto-refine flags
     if args.ser_refine:
@@ -595,6 +605,10 @@ def main() -> None:
                    help="ISI memory cap in symbols (0 = no cap)")
     p.add_argument("--guard-factor", type=float, default=None,
                    help="Override guard factor for ISI calculations")
+    p.add_argument("--guard-samples-cap", type=float, default=None,
+                   help="Per-seed sample cap for guard sweeps (0 disables cap)")
+    p.add_argument("--lod-skip-retry", action="store_true",
+                   help="On resume, do not retry LoD distances that previously failed (keep NaN).")
     
     # ------ SER auto-refine near target SER ------
     p.add_argument("--ser-refine", action="store_true",
@@ -744,7 +758,9 @@ def main() -> None:
             args.ablation = "both"
             args.supplementary = True
             _set_if_default("channel_suite", True)
-            _set_if_default("csk_baselines", True)
+            modes_value = getattr(args, "modes", "") or ""
+            if isinstance(modes_value, str) and modes_value.lower() in ("csk", "all"):
+                _set_if_default("csk_baselines", True)
             _set_if_default("validate_theory", True)
             _set_if_default("baseline_isi", "off")
             _set_if_default("studies", "sensitivity,capacity,isi-analytic")
@@ -795,6 +811,8 @@ def main() -> None:
             _set_if_default("lod_distance_concurrency", 16)
             if getattr(args, "max_symbol_duration_s", None) in (None, 180.0):
                 args.max_symbol_duration_s = 0.0
+            if getattr(args, "guard_samples_cap", None) is None:
+                args.guard_samples_cap = 0.0
 
             search_len = getattr(args, "lod_seq_len", 250)
             validate_len = getattr(args, "lod_validate_seq_len", None)

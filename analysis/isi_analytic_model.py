@@ -160,7 +160,7 @@ def main() -> None:
     out_png = project_root / "results" / "figures" / "fig_isi_analytic_vs_sim.png"
     out_png.parent.mkdir(parents=True, exist_ok=True)
     tmp_png = out_png.with_suffix(out_png.suffix + ".tmp")
-    fig.savefig(tmp_png, dpi=400, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(tmp_png, dpi=400, bbox_inches="tight", pad_inches=0.02, format="png")
     plt.close(fig)
     os.replace(tmp_png, out_png)
     print(f"[saved] {out_png}")

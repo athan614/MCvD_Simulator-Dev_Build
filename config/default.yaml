@@ -38,7 +38,7 @@ neurotransmitters:
     q_eff_e: 0.0
 
 # -------- Geometry --------
-gate_area_m2: 4e-8              # 200x200 um^2
+# gate_area_m2: 4e-8              # 200x200 um^2
 
 # -------- Release profile --------
 T_release_ms: 10
@@ -52,9 +52,9 @@ binding:
   k_on_M_s: 1e5                 # Changed from k_on_M_inv_s
   k_off_s: 0.1                  # Changed from k_off_s_inv  
   N_sites: 200000
-  N_sites_glu: 4e8              # CORRECTED
-  N_sites_gaba: 4e8             # CORRECTED
-  N_sites_ctrl: 0               # CTRL channel
+  # N_sites_glu: 4e8              # CORRECTED
+  # N_sites_gaba: 4e8             # CORRECTED
+  # N_sites_ctrl: 0               # CTRL channel
 
 # -------- OECT device --------
 oect:
@@ -76,7 +76,7 @@ noise:
   rho_between_channels_after_ctrl: 0.5  # residual Corr(DA-CTRL, SERO-CTRL) for symmetric triplet
 
 # -------- Simulation window --------
-monte_carlo_trials: 10000
+# monte_carlo_trials: 10000
 sim:
   time_window_s: 20
   dt_s: 0.01
@@ -88,7 +88,7 @@ sim:
 lod_distances_um:
   MoSK: [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175, 200]
   CSK: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125]
-  Hybrid: [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95]
+  Hybrid: [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150]
 # Legacy grids retained for reference
 # distances_um: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150]
 # distances_um_high_res: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
@@ -98,11 +98,11 @@ Nm_range: [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000] # fin
 detection:
   modulation: "MoSK"            # MoSK | CSK | hybrid
   decision_window_s: 20         # Use full symbol period (was 8.0)
-  threshold_nA:                 # only used for CSK (2-level) or CTRL threshold tests
-    GLU: 0.75e-9
-    GABA: 0.60e-9
+  # threshold_nA:                 # only used for CSK (2-level) or CTRL threshold tests
+    # GLU: 0.75e-9
+    # GABA: 0.60e-9
   sequence_length: 1000         # symbols per Monte-Carlo run
-  monte_carlo_trials: 10000
+  # monte_carlo_trials: 10000
   snr_dB_range: [-10, 20]       # analytic BER curves
   #mu0_glu: 2.442e-05           # Mean charge for GLU class
   #mu1_gaba: -2.620e-05         # Mean charge for GABA class
@@ -126,7 +126,7 @@ pipeline:
   guard_factor: 0.15             # 20% guard time (Reduced from 0.3)
   lod_nm_min: 50                # New flexible lower bound for LoD search
   csk_target_channel: "DA"     # Defines the molecule used for the pure CSK scheme
-  level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
+  # level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
   csk_levels: 4                 # Number of concentration levels for CSK and Hybrid modes
   csk_tail_fraction: 0.6        # Use tail-gating for CSK everywhere
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
@@ -148,39 +148,40 @@ pipeline:
   # Window guard tuning (Issue 2 optimization)
   _min_decision_points: 4       # Minimum time points for window guard
 
-  channel_spacing_um: 200       # from paper
+  # channel_spacing_um: 200       # from paper
   # Channel positions relative to organoid center
-  channel_positions:
-    GLU: {x: -200, y: 0, z: 0}    # μm
-    GABA: {x: 0, y: 0, z: 0}      # μm
-    CTRL: {x: 200, y: 0, z: 0}    # μm
+  # channel_positions:
+    # GLU: {x: -200, y: 0, z: 0}    # μm
+    # GABA: {x: 0, y: 0, z: 0}      # μm
+    # CTRL: {x: 200, y: 0, z: 0}    # μm
   # Gate dimensions for each channel
   gate_dimensions_um:
     width: 200
     height: 200
   # Aptamer specificity matrix (perfect selectivity assumed)
-  aptamer_specificity:
-    GLU: {GLU: 1.0, GABA: 0.0}    # GLU aptamers only bind GLU
-    GABA: {GLU: 0.0, GABA: 1.0}   # GABA aptamers only bind GABA
-    CTRL: {GLU: 0.0, GABA: 0.0}    # Control must be signal-free for differential subtraction
+  # aptamer_specificity:
+    # GLU: {GLU: 1.0, GABA: 0.0}    # GLU aptamers only bind GLU
+    # GABA: {GLU: 0.0, GABA: 1.0}   # GABA aptamers only bind GABA
+    # CTRL: {GLU: 0.0, GABA: 0.0}    # Control must be signal-free for differential subtraction
   # Channel-specific aptamer counts (tri-channel architecture)
-  N_sites_glu: 1.0e9              # Aptamer sites for GLU channel
-  N_sites_gaba: 1.0e9             # Aptamer sites for GABA channel
-  N_sites_ctrl: 0                 # No aptamers on control channel
+  # N_sites_glu: 1.0e9              # Aptamer sites for GLU channel
+  # N_sites_gaba: 1.0e9             # Aptamer sites for GABA channel
+  # N_sites_ctrl: 0                 # No aptamers on control channel
   enable_molecular_noise: true    # Enable Poisson shot noise
-  channel_distances:
-    GLU: 100.0                   # µm from organoid
-    GABA: 100.0                  # µm from organoid
-    CTRL: 100.0                  # µm from organoid
-  monte_carlo_trials: 10         # monte-carlo trials for analysis
+  # channel_distances:
+    # GLU: 100.0                   # µm from organoid
+    # GABA: 100.0                  # µm from organoid
+    # CTRL: 100.0                  # µm from organoid
+  # monte_carlo_trials: 10         # monte-carlo trials for analysis
   show_progress: true            # Show progress bars
   verbose: true                # Enable verbose output
 
 # -------- Enhanced Analysis Options --------
 analysis:
-  use_effective_data_rate: false     # Use (1-SER) factor in data rate calculations
-  enhanced_noise_model: false       # Enable configurable noise parameters
-  timeout_retry_enabled: true       # Enable timeout retry logic
-  pre_submission_ci_check: true     # Skip job submission when CI already satisfied
+  # use_effective_data_rate: false     # Use (1-SER) factor in data rate calculations
+  # enhanced_noise_model: false       # Enable configurable noise parameters
+  # timeout_retry_enabled: true       # Enable timeout retry logic
+  # pre_submission_ci_check: true     # Skip job submission when CI already satisfied
   allow_ts_exceed: true  # do not abort the LoD row when Ts gets large
   ts_cap_s: 0            # 0 disables the cap; or set a very high value
+  guard_samples_cap: 0  # skip guard sweeps that would require >40M samples per seed (default 4.0e7)

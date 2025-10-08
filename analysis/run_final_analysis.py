@@ -63,8 +63,10 @@ MODE_NAME_ALIASES: Dict[str, str] = {
 DEFAULT_MODE_DISTANCES: Dict[str, List[int]] = {
     "MoSK": [25, 35, 45, 55, 65, 75, 85, 95, 105, 125, 150, 175, 200],
     "CSK": [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125],
-    "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95],
+    "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150],
 }
+
+DEFAULT_GUARD_SAMPLES_CAP: float = 4.0e7  # per-seed limit on total time samples (sequence_length * Ts/dt)
 
 def _canonical_mode_name(mode: str) -> str:
     if not mode:
@@ -1204,6 +1206,9 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         if not (0.0 <= args.guard_factor <= 1.0):
             raise ValueError(f"--guard-factor must be between 0.0 and 1.0, got {args.guard_factor}")
     
+    if getattr(args, 'guard_samples_cap', None) is not None:
+        cfg.setdefault('analysis', {})['guard_samples_cap'] = float(args.guard_samples_cap)
+    
     if getattr(args, 'csk_target', None) is not None:
         cfg.setdefault('pipeline', {})['csk_target_channel'] = str(args.csk_target)
 
@@ -1328,6 +1333,40 @@ def _enforce_min_window(cfg: Dict[str, Any], Ts: float) -> float:
     min_win_cfg = float(cfg.get('_min_decision_window_s',
                           cfg['pipeline'].get('min_decision_window_s', 0.0)))
     return max(Ts, min_pts * dt, min_win_cfg)
+
+
+def _calculate_guard_sampling_load(
+    cfg: Dict[str, Any],
+    guard_pairs: List[Tuple[float, float]]
+) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]], float]:
+    """
+    Evaluate total time-sample load for guard-factor candidates.
+
+    Returns
+    -------
+    keep : list of tuples (guard_factor, Ts, total_samples)
+        Combinations that satisfy the configured sample cap.
+    skipped : list of tuples (guard_factor, Ts, total_samples)
+        Combinations rejected because they exceed the cap.
+    cap : float
+        Active sample cap (<=0 means unlimited).
+    """
+    dt = float(cfg['sim']['dt_s'])
+    seq_len = int(cfg['pipeline'].get('sequence_length', 1000))
+    samples_cap = float(cfg.get('_guard_total_samples_cap', 0.0))
+
+    keep: List[Tuple[float, float, float]] = []
+    skipped: List[Tuple[float, float, float]] = []
+
+    for guard, Ts in guard_pairs:
+        n_samples = max(1, math.ceil(Ts / dt))
+        total_samples = float(n_samples * seq_len)
+        if samples_cap > 0 and total_samples > samples_cap:
+            skipped.append((guard, Ts, total_samples))
+        else:
+            keep.append((guard, Ts, total_samples))
+
+    return keep, skipped, samples_cap
 
 # ============= CSV PERSIST HELPERS (atomic-ish) =============
 def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
@@ -1753,6 +1792,8 @@ def parse_arguments() -> argparse.Namespace:
                    help="ISI memory cap in symbols")
     parser.add_argument("--guard-factor", type=float, default=None,
                    help="Override guard factor for ISI calculations")
+    parser.add_argument("--guard-samples-cap", type=float, default=None,
+                   help="Per-seed sample cap for guard-factor sweeps (0 disables cap)")
     parser.add_argument("--lod-distance-timeout-s", type=float, default=7200.0,
                         help="Per-distance time budget during LoD analysis. <=0 disables timeout.")
     parser.add_argument("--lod-distance-concurrency", type=int, default=8,
@@ -1761,6 +1802,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Upper bound for Nm during LoD search (default: 1000000).")
     parser.add_argument("--ts-warn-only", action="store_true",
                         help="Issue warnings for long Ts instead of skipping (overrides all Ts limits)")
+    parser.add_argument("--lod-skip-retry", action="store_true",
+                        help="On resume, do not retry distances whose previous LoD attempt failed (keep NaN).")
     
     # ------ SER auto-refine near target SER ------
     parser.add_argument("--ser-refine", action="store_true",
@@ -4397,29 +4440,43 @@ def _run_guard_frontier(
                     distances_recomputed.add(dist_float)
     
             df_guard_new = pd.DataFrame()
-            guard_analysis: List[Tuple[float, float]] = []
+            guard_pairs: List[Tuple[float, float]] = []
             for g in run_values:
                 cfg_probe = deepcopy(cfg_base)
                 cfg_probe['pipeline']['distance_um'] = dist_float
                 cfg_probe['pipeline']['guard_factor'] = g
                 ts_est = calculate_dynamic_symbol_period(dist_float, cfg_probe)
-                guard_analysis.append((g, ts_est))
+                guard_pairs.append((g, ts_est))
+
+            filtered_pairs = guard_pairs
             if guard_max_ts > 0.0:
-                skipped_values = [(g, ts) for g, ts in guard_analysis if ts > guard_max_ts]
-                if skipped_values:
-                    preview = ', '.join(f'g={g:.1f}(Ts={ts:.1f}s)' for g, ts in skipped_values[:5])
-                    more = '...' if len(skipped_values) > 5 else ''
+                filtered_pairs = [(g, ts) for g, ts in guard_pairs if ts <= guard_max_ts]
+                skipped_ts = [(g, ts) for g, ts in guard_pairs if ts > guard_max_ts]
+                if skipped_ts:
+                    preview = ', '.join(f'g={g:.1f}(Ts={ts:.1f}s)' for g, ts in skipped_ts[:5])
+                    more = '...' if len(skipped_ts) > 5 else ''
                     print(f'??  Guard frontier: skipping guard factors {preview}{more} at {dist_float:.0f}um (Ts limit {guard_max_ts:.1f}s).')
-                run_values = [g for g, ts in guard_analysis if ts <= guard_max_ts]
             else:
-                warn_values = [(g, ts) for g, ts in guard_analysis if ts > 900.0]
+                warn_values = [(g, ts) for g, ts in guard_pairs if ts > 900.0]
                 if warn_values:
                     warn_g, warn_ts = warn_values[0]
                     print(f'??  Guard frontier: guard {warn_g:.1f} at {dist_float:.0f}um yields Ts={warn_ts:.1f}s; consider --guard-max-ts to cap runtime.')
-                run_values = [g for g, _ in guard_analysis]
+            allowed_pairs, skipped_samples, samples_cap = _calculate_guard_sampling_load(cfg_base, filtered_pairs)
+            if skipped_samples and samples_cap > 0:
+                preview = ', '.join(
+                    f'g={g:.1f}(Ts={ts:.1f}s, ~{total/1e6:.1f}M samples)'
+                    for g, ts, total in skipped_samples[:5]
+                )
+                more = '...' if len(skipped_samples) > 5 else ''
+                cap_desc = f"{samples_cap/1e6:.1f}M"
+                print(f'??  Guard frontier: skipping guard factors {preview}{more} at {dist_float:.0f}um (>~{cap_desc} samples per seed).')
+
+            run_values = [g for g, _, _ in allowed_pairs]
             if not run_values:
                 if guard_max_ts > 0.0:
                     print(f'??  Guard frontier: all guard factors skipped at {dist_float:.0f}um (Ts limit {guard_max_ts:.1f}s).')
+                elif samples_cap > 0:
+                    print(f'??  Guard frontier: all guard factors skipped at {dist_float:.0f}um (sample cap ~{samples_cap/1e6:.1f}M exceeded).')
                 if distance_task:
                     try:
                         distance_task.update(1, description=f'{mode} d={dist_float:.0f}um (skipped)')
@@ -4854,6 +4911,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
     cfg['_nonlod_watchdog_secs'] = int(args.nonlod_watchdog_secs)
     cfg['_guard_max_ts'] = float(args.guard_max_ts)
+    guard_cap_cfg = (cfg.get('analysis', {}) or {}).get('guard_samples_cap', DEFAULT_GUARD_SAMPLES_CAP)
+    try:
+        guard_cap_val = float(guard_cap_cfg)
+    except (TypeError, ValueError):
+        guard_cap_val = float(DEFAULT_GUARD_SAMPLES_CAP)
+    cfg['_guard_total_samples_cap'] = guard_cap_val
     cfg['_analytic_lod_bracket'] = getattr(args, 'analytic_lod_bracket', False)
     # Apply CLI optimization parameters to config
     cfg['_cal_eps_rel'] = args.cal_eps_rel
@@ -5203,6 +5266,10 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 if failed_distances:
                     print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
                       f"{sorted(failed_distances)} um")
+                if failed_distances and args.lod_skip_retry:
+                    print(f"🔄  --lod-skip-retry: accepting failures for {sorted(failed_distances)} um.")
+                    done_distances.update(failed_distances)
+                    failed_distances.clear()
             else:
                 # Old CSV without lod_nm → just don't prefill
                 print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
@@ -5613,11 +5680,18 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             # choose CTRL-matching rows
             if 'use_ctrl' in df_lod_all.columns:
                 df_lod_all = df_lod_all[df_lod_all['use_ctrl'] == bool(cfg['pipeline'].get('use_control_channel', True))]
-            df_lod_ok = df_lod_all.dropna(subset=['lod_nm'])
-            if not df_lod_ok.empty:
-                # pick median distance with a finite LoD
-                d_ref = int(np.median(pd.to_numeric(df_lod_ok['distance_um'], errors='coerce').dropna()))
-                nm_ref = float(df_lod_ok.loc[df_lod_ok['distance_um'].astype(int) == d_ref, 'lod_nm'].iloc[-1])
+            # guard against non-numeric distances or LoDs
+            if {'distance_um', 'lod_nm'}.issubset(df_lod_all.columns):
+                dist_numeric = pd.to_numeric(df_lod_all['distance_um'], errors='coerce')
+                lod_numeric = pd.to_numeric(df_lod_all['lod_nm'], errors='coerce')
+                valid_mask = dist_numeric.notna() & lod_numeric.notna()
+                if valid_mask.any():
+                    dist_numeric = dist_numeric[valid_mask]
+                    lod_numeric = lod_numeric[valid_mask]
+                    # pick median distance and choose the closest available LoD entry
+                    d_ref = int(round(np.median(dist_numeric)))
+                    nearest_idx = (dist_numeric - d_ref).abs().idxmin()
+                    nm_ref = float(lod_numeric.loc[nearest_idx])
 
         # Fallback if LoD CSV missing
         if d_ref is None:
@@ -5639,8 +5713,46 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # ensure ISI ON during the sweep
         cfg['pipeline']['enable_isi'] = True
 
-        guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
-        isi_jobs = len(guard_values) * len(seeds)
+        guard_values_candidates = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+        guard_pairs = []
+        for g in guard_values_candidates:
+            cfg_probe = deepcopy(cfg)
+            cfg_probe['pipeline']['guard_factor'] = g
+            ts_est = calculate_dynamic_symbol_period(d_ref, cfg_probe)
+            guard_pairs.append((g, ts_est))
+
+        guard_max_ts = float(cfg.get('_guard_max_ts', 0.0))
+        if guard_max_ts > 0.0:
+            allowed_ts_pairs = [(g, ts) for g, ts in guard_pairs if ts <= guard_max_ts]
+            skipped_ts_pairs = [(g, ts) for g, ts in guard_pairs if ts > guard_max_ts]
+            guard_pairs = allowed_ts_pairs
+            if skipped_ts_pairs:
+                preview = ', '.join(f'g={g:.1f}(Ts={ts:.1f}s)' for g, ts in skipped_ts_pairs[:5])
+                more = '...' if len(skipped_ts_pairs) > 5 else ''
+                print(f"??  ISI trade-off: skipping guard factors {preview}{more} at d={d_ref:.0f}um (Ts limit {guard_max_ts:.1f}s).")
+        else:
+            warn_pairs = [(g, ts) for g, ts in guard_pairs if ts > 900.0]
+            if warn_pairs:
+                g_warn, ts_warn = warn_pairs[0]
+                print(f"??  ISI trade-off: guard {g_warn:.1f} gives Ts={ts_warn:.1f}s at d={d_ref:.0f}um; consider --guard-max-ts to cap runtime.")
+
+        allowed_pairs, skipped_samples, samples_cap = _calculate_guard_sampling_load(cfg, guard_pairs)
+        if skipped_samples and samples_cap > 0:
+            preview = ', '.join(
+                f'g={g:.1f}(Ts={ts:.1f}s, ~{total/1e6:.1f}M samples)'
+                for g, ts, total in skipped_samples[:5]
+            )
+            more = '...' if len(skipped_samples) > 5 else ''
+            cap_desc = f"{samples_cap/1e6:.1f}M"
+            print(f"??  ISI trade-off: skipping guard factors {preview}{more} at d={d_ref:.0f}um (>~{cap_desc} samples per seed).")
+
+        guard_values = [g for g, _, _ in allowed_pairs]
+        if not guard_values:
+            print("??  ISI trade-off skipped: no guard factors within runtime limits.")
+            isi_jobs = 0
+        else:
+            isi_jobs = len(guard_values) * len(seeds)
+
         isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}{suffix}.csv"
         pm.set_status(mode=mode, sweep="ISI trade-off")
         isi_key = ("sweep", mode, "ISI_tradeoff")
@@ -5648,21 +5760,25 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         if hierarchy_supported:
             isi_bar = pm.task(total=isi_jobs, description="ISI trade-off (guard)",
                             parent=mode_key, key=isi_key, kind="sweep")
-        df_isi = run_sweep(
-            cfg, seeds,
-            'pipeline.guard_factor',
-            guard_values,
-            f"ISI trade-off ({mode})",
-            progress_mode=args.progress,
-            persist_csv=isi_csv,
-            resume=args.resume,
-            debug_calibration=args.debug_calibration,
-            pm=pm,
-            sweep_key=isi_key if hierarchy_supported else None,
-            parent_key=mode_key if hierarchy_supported else None,
-            recalibrate=args.recalibrate
-        )
-        if isi_bar: isi_bar.close()
+        if guard_values:
+            df_isi = run_sweep(
+                cfg, seeds,
+                'pipeline.guard_factor',
+                guard_values,
+                f"ISI trade-off ({mode})",
+                progress_mode=args.progress,
+                persist_csv=isi_csv,
+                resume=args.resume,
+                debug_calibration=args.debug_calibration,
+                pm=pm,
+                sweep_key=isi_key if hierarchy_supported else None,
+                parent_key=mode_key if hierarchy_supported else None,
+                recalibrate=args.recalibrate
+            )
+        else:
+            df_isi = pd.DataFrame()
+        if isi_bar:
+            isi_bar.close()
         # De-duplicate by (guard_factor, use_ctrl)
         if isi_csv.exists():
             existing = pd.read_csv(isi_csv)
