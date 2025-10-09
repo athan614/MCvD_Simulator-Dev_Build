@@ -41,6 +41,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import yaml
 from matplotlib.axes import Axes
+from matplotlib.lines import Line2D
 
 # Project root & imports
 project_root = Path(__file__).parent.parent
@@ -75,14 +76,75 @@ def _try_load_csv(p: Path) -> Optional[pd.DataFrame]:
             return None
     # Fallbacks for legacy filenames (e.g., *_uniform.csv)
     if p.suffix == ".csv":
-        for cand in (p.with_name(p.stem + "_uniform.csv"),
-                     p.with_name(p.stem + "_zero.csv")):
+        for cand in (
+            p.with_name(p.stem + "_uniform.csv"),
+            p.with_name(p.stem + "_zero.csv"),
+        ):
             if cand.exists():
                 try:
                     return pd.read_csv(cand)
                 except Exception:
-                    return None
+                    continue
     return None
+
+
+def _edge_indices(values: np.ndarray) -> List[int]:
+    if values.size <= 1:
+        return [0]
+    return [0, values.size - 1]
+
+
+def _add_marginal_curves(ax: Axes,
+                          nm_axis: np.ndarray,
+                          dist_axis: np.ndarray,
+                          mosk_grid: np.ndarray,
+                          csk_grid: np.ndarray) -> List[Line2D]:
+    """
+    Overlay MoSK/CSK marginal SER curves along the near/far distance edges.
+    Returns handles for legend composition.
+    """
+    handles: List[Line2D] = []
+    if nm_axis.size == 0 or dist_axis.size == 0:
+        return handles
+
+    nm_mask = np.isfinite(nm_axis)
+    nm = nm_axis[nm_mask]
+    if nm.size == 0:
+        return handles
+
+    mosk_colors = ["tab:red", "tab:orange"]
+    csk_colors = ["tab:blue", "tab:cyan"]
+    for idx, edge in enumerate(_edge_indices(dist_axis)):
+        dist = dist_axis[edge]
+
+        if mosk_grid.size:
+            mosk_row = mosk_grid[edge]
+            mosk_series = mosk_row[nm_mask]
+            if np.isfinite(mosk_series).any():
+                line = ax.plot(
+                    nm,
+                    mosk_series,
+                    linestyle="--",
+                    linewidth=1.4,
+                    color=mosk_colors[idx % len(mosk_colors)],
+                    label=f"MoSK edge {dist:.0f} μm",
+                )[0]
+                handles.append(line)
+
+        if csk_grid.size:
+            csk_row = csk_grid[edge]
+            csk_series = csk_row[nm_mask]
+            if np.isfinite(csk_series).any():
+                line = ax.plot(
+                    nm,
+                    csk_series,
+                    linestyle=":",
+                    linewidth=1.4,
+                    color=csk_colors[idx % len(csk_colors)],
+                    label=f"CSK edge {dist:.0f} μm",
+                )[0]
+                handles.append(line)
+    return handles
 
 # -------------------------- Panel A: HDS components -------------------------
 
@@ -266,6 +328,7 @@ def _prepare_qnsi(
         rho_post = 0.0
         delta_q_diff = math.nan
 
+        delta_q_diff_val: float = math.nan
         if cfg is not None:
             pipeline_cfg = cfg.setdefault("pipeline", {})
             pipeline_cfg["Nm_per_symbol"] = nm_value
@@ -289,6 +352,8 @@ def _prepare_qnsi(
 
             measured_sigma_da = row.get("noise_sigma_da")
             measured_sigma_sero = row.get("noise_sigma_sero")
+            measured_sigma_diff_charge = row.get("noise_sigma_diff_charge")
+
             if use_simulation_noise and pd.notna(measured_sigma_da) and pd.notna(measured_sigma_sero):
                 sigma_da_Q = float(measured_sigma_da)
                 sigma_sero_Q = float(measured_sigma_sero)
@@ -298,14 +363,22 @@ def _prepare_qnsi(
                 sigma_sero_Q = float(calc_sero)
 
             rho_post = _extract_rho_post(row, cfg)
-            sigma_q_diff = math.sqrt(max(
-                sigma_da_Q**2 + sigma_sero_Q**2 - 2.0 * rho_post * sigma_da_Q * sigma_sero_Q,
-                0.0
-            )) if (sigma_da_Q is not None and sigma_sero_Q is not None) else math.nan
+            if use_simulation_noise and pd.notna(measured_sigma_diff_charge):
+                sigma_q_diff = float(measured_sigma_diff_charge)
+            elif sigma_da_Q is not None and sigma_sero_Q is not None:
+                sigma_q_diff = math.sqrt(max(
+                    sigma_da_Q**2 + sigma_sero_Q**2 - 2.0 * rho_post * sigma_da_Q * sigma_sero_Q,
+                    0.0
+                ))
+            else:
+                sigma_q_diff = math.nan
 
-            delta_over_sigma = row.get("delta_over_sigma")
-            if pd.notna(delta_over_sigma) and math.isfinite(sigma_q_diff):
-                delta_q_diff = float(delta_over_sigma) * sigma_q_diff
+            delta_q_diff_raw = row.get("delta_Q_diff")
+            delta_over_sigma_q = row.get("delta_over_sigma_Q", row.get("delta_over_sigma"))
+            if pd.notna(delta_q_diff_raw) and math.isfinite(float(delta_q_diff_raw)):
+                delta_q_diff_val = float(delta_q_diff_raw)
+            elif pd.notna(delta_over_sigma_q) and math.isfinite(sigma_q_diff):
+                delta_q_diff_val = float(delta_over_sigma_q) * sigma_q_diff
             else:
                 delta_I_diff = row.get("delta_I_diff")
                 gm_S = cfg.get("oect", {}).get("gm_S")
@@ -313,21 +386,25 @@ def _prepare_qnsi(
                 if (pd.notna(delta_I_diff) and gm_S not in (None, 0.0) and
                         C_tot_F not in (None, 0.0)):
                     try:
-                        delta_q_diff = float(delta_I_diff) * (float(C_tot_F) / float(gm_S))
+                        delta_q_diff_val = float(delta_I_diff) * (float(C_tot_F) / float(gm_S))
                     except (TypeError, ValueError, ZeroDivisionError):
-                        delta_q_diff = math.nan
+                        delta_q_diff_val = math.nan
 
         else:
-            delta_over_sigma = row.get("delta_over_sigma")
-            if pd.notna(delta_over_sigma):
-                qnsi_values.append(float(delta_over_sigma))
+            delta_over_sigma_q = row.get("delta_over_sigma_Q", row.get("delta_over_sigma"))
+            if pd.notna(delta_over_sigma_q):
+                qnsi_values.append(float(delta_over_sigma_q))
                 continue
 
-        if (sigma_da_Q is None or sigma_sero_Q is None or
-                not math.isfinite(delta_q_diff)):
+        sigma_da_scalar = float(sigma_da_Q) if sigma_da_Q is not None else math.nan
+        sigma_sero_scalar = float(sigma_sero_Q) if sigma_sero_Q is not None else math.nan
+        if not math.isfinite(delta_q_diff_val):
+            delta_q_diff_val = math.nan
+        if (not math.isfinite(sigma_da_scalar) or not math.isfinite(sigma_sero_scalar) or
+                not math.isfinite(delta_q_diff_val)):
             qnsi_value = math.nan
         else:
-            qnsi_value = float(compute_qnsi(delta_q_diff, sigma_da_Q, sigma_sero_Q, rho_post))
+            qnsi_value = float(compute_qnsi(delta_q_diff_val, sigma_da_scalar, sigma_sero_scalar, rho_post))
         qnsi_values.append(qnsi_value)
 
     qnsi_arr = np.asarray(qnsi_values, dtype=np.float64)
@@ -550,32 +627,46 @@ def main() -> None:
 
             # Component contours
             levels = [1e-3, 1e-2, 1e-1]
-            cs_mosk = axA.contour(Xg, Yg, Z_mosk, levels=levels, colors="white", 
-                                 linestyles="--", linewidths=1.5, alpha=0.8)
-            cs_csk = axA.contour(Xg, Yg, Z_csk, levels=levels, colors="white", 
-                                linestyles=":", linewidths=1.5, alpha=0.8)
-            
+            cs_mosk = axA.contour(
+                Xg, Yg, Z_mosk, levels=levels, colors="white",
+                linestyles="--", linewidths=1.5, alpha=0.8
+            )
+            cs_csk = axA.contour(
+                Xg, Yg, Z_csk, levels=levels, colors="white",
+                linestyles=":", linewidths=1.5, alpha=0.8
+            )
+
             # Labels for contours
             axA.clabel(cs_mosk, inline=True, fontsize=7, fmt="MoSK: %.0e")
-            label_fmt = {"additive": "CSK: %.0e", "conditional": "CSK(cond): %.0e", "effective": "CSK(eff): %.0e"}[args.hds_csk_mode]
+            label_fmt = {
+                "additive": "CSK: %.0e",
+                "conditional": "CSK(cond): %.0e",
+                "effective": "CSK(eff): %.0e",
+            }[args.hds_csk_mode]
             axA.clabel(cs_csk, inline=True, fontsize=7, fmt=label_fmt)
-            
-            # Legend for contour types
-            from matplotlib.lines import Line2D
-            legend_elements = [
-                Line2D([0], [0], color='white', linestyle='--', label='MoSK contours'),
-                Line2D([0], [0], color='white', linestyle=':', label='CSK contours')
+
+            # Edge marginals for MoSK/CSK along grid extremes
+            edge_handles = _add_marginal_curves(axA, X, Y, Z_mosk, Z_csk)
+
+            # Legend for contours and edge marginals
+            contour_handles = [
+                Line2D([0], [0], color="white", linestyle="--", label="MoSK contours"),
+                Line2D([0], [0], color="white", linestyle=":", label="CSK contours"),
             ]
-            axA.legend(handles=legend_elements, loc='upper right', fontsize=8)
+            legend_handles = contour_handles + edge_handles
+            if legend_handles:
+                axA.legend(handles=legend_handles, loc="upper right", fontsize=8)
 
             axA.set_xlabel("Nm (molecules/symbol)")
             axA.set_ylabel("Distance (μm)")
             axA.set_title(f"(A) Hybrid Decision Surface: Total SER + Components\n{caption_text}")
         
-            # Add marginal plots as overlays if desired
-            # You could add contour lines for key SER levels
-            cs_total = axA.contour(Xg, Yg, Z_total, levels=[1e-3, 1e-2, 1e-1], colors='yellow', alpha=0.7, linewidths=1)
-            axA.clabel(cs_total, inline=True, fontsize=8, fmt='%.3f')
+            # Add total SER reference contours
+            cs_total = axA.contour(
+                Xg, Yg, Z_total, levels=[1e-3, 1e-2, 1e-1],
+                colors="yellow", alpha=0.7, linewidths=1.0
+            )
+            axA.clabel(cs_total, inline=True, fontsize=8, fmt="%.3f")
         else:
             axA.set_title("(A) HDS Grid (insufficient data)")
             axA.text(0.5, 0.5, "Insufficient grid data for heatmap", 

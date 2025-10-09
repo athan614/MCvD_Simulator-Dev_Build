@@ -38,20 +38,20 @@ def _load_config_defaults() -> Dict[str, float]:
         return {"gm_S": 0.0, "C_tot_F": 0.0}
 
 
-def _prepare_series(df: pd.DataFrame, param_type: str) -> Optional[pd.DataFrame]:
+def _prepare_series(df: pd.DataFrame, param_type: str, value_col: str) -> Optional[pd.DataFrame]:
     if df.empty:
         return None
     subset = df[df["param_type"] == param_type].copy()
     if subset.empty:
         return None
     subset["param_value"] = pd.to_numeric(subset["param_value"], errors="coerce")
-    subset["delta_over_sigma"] = pd.to_numeric(subset["delta_over_sigma"], errors="coerce")
-    subset = subset.dropna(subset=["param_value", "delta_over_sigma"])
+    subset[value_col] = pd.to_numeric(subset[value_col], errors="coerce")
+    subset = subset.dropna(subset=["param_value", value_col])
     if subset.empty:
         return None
     grouped = (
         subset.groupby("param_value", as_index=False)
-        .agg({"delta_over_sigma": "median"})
+        .agg({value_col: "median"})
         .sort_values(by="param_value")
     )
     return grouped
@@ -83,6 +83,12 @@ def main() -> None:
         default="on",
         help="Select control-channel configuration to plot (default: on).",
     )
+    parser.add_argument(
+        "--domain",
+        choices=["current", "charge"],
+        default="current",
+        help="Metric domain: 'current' for ΔI/σ_I, 'charge' for ΔQ/σ_Q.",
+    )
     args = parser.parse_args()
 
     suffix = f"_{args.variant}" if args.variant else ""
@@ -97,6 +103,13 @@ def main() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(6.8, 3.2))
     ax_gm, ax_c = axes
 
+    if args.domain == "current":
+        value_col = "delta_over_sigma_I"
+        ylabel = r"$\Delta I_{\mathrm{diff}} / \sigma_{I,\mathrm{diff}}$"
+    else:
+        value_col = "delta_over_sigma_Q"
+        ylabel = r"$\Delta Q_{\mathrm{diff}} / \sigma_{Q,\mathrm{diff}}$"
+
     defaults = _load_config_defaults()
 
     plotted_any = False
@@ -104,29 +117,33 @@ def main() -> None:
         df_mode = _load_mode_data(mode, suffix, desired_ctrl)
         if df_mode is None:
             continue
+        if value_col not in df_mode.columns:
+            print(f"??  Skipping {mode}: column {value_col} missing")
+            continue
 
-        gm_series = _prepare_series(df_mode, "gm_S")
-        c_series = _prepare_series(df_mode, "C_tot_F")
+        gm_series = _prepare_series(df_mode, "gm_S", value_col)
+        c_series = _prepare_series(df_mode, "C_tot_F", value_col)
 
         label = mode
         if gm_series is not None and not gm_series.empty:
             x = gm_series["param_value"].to_numpy(dtype=float) * 1e3  # S -> mS
-            y = gm_series["delta_over_sigma"].to_numpy(dtype=float)
+            y = gm_series[value_col].to_numpy(dtype=float)
             ax_gm.plot(x, y, marker="o", linewidth=2, label=label)
             plotted_any = True
         if c_series is not None and not c_series.empty:
             x = c_series["param_value"].to_numpy(dtype=float) * 1e9  # F -> nF
-            y = c_series["delta_over_sigma"].to_numpy(dtype=float)
+            y = c_series[value_col].to_numpy(dtype=float)
             ax_c.plot(x, y, marker="o", linewidth=2, label=label)
             plotted_any = True
 
     ax_gm.set_xlabel("g_m (mS)")
-    ax_gm.set_ylabel("Delta I_diff / sigma_I_diff")
+    ax_gm.set_ylabel(ylabel)
     ax_gm.grid(True, alpha=0.3)
     if defaults["gm_S"] > 0:
         ax_gm.axvline(defaults["gm_S"] * 1e3, color="grey", linestyle="--", alpha=0.6)
 
     ax_c.set_xlabel("C_tot (nF)")
+    ax_c.set_ylabel(ylabel)
     ax_c.grid(True, alpha=0.3)
     if defaults["C_tot_F"] > 0:
         ax_c.axvline(defaults["C_tot_F"] * 1e9, color="grey", linestyle="--", alpha=0.6)

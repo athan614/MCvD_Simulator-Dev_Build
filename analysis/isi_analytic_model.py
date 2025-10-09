@@ -8,7 +8,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,8 +20,17 @@ sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
 from analysis.run_final_analysis import preprocess_config_full, calculate_dynamic_symbol_period
-from src.pipeline import calculate_proper_noise_sigma
+from src.pipeline import calculate_proper_noise_sigma, _resolve_decision_window
 from src.mc_channel.isi_analytic import window_coefficients, gaussian_ser_binary, predicted_stats_mosk
+
+
+def _as_float(value: Any) -> float:
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    arr = np.asarray(value)
+    if arr.size == 0:
+        raise TypeError("Cannot convert empty value to float")
+    return float(arr.ravel()[0])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,31 +46,6 @@ def _load_cfg() -> Dict[str, Any]:
     with cfg_path.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
     return preprocess_config_full(cfg)
-
-
-def _resolve_detection_window(cfg: Dict[str, Any], Ts: float) -> float:
-    detection = cfg.setdefault("detection", {})
-    dt = float(cfg["sim"].get("dt_s", 0.01))
-    min_pts = int(cfg.get("_min_decision_points", 4))
-    policy = str(detection.get("decision_window_policy", "full_Ts")).lower()
-
-    if policy in ("fraction_of_ts", "fraction", "tail_fraction", "tail"):
-        frac = float(detection.get("decision_window_fraction", 0.9))
-        min_win = max(min_pts * dt, Ts * frac)
-    elif policy == "full_ts":
-        min_win = max(min_pts * dt, Ts)
-    else:
-        explicit = float(detection.get("decision_window_s", Ts))
-        min_win = max(min_pts * dt, explicit if explicit > 0 else Ts)
-
-    detection["decision_window_s"] = max(
-        float(detection.get("decision_window_s", min_win)), min_win
-    )
-    cfg["pipeline"]["time_window_s"] = max(
-        float(cfg["pipeline"].get("time_window_s", 0.0)),
-        detection["decision_window_s"],
-    )
-    return detection["decision_window_s"]
 
 
 def _pick_anchor(cfg: Dict[str, Any]) -> tuple[float, float]:
@@ -96,31 +80,44 @@ def main() -> None:
     nm_hint = float(nm_hint if math.isfinite(nm_hint) and nm_hint > 0 else cfg["pipeline"].get("Nm_per_symbol", 1e4))
 
     guard_vals = np.linspace(0.0, 1.0, args.points)
-    analytic_rows = []
+    nm_multipliers = (0.5, 1.0, 2.0)
+    analytic_rows: list[dict[str, float]] = []
 
     for gf in guard_vals:
-        cfg_g = copy.deepcopy(cfg)
-        cfg_g["pipeline"]["guard_factor"] = float(gf)
-        cfg_g["pipeline"]["distance_um"] = float(distance_um)
-        cfg_g["pipeline"]["Nm_per_symbol"] = float(nm_hint)
+        for nm_scale in nm_multipliers:
+            cfg_g = copy.deepcopy(cfg)
+            cfg_g["pipeline"]["guard_factor"] = float(gf)
+            cfg_g["pipeline"]["distance_um"] = float(distance_um)
+            nm_value = float(nm_hint * nm_scale)
+            cfg_g["pipeline"]["Nm_per_symbol"] = nm_value
+            cfg_g["pipeline"]["use_control_channel"] = False  # analytic MoSK stat is single-ended
 
-        Ts = calculate_dynamic_symbol_period(distance_um, cfg_g)
-        cfg_g["pipeline"]["symbol_period_s"] = Ts
-        win = _resolve_detection_window(cfg_g, Ts)
-        cfg_g["sim"]["time_window_s"] = max(float(cfg_g["sim"].get("time_window_s", Ts)), Ts)
+            Ts = calculate_dynamic_symbol_period(distance_um, cfg_g)
+            cfg_g["pipeline"]["symbol_period_s"] = Ts
+            dt = float(cfg_g["sim"].get("dt_s", 0.01))
+            win = _resolve_decision_window(cfg_g, Ts, dt)
+            cfg_g["sim"]["time_window_s"] = max(float(cfg_g["sim"].get("time_window_s", Ts)), Ts)
 
-        h_vec = window_coefficients(distance_m=distance_um * 1e-6, Ts=Ts, win_s=win, cfg=cfg_g, k_max=int(cfg_g["pipeline"].get("isi_memory_cap_symbols", 60)))
-        mu_da, mu_sero, _, _ = predicted_stats_mosk(nm_hint, h_vec, cfg_g)
-        sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg_g, win)
-        sigma_eff = math.sqrt(max(0.5 * (sigma_da ** 2 + sigma_sero ** 2), 1e-18))
-        ser_est = gaussian_ser_binary(mu_da, mu_sero, sigma_eff, sigma_eff)
+            h_vec = window_coefficients(
+                distance_m=distance_um * 1e-6,
+                Ts=Ts,
+                win_s=win,
+                cfg=cfg_g,
+                k_max=int(cfg_g["pipeline"].get("isi_memory_cap_symbols", 60)),
+            )
+            mu_da, mu_sero, _, _ = predicted_stats_mosk(nm_value, h_vec, cfg_g)
+            sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg_g, win)
+            sigma_eff = math.sqrt(max(0.5 * (sigma_da ** 2 + sigma_sero ** 2), 1e-18))
+            ser_est = gaussian_ser_binary(mu_da, mu_sero, sigma_eff, sigma_eff)
 
-        analytic_rows.append({
-            "guard_factor": gf,
-            "ser_analytic": ser_est,
-            "symbol_period_s": Ts,
-            "decision_window_s": win,
-        })
+            analytic_rows.append({
+                "guard_factor": gf,
+                "nm_multiplier": nm_scale,
+                "nm_per_symbol": nm_value,
+                "ser_analytic": ser_est,
+                "symbol_period_s": Ts,
+                "decision_window_s": win,
+            })
 
     df_analytic = pd.DataFrame(analytic_rows)
     out_csv = project_root / "results" / "data" / "isi_analytic_model.csv"
@@ -138,7 +135,7 @@ def main() -> None:
         except Exception:
             df_sim = pd.DataFrame()
 
-    gf_col = None
+    gf_col: Optional[str] = None
     if not df_sim.empty:
         if "guard_factor" in df_sim.columns:
             gf_col = "guard_factor"
@@ -147,9 +144,17 @@ def main() -> None:
 
     apply_ieee_style()
     fig, ax = plt.subplots(figsize=(3.5, 2.6))
-    ax.plot(df_analytic["guard_factor"], df_analytic["ser_analytic"], marker="o", label="Analytic")
-    if gf_col:
-        ax.plot(df_sim[gf_col], df_sim["ser"], marker="s", label="Simulation")
+    for nm_scale_raw, grp in df_analytic.groupby("nm_multiplier"):
+        nm_scale = _as_float(nm_scale_raw)
+        grp_sorted = grp.sort_values("guard_factor")
+        guard_vals = pd.to_numeric(grp_sorted["guard_factor"], errors="coerce").to_numpy(dtype=float)
+        ser_vals = pd.to_numeric(grp_sorted["ser_analytic"], errors="coerce").to_numpy(dtype=float)
+        label = f"Analytic (Nm×{nm_scale:g})"
+        ax.plot(guard_vals, ser_vals, marker="o", label=label)
+    if gf_col is not None and not df_sim.empty:
+        guard_series = pd.to_numeric(df_sim[gf_col], errors="coerce").to_numpy(dtype=float)
+        ser_series = pd.to_numeric(df_sim["ser"], errors="coerce").to_numpy(dtype=float)
+        ax.plot(guard_series, ser_series, marker="s", label="Simulation")
     ax.axhline(0.01, linestyle="--", linewidth=1.0, label="SER = 1%")
     ax.set_xlabel("Guard factor")
     ax.set_ylabel("SER")

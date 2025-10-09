@@ -43,49 +43,80 @@ def integrate_current(i_t: np.ndarray, dt: float, win_s: float) -> float:
 # ------------------------------------------------------------------
 #  MoSK detector (DA vs SERO) - Implements Eq. (39)
 # ------------------------------------------------------------------
-def detect_mosk(i_da: np.ndarray,
-                i_sero: np.ndarray,
-                i_ctrl: np.ndarray,
-                cfg: Dict[str, Any],
-                use_differential: bool = True) -> int:
+def detect_mosk(
+    i_da: np.ndarray,
+    i_sero: np.ndarray,
+    i_ctrl: np.ndarray,
+    cfg: Dict[str, Any],
+    use_differential: Optional[bool] = None,
+    sigma_diff: Optional[float] = None,
+    detector_mode: Optional[str] = None,
+) -> int:
     """
-    Optimized MoSK detection: distinguish between datamate and SERO.
-    
-    Implements improved decision rule with adaptive thresholds and better integration.
+    MoSK detector aligned with the end-to-end pipeline statistics.
+
+    When ``use_differential`` is left as ``None`` it mirrors the simulator’s
+    convention: MoSK statistics remain single-ended even if the control channel
+    is enabled, while other modes default to CTRL-differential subtraction.
     """
-    win = cfg['detection']['decision_window_s']  # Now 17s (optimized)
-    dt = cfg['sim']['dt_s']
-    
+    detection_cfg = cfg.get('detection', {})
+    sim_cfg = cfg.get('sim', {})
+    pipeline_cfg = cfg.get('pipeline', {})
+
+    win = float(detection_cfg.get('decision_window_s', pipeline_cfg.get('symbol_period_s', 0.0)))
+    dt = float(sim_cfg.get('dt_s', 1.0))
+
+    detector_mode = detector_mode or str(pipeline_cfg.get('detector_mode', 'zscore')).lower()
+    if detector_mode not in ('raw', 'zscore', 'whitened'):
+        detector_mode = 'zscore'
+
+    if use_differential is None:
+        pipeline_mod = str(pipeline_cfg.get('modulation', 'MoSK')).upper()
+        use_ctrl = bool(pipeline_cfg.get('use_control_channel', True))
+        # Align with end-to-end pipeline: MoSK contrast stays single-ended.
+        use_differential = use_ctrl and pipeline_mod != 'MOSK'
+
     if use_differential:
-        # Differential currents
-        i_diff_da = i_da - i_ctrl
-        i_diff_sero = i_sero - i_ctrl
+        i_da_use = i_da - i_ctrl
+        i_sero_use = i_sero - i_ctrl
     else:
-        # Direct currents (for comparison)
-        i_diff_da = i_da
-        i_diff_sero = i_sero
-    
-    # OPTIMIZED: Better integration method
-    n_int = min(int(win / dt), len(i_diff_da))
+        i_da_use = i_da
+        i_sero_use = i_sero
+
+    n_int = min(int(win / dt), len(i_da_use))
     if n_int <= 0:
-        return 1  # Default to SERO
-    
-    # Use trapezoidal integration for better accuracy
-    q_da = np.trapezoid(i_diff_da[:n_int], dx=dt)
-    q_sero = np.trapezoid(i_diff_sero[:n_int], dx=dt)
-    
-    # OPTIMIZED: Adaptive noise estimation for better decision making
-    noise_var_da = max(float(np.var(np.diff(i_diff_da[:n_int])) / 2), 1e-24)
-    noise_var_sero = max(float(np.var(np.diff(i_diff_sero[:n_int])) / 2), 1e-24)
-    
-    # OPTIMIZED: ML-optimal decision with noise weighting
-    sigma_da = np.sqrt(noise_var_da)
-    sigma_sero = np.sqrt(noise_var_sero)
-    
-    # Improved decision statistic with noise normalization (signed, no abs—handles depletion/enhancement)
-    test_stat = q_da / sigma_da - q_sero / sigma_sero  # Negative q_da large → positive test_stat for DA
-    # Return 0 for DA (test_stat > 0), 1 for SERO (test_stat < 0)
-    return int(test_stat < 0)
+        return 1
+
+    q_da = float(np.trapezoid(i_da_use[:n_int], dx=dt))
+    q_sero = float(np.trapezoid(i_sero_use[:n_int], dx=dt))
+
+    from ..constants import get_nt_params
+
+    q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
+    q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
+    sign_da = 1.0 if q_eff_da >= 0 else -1.0
+    sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
+
+    raw_stat = (sign_da * q_da) - (sign_sero * q_sero)
+
+    if sigma_diff is None:
+        diff_samples = (sign_da * i_da_use[:n_int]) - (sign_sero * i_sero_use[:n_int])
+        sigma_est = float(np.std(diff_samples, ddof=1) * np.sqrt(dt))
+        sigma_diff = max(sigma_est, 1e-15)
+
+    sigma_norm = max(float(sigma_diff), 1e-15)
+    stat_zscore = raw_stat / sigma_norm
+    stat_whitened = stat_zscore
+
+    if detector_mode == 'raw':
+        decision_stat = raw_stat
+    elif detector_mode == 'whitened':
+        decision_stat = stat_whitened
+    else:
+        decision_stat = stat_zscore
+
+    return int(decision_stat < 0)
+
 
 # ------------------------------------------------------------------
 #  ML threshold calculation for CSK - Implements Eq. (44)

@@ -21,6 +21,7 @@ Usage (IEEE publication preset):
 
 from __future__ import annotations
 import argparse
+import csv
 import json
 import os
 import platform
@@ -32,7 +33,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Disable BLAS/OpenMP oversubscription for optimal process-level parallelism
@@ -62,9 +63,40 @@ sys.path.append(str(project_root))
 from analysis.ui_progress import ProgressManager
 from analysis.log_utils import setup_tee_logging
 
+try:
+    from argparse import BooleanOptionalAction  # type: ignore[attr-defined]
+except (ImportError, AttributeError):  # pragma: no cover - fallback for Python < 3.9
+    class BooleanOptionalAction(argparse.Action):  # type: ignore[no-redef]
+        def __init__(self, option_strings, dest, default=None, **kwargs):
+            if default is None:
+                default = True
+            super().__init__(option_strings=option_strings, dest=dest, nargs=0, default=default, **kwargs)
+            self._negative = {opt for opt in option_strings if opt.startswith("--no-")}
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            if option_string in self._negative:
+                setattr(namespace, self.dest, False)
+            else:
+                setattr(namespace, self.dest, True)
+
+OECT_FIG_RELATIVE = [
+    Path("results/figures/notebook_replicas/oect_differential_psd.png"),
+    Path("results/figures/notebook_replicas/oect_noise_breakdown.png"),
+]
+
+
+def _log_oect_figures(prefix: str = "[oect]") -> None:
+    """Emit a short status line for each expected OECT PSD figure."""
+    print(f"{prefix} Expected PSD figures:")
+    for rel_path in OECT_FIG_RELATIVE:
+        full_path = project_root / rel_path
+        status = "available" if full_path.exists() else "missing"
+        print(f"{prefix}   - {rel_path} ({status})")
+
 STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR = project_root / "results"
+GUARD_FRONTIER_MODES = ["mosk", "csk", "hybrid"]
 
 """# Results Data README
 
@@ -81,6 +113,10 @@ This folder contains CSVs produced by `analysis/run_final_analysis.py`.
 ## SNR semantics by mode
 - **MoSK** and **Hybrid (MoSK bit)**: SNR from the **MoSK contrast statistic** (sign-aware DA vs SERO), using **pre-CTRL** correlation in the denominator.
 - **CSK**: SNR from the **Q-statistic** used by the dual-channel combiner.
+
+## OECT PSD figures
+- `results/figures/notebook_replicas/oect_differential_psd.png`
+- `results/figures/notebook_replicas/oect_noise_breakdown.png`
 
 Notes:
 - Hybrid amplitude decisions use CTRL subtraction when enabled; MoSK decisions do not.
@@ -108,6 +144,85 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(dict(data), indent=2), encoding='utf-8')
     tmp.replace(path)
+
+
+def _parse_guard_variant(mode: str, path: Path) -> Optional[str]:
+    stem = path.stem
+    prefix = f"guard_frontier_{mode}"
+    if not stem.startswith(prefix):
+        return None
+    suffix = stem[len(prefix):]
+    if suffix.startswith("_"):
+        return suffix[1:]
+    return "" if not suffix else suffix
+
+
+def _discover_guard_frontier_variants() -> List[str]:
+    data_dir = RESULTS_DIR / "data"
+    if not data_dir.exists():
+        return []
+    variants: Set[str] = set()
+    for mode in GUARD_FRONTIER_MODES:
+        prefix = f"guard_frontier_{mode}"
+        for path in data_dir.glob(f"{prefix}*.csv"):
+            if not path.is_file() or path.stat().st_size == 0:
+                continue
+            variant = _parse_guard_variant(mode, path)
+            if variant is not None:
+                variants.add(variant)
+    # Sort with default (empty) first, then alphabetically
+    return sorted(variants, key=lambda v: (v != "", v))
+
+
+def _guard_frontier_ctrl_states(variant: str) -> Set[bool]:
+    data_dir = RESULTS_DIR / "data"
+    states: Set[bool] = set()
+    suffix = f"_{variant}" if variant else ""
+    required_cols = {"best_guard_factor", "max_irt_bps"}
+    for mode in GUARD_FRONTIER_MODES:
+        path = data_dir / f"guard_frontier_{mode}{suffix}.csv"
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    continue
+                header = {col.strip() for col in reader.fieldnames if col}
+                if not required_cols.issubset(header):
+                    continue
+                if 'use_ctrl' not in header:
+                    states.add(True)
+                    continue
+                for row in reader:
+                    val = (row or {}).get('use_ctrl')
+                    if val is None:
+                        continue
+                    token = str(val).strip().lower()
+                    if token in ("true", "1", "t", "yes"):
+                        states.add(True)
+                    elif token in ("false", "0", "f", "no"):
+                        states.add(False)
+        except Exception:
+            continue
+    return states
+
+
+def _build_guard_frontier_commands(plot_script: Path) -> List[List[str]]:
+    commands: List[List[str]] = []
+    if not plot_script.exists():
+        return commands
+    for variant in _discover_guard_frontier_variants():
+        ctrl_states = _guard_frontier_ctrl_states(variant)
+        if not ctrl_states:
+            continue
+        for ctrl_state in sorted(ctrl_states, reverse=True):
+            cmd = [sys.executable, "-u", str(plot_script)]
+            if variant:
+                cmd.extend(["--variant", variant])
+            cmd.extend(["--ctrl", "on" if ctrl_state else "off"])
+            commands.append(cmd)
+    return commands
 
 def _get_run_fingerprint(args: argparse.Namespace) -> str:
     """Generate a fingerprint for the current run configuration."""
@@ -561,6 +676,10 @@ def main() -> None:
     p.add_argument("--sequence-length", type=int, default=1000)
     p.add_argument("--recalibrate", action="store_true", help="Force recalibration (ignore JSON cache)")
     p.add_argument("--supplementary", action="store_true", help="Also generate supplementary figures")
+    p.add_argument("--supplementary-include-synthetic", action="store_true",
+                   help="Include synthetic supplementary panels (S3/S4/S6).")
+    p.add_argument("--supplementary-allow-fallback", action="store_true",
+                   help="Allow illustrative supplementary fallbacks when caches are missing.")
     p.add_argument("--baseline-isi", choices=["off", "on"], default="off",
                 help="ISI state for baseline SER/LoD sweeps; ISI trade-off always runs ON.")
     p.add_argument("--shared-pool", action="store_true", dest="shared_pool",
@@ -585,6 +704,8 @@ def main() -> None:
                    help="Run physical channel baselines (single-channel DA and dual-channel DA+SERO).")
     p.add_argument("--validate-theory", action="store_true",
                    help="Run analytic BER/SEP and diffusion validation figure scripts.")
+    p.add_argument("--gain-step", action=BooleanOptionalAction, default=True,
+                   help="Run the ΔI/ΔQ gain plot step (use --no-gain-step to skip).")
     p.add_argument("--nm-grid", type=str, default="",
                     help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
                          "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
@@ -749,7 +870,7 @@ def main() -> None:
                 args.distances = [
                     "MoSK=25,35,45,55,65,75,85,95,105,125,150,175,200",
                     "CSK=15,25,35,45,55,65,75,85,95,105,115,125",
-                    "Hybrid=15,20,25,30,35,40,45,55,65",
+                    "Hybrid=15,20,25,30,35,40,45,55,65,75,85,95,105,115,125,150",
                 ]
 
             # Force comprehensive coverage
@@ -902,30 +1023,47 @@ def main() -> None:
         ablation_runs = [True, False]  # BOTH (default)
 
     # Enhanced session metadata for GUI header
+    flag_list: List[str] = [
+        f"--num-seeds={args.num_seeds}",
+        f"--sequence-length={args.sequence_length}",
+        f"--ablation={args.ablation}",
+        f"--parallel-modes={args.parallel_modes}",
+        f"--target-ci={args.target_ci}",
+        f"--min-ci-seeds={args.min_ci_seeds}",
+        f"--lod-screen-delta={args.lod_screen_delta}",
+    ]
+    if args.preset:
+        flag_list.append(f"--preset={args.preset}")
+    if args.nt_pairs:
+        flag_list.append(f"--nt-pairs={args.nt_pairs}")
+    if args.nm_grid:
+        flag_list.append(f"--nm-grid={args.nm_grid}")
+    if args.csk_baselines:
+        flag_list.append("--csk-baselines")
+    if args.channel_suite:
+        flag_list.append("--channel-suite")
+    if args.validate_theory:
+        flag_list.append("--validate-theory")
+    if args.recalibrate:
+        flag_list.append("--recalibrate")
+    if args.extreme_mode:
+        flag_list.append("--extreme-mode")
+    elif args.beast_mode:
+        flag_list.append("--beast-mode")
+    if args.max_workers is not None:
+        flag_list.append(f"--max-workers={args.max_workers}")
+    if args.studies:
+        flag_list.append(f"--studies={args.studies}")
+    flag_list.append("--gain-step" if args.gain_step else "--no-gain-step")
+    flag_list.append("oect_psd")
+
     session_meta = {
         "modes": (["MoSK","CSK","Hybrid"] if args.modes.lower()=="all" else [args.modes]),
         "progress": args.progress,
         "resume": bool(args.resume and not args.reset),
         "with_ctrl": None if len(ablation_runs) == 2 else bool(ablation_runs[0]),
         "isi": args.baseline_isi == "on",  # Reflect actual baseline setting
-        "flags": [
-            f"--num-seeds={args.num_seeds}",
-            f"--sequence-length={args.sequence_length}",
-            f"--ablation={args.ablation}",
-            f"--parallel-modes={args.parallel_modes}",
-            f"--target-ci={args.target_ci}",
-            f"--min-ci-seeds={args.min_ci_seeds}",
-            f"--lod-screen-delta={args.lod_screen_delta}",
-        ] + ([f"--preset={args.preset}"] if args.preset else []) +
-            ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
-            ([f"--nm-grid={args.nm_grid}"] if args.nm_grid else []) +
-            (["--csk-baselines"] if args.csk_baselines else []) +
-            (["--channel-suite"] if args.channel_suite else []) +
-            (["--validate-theory"] if args.validate_theory else []) +
-            (["--recalibrate"] if args.recalibrate else []) +
-            (["--extreme-mode"] if args.extreme_mode else (["--beast-mode"] if args.beast_mode else [])) +
-            ([f"--max-workers={args.max_workers}"] if args.max_workers is not None else []) +
-            ([f"--studies={args.studies}"] if args.studies else [])
+        "flags": flag_list,
     }
 
     # Dynamic step plan: split simulate into per-ablation steps
@@ -937,7 +1075,10 @@ def main() -> None:
         steps.append("channel_suite")
     if args.validate_theory:
         steps.append("validate_theory")
-    steps += ["plots", "isi", "hybrid", "nb_replicas", "tables"]
+    steps.append("plots")
+    if args.gain_step:
+        steps.append("gain")
+    steps += ["snr_ts", "snr_panels", "oect_psd", "guard_frontier", "isi", "hybrid", "nb_replicas", "tables"]
     if "sensitivity" in studies_set:
         steps.append("study_sensitivity")
     if "capacity" in studies_set:
@@ -1466,11 +1607,120 @@ def main() -> None:
             _mark_done(state, "plots")
         sub["plots"].update(1); sub["plots"].close(); overall.update(1)
 
+        if "gain" in sub:
+            # --- Input-output gain plots ---
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("\U0001f6d1 Master pipeline stopped by user")
+                sys.exit(130)
+
+            if not (args.resume and state.get("gain", {}).get("done")):
+                gain_cmd = [sys.executable, "-u", "analysis/plot_input_output_gain.py"]
+                rc = _run_tracked(gain_cmd)
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "gain")
+                    print("\U0001f6d1 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "gain")
+                    sys.exit(rc)
+                _mark_done(state, "gain")
+            sub["gain"].update(1); sub["gain"].close(); overall.update(1)
+
+        # --- SNR vs Ts sweep ---
+        if master_cancelled.is_set():
+            _safe_close_progress(pm, overall, sub)
+            print("\U0001f6d1 Master pipeline stopped by user")
+            sys.exit(130)
+
+        if not (args.resume and state.get("snr_ts", {}).get("done")):
+            snr_modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+            for mode in snr_modes:
+                ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
+                rc = _run_tracked(ts_cmd)
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "snr_ts")
+                    print("\U0001f6d1 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "snr_ts")
+                    sys.exit(rc)
+            _mark_done(state, "snr_ts")
+        sub["snr_ts"].update(1); sub["snr_ts"].close(); overall.update(1)
+
+        # --- SNR summary panels ---
+        if master_cancelled.is_set():
+            _safe_close_progress(pm, overall, sub)
+            print("\U0001f6d1 Master pipeline stopped by user")
+            sys.exit(130)
+
+        if not (args.resume and state.get("snr_panels", {}).get("done")):
+            panel_cmd = [sys.executable, "-u", "analysis/plot_snr_panels.py"]
+            modes_arg = args.modes if hasattr(args, "modes") else getattr(args, "mode", "MoSK")
+            if modes_arg:
+                panel_cmd.extend(["--modes", modes_arg])
+            rc = _run_tracked(panel_cmd)
+            if rc == 130:
+                _safe_close_progress(pm, overall, sub, "snr_panels")
+                print("\U0001f6d1 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
+                _safe_close_progress(pm, overall, sub, "snr_panels")
+                sys.exit(rc)
+            _mark_done(state, "snr_panels")
+        sub["snr_panels"].update(1); sub["snr_panels"].close(); overall.update(1)
+
+        # --- OECT PSD & notebook replica figures ---
+        if master_cancelled.is_set():
+            _safe_close_progress(pm, overall, sub)
+            print("\U0001f6d1 Master pipeline stopped by user")
+            sys.exit(130)
+
+        if not (args.resume and state.get("oect_psd", {}).get("done")):
+            rc = _run_tracked([sys.executable, "-u", "analysis/rebuild_oect_figs.py"])
+            if rc == 130:
+                _safe_close_progress(pm, overall, sub, "oect_psd")
+                print("\U0001f6d1 Master pipeline stopped by user")
+                sys.exit(130)
+            elif rc != 0:
+                _safe_close_progress(pm, overall, sub, "oect_psd")
+                sys.exit(rc)
+            _mark_done(state, "oect_psd")
+            _log_oect_figures()
+        else:
+            _log_oect_figures(prefix="[oect-cached]")
+        sub["oect_psd"].update(1); sub["oect_psd"].close(); overall.update(1)
+
         # Check cancellation before ISI step
         if master_cancelled.is_set():
             _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
+
+        # Check cancellation before guard-frontier plots
+        if master_cancelled.is_set():
+            _safe_close_progress(pm, overall, sub)
+            print("?? Master pipeline stopped by user")
+            sys.exit(130)
+
+        # --- Guard frontier plots ---
+        if not (args.resume and state.get("guard_frontier", {}).get("done")):
+            guard_script = project_root / "analysis" / "plot_guard_frontier.py"
+            guard_commands = _build_guard_frontier_commands(guard_script)
+            if guard_commands:
+                for cmd in guard_commands:
+                    rc = _run_tracked(cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, "guard_frontier")
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, "guard_frontier")
+                        sys.exit(rc)
+            else:
+                print("?? Guard frontier plot skipped: no guard_frontier CSVs detected.")
+            _mark_done(state, "guard_frontier")
+        sub["guard_frontier"].update(1); sub["guard_frontier"].close(); overall.update(1)
 
         # --- ISI trade-off ---
         if not (args.resume and state.get("isi", {}).get("done")):
@@ -1630,14 +1880,18 @@ def main() -> None:
         if "supplementary" in sub:
             if master_cancelled.is_set():
                 _safe_close_progress(pm, overall, sub)
-                print("🛑 Master pipeline stopped by user")
+                print("[stop] Master pipeline stopped by user")
                 sys.exit(130)
             if not (args.resume and state.get("supplementary", {}).get("done")):
-                rc = _run_tracked([sys.executable, "-u", "analysis/generate_supplementary_figures.py",
-                           "--strict", "--only-data"])
+                supp_cmd = [sys.executable, "-u", "analysis/generate_supplementary_figures.py"]
+                if args.supplementary_include_synthetic:
+                    supp_cmd.append("--include-synthetic")
+                if args.supplementary_allow_fallback:
+                    supp_cmd.append("--allow-fallback")
+                rc = _run_tracked(supp_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, "supplementary")
-                    print("🛑 Master pipeline stopped by user")
+                    print("[stop] Master pipeline stopped by user")
                     sys.exit(130)
                 elif rc != 0:
                     _safe_close_progress(pm, overall, sub, "supplementary")
@@ -1681,6 +1935,7 @@ def main() -> None:
     elapsed = (time.time() - t0) / 60.0
     print(f"\n✓ All steps completed in {elapsed:.1f} min")
     print(f"Results in: {project_root / 'results'}")
+    _log_oect_figures(prefix="[oect-summary]")
 
 if __name__ == "__main__":
     main()

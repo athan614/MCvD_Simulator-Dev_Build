@@ -107,7 +107,7 @@ detection:
   #mu0_glu: 2.442e-05           # Mean charge for GLU class
   #mu1_gaba: -2.620e-05         # Mean charge for GABA class
   show_progress: true          # Show progress bars
-  decision_window_policy: fraction_of_Ts
+  decision_window_policy: full_ts
   decision_window_fraction: 0.9  # integrate the last 90* of Ts
   # optional: min_decision_samples: 32
 
@@ -136,6 +136,7 @@ pipeline:
   csk_leakage_frac: 0.0           # fractional mean leakage on the 'other' channel (0–0.2 typical)
   csk_store_combiner_meta: true   # persist combiner + (σ,ρ) into CSVs
   isi_memory_cap_symbols: 60   # cap the ISI tail
+  detector_mode: "zscore"       # Detector statistic: zscore | raw | whitened
 
   # -------- Advanced Optimization Parameters --------
   # Adaptive calibration tuning (Issue 1 optimization)

@@ -38,23 +38,29 @@ def to_int(value):
 def _resolve_decision_window(cfg: Dict[str, Any], Ts: float, dt: float) -> float:
     """
     Resolve decision window based on policy: 'fixed', 'fraction_of_Ts', or 'full_Ts'.
-    Default is 'fixed' for backward compatibility.
+
+    The simulator now defaults to integrating over the full symbol period so that
+    analytics and Monte Carlo experiments share the same decision window policy.
+    The resolved window is written back into ``cfg['detection']['decision_window_s']``
+    so downstream code (noise model, logging, plotting) observes a consistent value.
     """
-    det = cfg.get('detection', {})
-    policy = str(det.get('decision_window_policy', 'fixed')).lower()
-    
+    detection = cfg.setdefault('detection', {})
+    policy = str(detection.get('decision_window_policy', 'full_ts')).lower()
+
     if policy in ('full_ts', 'full', 'ts'):
         win_s = Ts
-    elif policy in ('fraction_of_ts', 'fraction', 'frac'):
-        frac = float(det.get('decision_window_fraction', 0.9))
-        frac = min(max(frac, 0.1), 1.0)  # clamp to 10–100%
+    elif policy in ('fraction_of_ts', 'fraction', 'frac', 'tail', 'tail_fraction'):
+        frac = float(detection.get('decision_window_fraction', 0.9))
+        frac = min(max(frac, 0.1), 1.0)
         win_s = frac * Ts
     else:  # 'fixed' (legacy)
-        win_s = float(det.get('decision_window_s', Ts))
+        win_s = float(detection.get('decision_window_s', Ts))
 
-    # Guardrails: at least N samples; never exceed Ts
-    min_samples = int(det.get('min_decision_samples', 16))
+    min_samples = int(detection.get('min_decision_samples', 16))
     win_s = max(min_samples * dt, min(win_s, Ts))
+
+    detection['decision_window_s'] = win_s
+    cfg['detection'] = detection
     return win_s
 
 def _csk_dual_channel_Q(
@@ -193,13 +199,16 @@ def calculate_proper_noise_sigma(
     total_single_var = thermal_var_single + flicker_var_single + drift_var_single
     sigma_single = math.sqrt(max(total_single_var, 0.0))
 
-    # Enhanced: Mode-aware noise calculation
-    use_ctrl_flag = bool(cfg.get('pipeline', {}).get('use_control_channel', True))
-    mod = str(cfg.get('pipeline', {}).get('modulation', '')).upper()
+    pipeline_cfg = cfg.get('pipeline', {})
+    modulation = str(pipeline_cfg.get('modulation', '')).upper()
+
+    # Enhanced: Mode-aware noise calculation (MoSK never applies CTRL subtraction)
+    use_ctrl_flag = bool(pipeline_cfg.get('use_control_channel', True))
     effective_rho = float(np.clip(noise_cfg.get('effective_correlation', rho_corr), -0.999, 0.999))  # Allow override with clamp
 
-    # For MoSK we never subtract CTRL from the charges, so noise is single-ended even if CTRL is "enabled".
-    use_ctrl_for_noise = (use_ctrl_flag and mod != 'MOSK')
+    # Mirror detector behaviour: when the control channel is active, apply the
+    # differential noise rejection. Otherwise remain single-ended.
+    use_ctrl_for_noise = use_ctrl_flag and modulation not in ('MOSK',)
 
     if use_ctrl_for_noise:
         # Differential measurement: benefits from common-mode rejection
@@ -219,6 +228,13 @@ def calculate_proper_noise_sigma(
     # Increased floor slightly for robustness
     sigma = max(sigma_effective, 1e-15)
 
+    rho_pre = float(np.clip(noise_cfg.get('rho_corr', rho_corr), -0.999, 0.999))
+    rho_for_diff = effective_rho if use_ctrl_for_noise else rho_pre
+    sigma_diff_charge = math.sqrt(max(
+        2.0 * total_single_var - 2.0 * rho_for_diff * (sigma_single ** 2),
+        0.0
+    ))
+
     if components_out is not None:
         components_out.clear()
         total_eff = max(total_effective_var, 0.0)
@@ -232,12 +248,14 @@ def calculate_proper_noise_sigma(
             'total_sigma': float(sigma),
             'single_ended_sigma': float(max(sigma_single, 1e-15)),
             'use_ctrl_for_noise': float(1.0 if use_ctrl_for_noise else 0.0),
-            'rho_used': float(effective_rho if use_ctrl_for_noise else 0.0),
+            'rho_used': float(rho_for_diff),
+            'rho_pre_ctrl': float(rho_pre),
             'detection_window_s': float(T_int),
             'I_dc_used_A': float(I_dc),
             'V_g_bias_used_V': float(V_g_bias),
             'gm_S': float(gm),
             'C_tot_F': float(C_tot),
+            'sigma_diff_charge': float(max(sigma_diff_charge, 1e-15)),
         })
 
     return sigma, sigma
@@ -586,7 +604,12 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     mod = cfg['pipeline']['modulation']
     L = cfg['pipeline']['sequence_length']
     rng = default_rng(cfg['pipeline'].get('random_seed'))
-    
+
+    detector_mode = str(cfg['pipeline'].get('detector_mode', 'zscore')).lower()
+    if detector_mode not in ('zscore', 'raw', 'whitened'):
+        detector_mode = 'zscore'
+    cfg['pipeline']['detector_mode'] = detector_mode
+
     tx_history: List[Tuple[int, float]] = []
     subsymbol_errors = {'mosk': 0, 'csk': 0}
     thresholds_used: Dict[str, Any] = {}
@@ -606,6 +629,14 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     rx_symbols = np.zeros(L, dtype=int)
     stats_da = []
     stats_sero = []
+    stats_charge_da: List[float] = []
+    stats_charge_sero: List[float] = []
+    stats_current_da: List[float] = []
+    stats_current_sero: List[float] = []
+    constellation_points: List[Dict[str, float]] = []
+    mosk_stats_raw: List[float] = []
+    mosk_stats_z: List[float] = []
+    mosk_stats_whitened: List[float] = []
 
     # enable metric collection for this run
     cfg['collect_isi_metrics'] = True
@@ -629,6 +660,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     from copy import deepcopy
     cfg_mosk = deepcopy(cfg)
     cfg_mosk['pipeline']['modulation'] = 'MoSK'  # force single-ended sigmas
+    cfg_mosk['pipeline']['use_control_channel'] = False
     sigma_da_mosk, sigma_sero_mosk = calculate_proper_noise_sigma(cfg_mosk, detection_window_s)
 
     # Enhanced: Mode-aware correlation selection
@@ -663,7 +695,21 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         - 2.0 * rho_pre * sigma_da_mosk * sigma_sero_mosk,
         0.0
     )))
-    
+
+    frozen_noise = cfg['pipeline'].get('_frozen_noise')
+    if isinstance(frozen_noise, dict):
+        detection_window_s = float(frozen_noise.get('detection_window_s', detection_window_s))
+        cfg.setdefault('detection', {})['decision_window_s'] = detection_window_s
+        sigma_da = float(frozen_noise.get('sigma_da', sigma_da))
+        sigma_sero = float(frozen_noise.get('sigma_sero', sigma_sero))
+        sigma_diff = float(frozen_noise.get('sigma_diff', sigma_diff))
+        sigma_diff_mosk = float(frozen_noise.get('sigma_diff_mosk', sigma_diff_mosk))
+        rho_for_diff = float(frozen_noise.get('rho_for_diff', rho_for_diff))
+        rho_override = frozen_noise.get('rho_cc')
+        if rho_override is not None:
+            rho_cc = float(rho_override)
+        noise_components = dict(frozen_noise.get('noise_components', noise_components))
+
     # FIX B: Use measured ρ_post whenever available; fall back to config otherwise
     rho_cc_measured = cfg['pipeline'].get('rho_cc_measured')
     if rho_cc_measured is not None:
@@ -702,6 +748,18 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         sig_sero = (ia - ic) if subtract_for_q else ia
         q_da = float(np.trapezoid(sig_da[:n_detect_samples], dx=dt))
         q_sero = float(np.trapezoid(sig_sero[:n_detect_samples], dx=dt))
+        window_s = n_detect_samples * dt
+        mean_i_da = q_da / window_s if window_s > 0 else 0.0
+        mean_i_sero = q_sero / window_s if window_s > 0 else 0.0
+
+        constellation_points.append({
+            "symbol_index": float(i),
+            "symbol_tx": float(s_tx),
+            "q_da": q_da,
+            "q_sero": q_sero,
+            "use_ctrl": 1.0 if use_ctrl else 0.0,
+            "subtract_ctrl": 1.0 if subtract_for_q else 0.0,
+        })
 
         # Patch 4: ISI Memory Equalizer with K-tap tail cancellation
         if cfg['pipeline'].get('enable_isi_equalizer', False) and len(tx_history) > 1:
@@ -723,14 +781,28 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         # sigma_da, sigma_sero already available from above
 
         if mod == 'MoSK':
-            # Same statistic used during calibration (sign-aware difference; no CTRL subtraction here)
+            # Use the same statistic family employed during calibration (sign-aware difference).
             q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
             q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
             sign_da = 1.0 if q_eff_da >= 0 else -1.0
             sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
 
-            numer = (sign_da * q_da) - (sign_sero * q_sero)
-            decision_stat = numer / (sigma_diff if sigma_diff > 1e-15 else 1e-15)
+            raw_stat = (sign_da * q_da) - (sign_sero * q_sero)
+            sigma_norm = sigma_diff if sigma_diff > 1e-15 else 1e-15
+            stat_zscore = raw_stat / sigma_norm
+            # In 1-D the whitened statistic collapses to the z-score.
+            stat_whitened = stat_zscore
+
+            if detector_mode == 'raw':
+                decision_stat = raw_stat
+            elif detector_mode == 'whitened':
+                decision_stat = stat_whitened
+            else:
+                decision_stat = stat_zscore
+
+            mosk_stats_raw.append(raw_stat)
+            mosk_stats_z.append(stat_zscore)
+            mosk_stats_whitened.append(stat_whitened)
 
             # Honor comparator direction saved by calibration (default to '>')
             threshold = float(cfg['pipeline'].get('mosk_threshold', 0.0))
@@ -741,50 +813,44 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 s_rx = 0 if decision_stat < threshold else 1
             rx_symbols[i] = s_rx
             
-            # Patch 5: Guardrails to catch future regressions
-            if i == 0:  # Log once per sequence
-                # Validate decision statistic makes sense
+            # Guardrails to catch future regressions (log once per sequence)
+            if i == 0:
                 stat_magnitude = abs(decision_stat)
                 charge_magnitude = max(abs(q_da), abs(q_sero))
-                
-                # FIX: Compare like-for-like since decision_stat is normalized
-                if cfg['pipeline'].get('mosk_statistic', 'sign_aware_diff') == 'sign_aware_diff':
-                    # Decision statistic is normalized (dimensionless), compare to its typical scale (~O(1))
-                    ref_scale = 10.0  # Reasonable for normalized statistics
+
+                if detector_mode == 'raw':
+                    ref_scale = max(charge_magnitude * 10.0, 1e-21)
+                    threshold_ref_scale = ref_scale
                 else:
-                    # Raw units - compare to charge scale
-                    ref_scale = 1000 * charge_magnitude
-                
+                    ref_scale = 10.0  # Reasonable for dimensionless statistics
+                    threshold_ref_scale = 10.0
+
                 if stat_magnitude > ref_scale:
-                    logger.warning(f"MoSK decision statistic suspiciously large: {decision_stat:.2e} "
-                                f"vs expected scale ~{ref_scale:.1f}. Check for normalization error.")
-                
+                    logger.warning(
+                        f"MoSK decision statistic suspiciously large: {decision_stat:.2e} "
+                        f"vs expected scale ~{ref_scale:.1f}. Check for normalization error."
+                    )
+
                 threshold_magnitude = abs(threshold)
-                if cfg['pipeline'].get('mosk_statistic', 'sign_aware_diff') == 'sign_aware_diff':
-                    # Threshold should also be normalized (dimensionless)
-                    threshold_ref_scale = 10.0  # Reasonable for normalized thresholds
-                else:
-                    # Raw threshold units
-                    threshold_ref_scale = 1000 * charge_magnitude
-                    
                 if threshold_magnitude > threshold_ref_scale:
-                    logger.warning(f"MoSK threshold suspiciously large: {threshold:.2e} "
-                                f"vs expected scale ~{threshold_ref_scale:.1f}. Check for units.")
-                
-                # Validate threshold in matching units. When using the normalized MoSK
-                # statistic ('sign_aware_diff'), the threshold is dimensionless, so
-                # comparing to a Coulomb scale is meaningless (avoid false positives).
-                if cfg['pipeline'].get('mosk_statistic', 'sign_aware_diff') != 'sign_aware_diff':
-                    if abs(threshold) > charge_magnitude * 10:
-                        logger.warning(f"MoSK threshold suspiciously large: {threshold:.2e} "
-                                       f"vs typical charge {charge_magnitude:.2e}")
-                
-                logger.info(f"MoSK decision: stat={decision_stat:.2e}, thresh={threshold:.2e}, "
-                        f"charges=[{q_da:.2e}, {q_sero:.2e}]")
+                    logger.warning(
+                        f"MoSK threshold suspiciously large: {threshold:.2e} "
+                        f"vs expected scale ~{threshold_ref_scale:.1f}. Check for units."
+                    )
+
+                logger.info(
+                    f"MoSK decision ({detector_mode}): stat={decision_stat:.2e}, "
+                    f"thresh={threshold:.2e}, charges=[{q_da:.2e}, {q_sero:.2e}]"
+                )
+
             if s_tx == 0:
                 stats_da.append(decision_stat)
+                stats_charge_da.append(q_da)
+                stats_current_da.append(mean_i_da)
             else:
                 stats_sero.append(decision_stat)
+                stats_charge_sero.append(q_sero)
+                stats_current_sero.append(mean_i_sero)
           
         elif mod == 'CSK':
             # Get CSK configuration parameters
@@ -794,7 +860,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             combiner = cfg['pipeline'].get('csk_selected_combiner', combiner_cfg)  # Use selected if present
             use_dual = bool(cfg['pipeline'].get('csk_dual_channel', True))
             leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
-            
+
             # Tail-gated integration
             tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
             tail = min(max(tail, 0.1), 1.0)  # clamp
@@ -808,56 +874,91 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             # Tail-gated trapezoid integration
             q_da = float(np.trapezoid(sig_da[i0:n_detect_samples], dx=dt))
             q_sero = float(np.trapezoid(sig_sero[i0:n_detect_samples], dx=dt))
+            tail_samples = max(n_detect_samples - i0, 0)
+            tail_window_s = tail_samples * dt
+            mean_i_da = q_da / tail_window_s if tail_window_s > 0 else 0.0
+            mean_i_sero = q_sero / tail_window_s if tail_window_s > 0 else 0.0
 
-            # Compute dual-channel decision statistic Q
+            # Detector-mode aware statistics
+            primary_is_da = target_channel.upper() == 'DA'
+            primary_charge = q_da if primary_is_da else q_sero
+            primary_current = mean_i_da if primary_is_da else mean_i_sero
+            stat_raw = primary_charge
+
             if use_dual:
-                Q = _csk_dual_channel_Q(
+                stat_zscore = _csk_dual_channel_Q(
                     q_da=q_da, q_sero=q_sero,
                     sigma_da=sigma_da, sigma_sero=sigma_sero,
                     rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
                     target=target_channel,
                     cfg=cfg
                 )
+                stat_whitened = _csk_dual_channel_Q(
+                    q_da=q_da, q_sero=q_sero,
+                    sigma_da=sigma_da, sigma_sero=sigma_sero,
+                    rho_cc=rho_cc, combiner='whitened', leakage_frac=leakage,
+                    target=target_channel,
+                    cfg=cfg
+                )
             else:
-                # Legacy single-channel behavior
-                Q = q_da if target_channel == 'DA' else q_sero
+                sigma_primary = sigma_da if primary_is_da else sigma_sero
+                sigma_primary = max(sigma_primary, 1e-15)
+                stat_zscore = primary_charge / sigma_primary
+                stat_whitened = stat_zscore
+
+            stat_map = {
+                'raw': stat_raw,
+                'zscore': stat_zscore,
+                'whitened': stat_whitened
+            }
+            decision_stat = stat_map.get(detector_mode, stat_zscore)
 
             # Get thresholds from configuration
             threshold_key = f'csk_thresholds_{target_channel.lower()}'
             thresholds = cfg['pipeline'].get(threshold_key, [])
             if not thresholds:
                 logger.warning(f"CSK thresholds missing for {threshold_key}. Symbol detection will default to level 0.")
-            
+
             # Use data-driven orientation (not q_eff)
             q_eff_target = get_nt_params(cfg, target_channel)['q_eff_e']
             increasing = bool(cfg['pipeline'].get('csk_thresholds_increasing',
                                                 True if q_eff_target > 0 else False))
-            
+
             # CSK symbol detection
             s_rx = 0
             # Use the orientation determined during calibration
             for thresh in thresholds:
                 if increasing:
-                    if Q > thresh:
+                    if decision_stat > thresh:
                         s_rx += 1
                     else:
                         break
                 else:
-                    if Q < thresh:
+                    if decision_stat < thresh:
                         s_rx += 1
                     else:
                         break
             rx_symbols[i] = s_rx
-            
+
             # Store decision statistics for analysis
-            (stats_da if s_tx < M/2 else stats_sero).append(Q)
+            if s_tx < M/2:
+                stats_da.append(decision_stat)
+                stats_charge_da.append(primary_charge)
+                stats_current_da.append(primary_current)
+            else:
+                stats_sero.append(decision_stat)
+                stats_charge_sero.append(primary_charge)
+                stats_current_sero.append(primary_current)
 
             # Log configuration on first symbol (for debugging)
             if i == 0:
                 cb = cfg['pipeline'].get('csk_selected_combiner', combiner)
-                logger.info(f"CSK combiner={cb}, dual={use_dual}, σ=[{sigma_da:.2e},{sigma_sero:.2e}], "
-                            f"ρcc={rho_cc:+.2f}, increasing={increasing}, leakage={leakage:.2f}")
-              
+                logger.info(
+                    f"CSK combiner={cb}, dual={use_dual}, mode={detector_mode}, "
+                    f"sigma=[{sigma_da:.2e},{sigma_sero:.2e}], rho_cc={rho_cc:+.2f}, "
+                    f"increasing={increasing}, leakage={leakage:.2f}, stat={decision_stat:.2e}"
+                )
+
         elif mod == 'Hybrid':
             # Align MoSK integration window with calibration (tail-gated)
             tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
@@ -865,58 +966,94 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             i0 = int((1.0 - tail) * n_detect_samples)
             q_da_raw = float(np.trapezoid(ig[i0:n_detect_samples], dx=dt))
             q_sero_raw = float(np.trapezoid(ia[i0:n_detect_samples], dx=dt))
+            tail_samples = max(n_detect_samples - i0, 0)
+            tail_window_s = tail_samples * dt
+            mean_i_da_raw = q_da_raw / tail_window_s if tail_window_s > 0 else 0.0
+            mean_i_sero_raw = q_sero_raw / tail_window_s if tail_window_s > 0 else 0.0
 
             # Use MoSK decision statistic with proper single-ended noise
             sign_da = 1.0 if q_eff_da >= 0 else -1.0
             sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
-            decision_stat = (sign_da * q_da_raw - sign_sero * q_sero_raw) / max(sigma_diff_mosk, 1e-15)
+            raw_stat_mosk = (sign_da * q_da_raw) - (sign_sero * q_sero_raw)
+            sigma_norm_mosk = sigma_diff_mosk if sigma_diff_mosk > 1e-15 else 1e-15
+            zscore_mosk = raw_stat_mosk / sigma_norm_mosk
+            whitened_mosk = zscore_mosk
+
+            if detector_mode == 'raw':
+                decision_stat_mosk = raw_stat_mosk
+            elif detector_mode == 'whitened':
+                decision_stat_mosk = whitened_mosk
+            else:
+                decision_stat_mosk = zscore_mosk
 
             threshold_mosk = float(cfg['pipeline'].get('mosk_threshold', 0.0))
             comparator = str(cfg['pipeline'].get('mosk_comparator', '>'))
-            b_hat = (0 if (decision_stat > threshold_mosk) else 1) if comparator == '>' \
-                    else (0 if (decision_stat < threshold_mosk) else 1)
+            if comparator == '>':
+                b_hat = 0 if (decision_stat_mosk > threshold_mosk) else 1
+            else:
+                b_hat = 0 if (decision_stat_mosk < threshold_mosk) else 1
 
             # Recompute amplitude charges with tail-gated window and CTRL treatment
             use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
 
             # Tail-gated window (same as used for MoSK statistic above)
-            # i0 and n_detect_samples are already defined in the Hybrid block above
-            sig_da_amp   = (ig - ic) if use_ctrl else ig
+            sig_da_amp = (ig - ic) if use_ctrl else ig
             sig_sero_amp = (ia - ic) if use_ctrl else ia
-            q_da_amp     = float(np.trapezoid(sig_da_amp[i0:n_detect_samples], dx=dt))
-            q_sero_amp   = float(np.trapezoid(sig_sero_amp[i0:n_detect_samples], dx=dt))
+            q_da_amp = float(np.trapezoid(sig_da_amp[i0:n_detect_samples], dx=dt))
+            q_sero_amp = float(np.trapezoid(sig_sero_amp[i0:n_detect_samples], dx=dt))
+            mean_i_da_amp = q_da_amp / tail_window_s if tail_window_s > 0 else 0.0
+            mean_i_sero_amp = q_sero_amp / tail_window_s if tail_window_s > 0 else 0.0
 
-            # NEW: Use the dual‑channel combiner for the amplitude bit (like CSK)
-            combiner = str(cfg['pipeline'].get('hybrid_combiner', cfg['pipeline'].get('csk_combiner','zscore')))
-            leakage  = float(cfg['pipeline'].get('hybrid_leakage_frac', cfg['pipeline'].get('csk_leakage_frac', 0.0)))
-            target   = 'DA' if b_hat == 0 else 'SERO'
-            Q_amp = _csk_dual_channel_Q(
+            # Use the dual-channel combiner for the amplitude bit (like CSK)
+            combiner = str(cfg['pipeline'].get('hybrid_combiner', cfg['pipeline'].get('csk_combiner', 'zscore')))
+            leakage = float(cfg['pipeline'].get('hybrid_leakage_frac', cfg['pipeline'].get('csk_leakage_frac', 0.0)))
+            target = 'DA' if b_hat == 0 else 'SERO'
+            stat_raw_amp = q_da_amp if target == 'DA' else q_sero_amp
+            stat_zscore_amp = _csk_dual_channel_Q(
                 q_da=q_da_amp, q_sero=q_sero_amp,
                 sigma_da=sigma_da, sigma_sero=sigma_sero,
                 rho_cc=rho_cc,
                 combiner=combiner, leakage_frac=leakage,
                 target=target, cfg=cfg
             )
+            stat_whitened_amp = _csk_dual_channel_Q(
+                q_da=q_da_amp, q_sero=q_sero_amp,
+                sigma_da=sigma_da, sigma_sero=sigma_sero,
+                rho_cc=rho_cc,
+                combiner='whitened', leakage_frac=leakage,
+                target=target, cfg=cfg
+            )
 
-            # NEW: Use calibrated thresholds on Q_amp with data-driven orientation
+            stat_map_amp = {
+                'raw': stat_raw_amp,
+                'zscore': stat_zscore_amp,
+                'whitened': stat_whitened_amp
+            }
+            decision_stat_amp = stat_map_amp.get(detector_mode, stat_zscore_amp)
+
+            # Use calibrated thresholds on the amplitude statistic with data-driven orientation
             if b_hat == 0:
-                tau   = float(cfg['pipeline'].get('hybrid_threshold_da', 0.0))
-                inc   = bool(cfg['pipeline'].get('hybrid_threshold_da_increasing', True))
+                tau = float(cfg['pipeline'].get('hybrid_threshold_da', 0.0))
+                inc = bool(cfg['pipeline'].get('hybrid_threshold_da_increasing', True))
             else:
-                tau   = float(cfg['pipeline'].get('hybrid_threshold_sero', 0.0))
-                inc   = bool(cfg['pipeline'].get('hybrid_threshold_sero_increasing', True))
-            l_hat = 1 if ((Q_amp > tau) if inc else (Q_amp < tau)) else 0
+                tau = float(cfg['pipeline'].get('hybrid_threshold_sero', 0.0))
+                inc = bool(cfg['pipeline'].get('hybrid_threshold_sero_increasing', True))
+            l_hat = 1 if ((decision_stat_amp > tau) if inc else (decision_stat_amp < tau)) else 0
 
             # Construct final symbol
             s_rx = (b_hat << 1) | l_hat
             rx_symbols[i] = s_rx
 
-            # ✅ For SNR diagnostics: store the *MoSK decision statistic* by TRUE molecule class (not by decision)
+            # For SNR diagnostics: store the MoSK decision statistic by TRUE molecule class (not by decision)
             true_mol_bit = (s_tx >> 1)
             if true_mol_bit == 0:
-                stats_da.append(decision_stat)
+                stats_da.append(decision_stat_mosk)
+                stats_charge_da.append(q_da_raw)
+                stats_current_da.append(mean_i_da_raw)
             else:
-                stats_sero.append(decision_stat)
+                stats_sero.append(decision_stat_mosk)
+                stats_charge_sero.append(q_sero_raw)
+                stats_current_sero.append(mean_i_sero_raw)
 
             true_mol_bit = s_tx >> 1
             true_amp_bit = s_tx & 1
@@ -924,10 +1061,10 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if b_hat != true_mol_bit:
                 subsymbol_errors['mosk'] += 1
             else:
-                mosk_correct += 1                # Count symbols that pass MoSK and "expose" CSK
+                mosk_correct += 1                # Count symbols that pass MoSK and expose CSK
                 if l_hat != true_amp_bit:
                     subsymbol_errors['csk'] += 1
-                
+
     # Calculate errors
     errors = np.sum(tx_symbols != rx_symbols)
 
@@ -944,10 +1081,19 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "SER": errors / L if L > 0 else 0,
         "stats_da": stats_da,
         "stats_sero": stats_sero,
+        "stats_charge_da": stats_charge_da,
+        "stats_charge_sero": stats_charge_sero,
+        "stats_current_da": stats_current_da,
+        "stats_current_sero": stats_current_sero,
+        "constellation_points": constellation_points,
+        "mosk_stats_raw": mosk_stats_raw,
+        "mosk_stats_zscore": mosk_stats_z,
+        "mosk_stats_whitened": mosk_stats_whitened,
         "subsymbol_errors": subsymbol_errors,
         "thresholds_used": thresholds_used,
         "isi_ratio_mean": isi_ratio_mean,
         "isi_ratio_median": isi_ratio_median,
+        "detector_mode": detector_mode,
         # Stage 14: reproducibility knobs
         'noise_sigma_da': float(sigma_da),
         'noise_sigma_sero': float(sigma_sero),
@@ -956,11 +1102,25 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         'noise_sigma_flicker': float(noise_components.get('flicker_sigma', float('nan'))),
         'noise_sigma_drift': float(noise_components.get('drift_sigma', float('nan'))),
         'noise_thermal_fraction': float(noise_components.get('thermal_fraction', float('nan'))),
+        'noise_sigma_diff_charge': float(noise_components.get('sigma_diff_charge', float('nan'))),
+        'noise_sigma_single': float(noise_components.get('single_ended_sigma', float('nan'))),
+        'rho_pre_ctrl': float(noise_components.get('rho_pre_ctrl', float('nan'))),
         'I_dc_used_A': float(noise_components.get('I_dc_used_A', float('nan'))),
         'V_g_bias_V_used': float(noise_components.get('V_g_bias_used_V', float('nan'))),
         'gm_S': float(noise_components.get('gm_S', float('nan'))),
         'C_tot_F': float(noise_components.get('C_tot_F', float('nan'))),
+        'detection_window_s': float(detection_window_s),
+        'burst_shape': str(cfg.get('burst_shape', 'rect')),
+        'T_release_ms': float(cfg.get('T_release_ms', 0.0)),
     }
+
+    freeze_active = bool(cfg['pipeline'].get('_freeze_calibration_active', False))
+    if freeze_active:
+        result['calibration_frozen'] = True
+        result['calibration_baseline_id'] = str(cfg['pipeline'].get('_freeze_baseline_id', ''))
+    else:
+        result['calibration_frozen'] = False
+        result['calibration_baseline_id'] = ''
 
     # Add MoSK sigma metadata for Hybrid mode
     if mod == 'Hybrid':
@@ -979,7 +1139,12 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             bits_csk_realized = float('nan')
 
         result['mosk_sigma_diff_used'] = float(sigma_diff_mosk)
-        result['mosk_stat_units'] = 'normalized_by_sigma_diff_single_ended_preCTRL'
+        if detector_mode == 'raw':
+            result['mosk_stat_units'] = 'raw_charge'
+        elif detector_mode == 'whitened':
+            result['mosk_stat_units'] = 'whitened_sigma_diff'
+        else:
+            result['mosk_stat_units'] = 'normalized_sigma_diff'
         result['n_mosk_correct'] = int(mosk_correct)
         result['mosk_ser'] = float(mosk_ser)
         result['csk_ser'] = float(csk_ser)

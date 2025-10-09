@@ -1,11 +1,11 @@
 # analysis/generate_supplementary_figures.py
 """
-Generate supplementary figures S3–S6 for the TMBMC paper.
+Generate supplementary figures S3-S6 for the TMBMC paper.
 
-S3: Constellations (illustrative; gated to synthetic points for now)
-S4: SNR types I–III (illustrative)
+S3: Constellations (data-driven from cached constellation points)
+S4: SNR types I-III (synthetic, optional)
 S5: Confusion matrices (plots + an .npz artifact with proper ArrayLike dtypes)
-S6: Energy/bit (illustrative; reads temperature from config)
+S6: Energy/bit (synthetic, optional)
 
 Type-safety notes:
 - All numeric values passed to Matplotlib are cast to 'float' to avoid
@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 from analysis.ieee_plot_style import apply_ieee_style
 
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -44,6 +45,8 @@ from src.config_utils import preprocess_config  # noqa: E402
 
 # ENHANCEMENT: Import canonical value key formatter for consistent CSV ↔ cache matching
 from analysis.run_final_analysis import canonical_value_key  # noqa: E402
+
+import json
 
 
 # ---------- small helpers (type-safe plotting & saving) ----------------------
@@ -125,6 +128,127 @@ def _save_confusions_npz(
     # Finally write to disk (cast kwargs to Any to satisfy typing of numpy stubs)
     np.savez(npz_path, **cast(Dict[str, Any], payload))
 
+
+def _ser_operating_point(results_dir: Path, mode: str, target_ser: float = 0.01) -> Optional[Dict[str, Any]]:
+    csv_path = results_dir / "data" / f"ser_vs_nm_{mode.lower()}.csv"
+    if not csv_path.exists():
+        return None
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return None
+    df = df.copy()
+    nm_col = None
+    for candidate in ("pipeline_Nm_per_symbol", "pipeline.Nm_per_symbol", "Nm_per_symbol", "nm_per_symbol"):
+        if candidate in df.columns:
+            nm_col = candidate
+            break
+    if nm_col is None or "ser" not in df.columns:
+        return None
+    df["nm_value"] = pd.to_numeric(df[nm_col], errors="coerce")
+    df["ser"] = pd.to_numeric(df["ser"], errors="coerce")
+    if "use_ctrl" in df.columns:
+        df["use_ctrl"] = df["use_ctrl"].astype(bool)
+        df = df.sort_values(["use_ctrl"], ascending=False)
+    df = df.dropna(subset=["nm_value", "ser"])
+    if df.empty:
+        return None
+    df["ser_diff"] = (df["ser"] - target_ser).abs()
+    idx = df["ser_diff"].idxmin()
+    row = df.loc[idx]
+    nm_value = _f(row["nm_value"])
+    use_ctrl_raw: Any = row.get("use_ctrl", True)
+    use_ctrl_flag = True
+    if isinstance(use_ctrl_raw, (bool, np.bool_)):
+        use_ctrl_flag = bool(use_ctrl_raw)
+    elif isinstance(use_ctrl_raw, (int, float, np.integer, np.floating)):
+        if not math.isnan(float(use_ctrl_raw)):
+            use_ctrl_flag = bool(use_ctrl_raw)
+    elif isinstance(use_ctrl_raw, pd.Series):
+        if not use_ctrl_raw.empty:
+            use_ctrl_flag = bool(use_ctrl_raw.iloc[0])
+    elif use_ctrl_raw is not None:
+        use_ctrl_flag = bool(use_ctrl_raw)
+    ser_val = _f(row["ser"])
+    return {
+        "nm": nm_value,
+        "use_ctrl": use_ctrl_flag,
+        "ser": ser_val,
+        "row": row,
+    }
+
+
+def _collect_constellation_points(results_dir: Path, mode: str, nm_value: float, use_ctrl: bool,
+                                  max_points: int = 4000) -> pd.DataFrame:
+    cache_root = results_dir / "cache" / mode.lower()
+    ctrl_seg = "wctrl" if use_ctrl else "noctrl"
+    sweep_dir = cache_root / f"ser_vs_nm_{ctrl_seg}"
+    value_key = canonical_value_key(nm_value)
+    value_dir = sweep_dir / value_key
+    if not value_dir.exists():
+        return pd.DataFrame()
+    rows: List[Dict[str, float]] = []
+    for seed_file in sorted(value_dir.glob("seed_*.json")):
+        try:
+            data = json.loads(seed_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        points = data.get("constellation_points", [])
+        for entry in points:
+            try:
+                q_da = _f(entry.get("q_da", 0.0))
+                q_sero = _f(entry.get("q_sero", 0.0))
+                sym = int(_f(entry.get("symbol_tx", -1)))
+            except Exception:
+                continue
+            rows.append({
+                "symbol_tx": sym,
+                "q_da": q_da,
+                "q_sero": q_sero,
+            })
+            if len(rows) >= max_points:
+                break
+        if len(rows) >= max_points:
+            break
+    return pd.DataFrame(rows)
+
+
+def _symbol_label(mode: str, symbol: int) -> str:
+    mode_upper = mode.upper()
+    if mode_upper == "MOSK":
+        return "DA" if symbol == 0 else "SERO"
+    if mode_upper == "CSK":
+        return f"Level {symbol}"
+    if mode_upper == "HYBRID":
+        mol = "DA" if (symbol >> 1) == 0 else "SERO"
+        amp = symbol & 1
+        return f"{mol}-Amp{amp}"
+    return f"Symbol {symbol}"
+
+
+def _has_required_confusion_inputs(results_dir: Path) -> bool:
+    """
+    Quick readiness check for data-driven supplementary panels.
+    Requires ser_vs_nm CSVs and at least one cached seed JSON per modulation.
+    """
+    data_dir = results_dir / "data"
+    cache_dir = results_dir / "cache"
+    modes = ["MoSK", "CSK", "Hybrid"]
+    for mode in modes:
+        csv_path = data_dir / f"ser_vs_nm_{mode.lower()}.csv"
+        if not csv_path.exists():
+            return False
+        mode_cache = cache_dir / mode
+        if not mode_cache.exists():
+            return False
+        seed_found = False
+        for seed_json in mode_cache.rglob("seed_*.json"):
+            seed_found = True
+            break
+        if not seed_found:
+            return False
+    return True
+
 def _get_csv_ser_at_nm(mode: str, nm: float, data_dir: Path, tolerance: float = 0.1) -> Optional[float]:
     """
     Get the SER for a specific mode and Nm from CSV data.
@@ -192,73 +316,58 @@ def _get_csv_ser_at_nm(mode: str, nm: float, data_dir: Path, tolerance: float = 
 
 # ---------------------- S3: Constellations (illustrative) --------------------
 
-def plot_figure_s3_constellation(results_dir: Path, save_path: Path) -> None:
+def plot_figure_s3_constellation(results_dir: Path, save_path: Path, target_ser: float = 0.01) -> None:
     """
-    Generate Figure S3: Constellation diagrams for all modulation schemes.
-    Shows decision space (q_DA vs q_SERO) with transmitted symbols marked.
-    Currently illustrative; data-driven points will replace these later.
+    Generate Figure S3 using constellation points captured from cached simulation seeds.
     """
     _ensure_figdir(save_path)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    modes = ['MoSK', 'CSK', 'Hybrid']
+    modes = ["MoSK", "CSK", "Hybrid"]
+    fig, axes = plt.subplots(1, len(modes), figsize=(15, 5))
 
     for idx, mode in enumerate(modes):
         ax = axes[idx]
-
-        # Gate on existence of some results; else display placeholder notice
-        data_file = results_dir / "data" / f"ser_vs_nm_{mode.lower()}.csv"
-        if not data_file.exists():
-            ax.text(0.5, 0.5, f"No data for {mode}",
-                    ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f"{mode} Constellation")
-            ax.set_xlabel(r'$q_{\mathrm{DA}}$ (nC)')
-            ax.set_ylabel(r'$q_{\mathrm{SERO}}$ (nC)')
+        op = _ser_operating_point(results_dir, mode, target_ser=target_ser)
+        if not op:
+            ax.text(0.5, 0.5, f"No SER data for {mode}", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(f"{mode} (no data)")
+            ax.set_xlabel(r"$q_{\mathrm{DA}}$ (C)")
+            ax.set_ylabel(r"$q_{\mathrm{SERO}}$ (C)")
             ax.grid(True, alpha=0.3)
             continue
 
-        # For S3 we still show synthetic clusters (remove once real scatter is wired)
-        rng = np.random.default_rng(42)
+        nm_value = op["nm"]
+        use_ctrl = op["use_ctrl"]
+        df_points = _collect_constellation_points(results_dir, mode, nm_value, use_ctrl)
+        if df_points.empty:
+            ax.text(0.5, 0.5, f"No cached samples for {mode}", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(f"{mode} (cache missing)")
+            ax.set_xlabel(r"$q_{\mathrm{DA}}$ (C)")
+            ax.set_ylabel(r"$q_{\mathrm{SERO}}$ (C)")
+            ax.grid(True, alpha=0.3)
+            continue
 
-        if mode == 'MoSK':
-            # DA vs SERO binary classes
-            q_da_0 = _as_float1d(rng.normal(1.0, 0.2, 120))
-            q_sero_0 = _as_float1d(rng.normal(0.0, 0.2, 120))
-            q_da_1 = _as_float1d(rng.normal(0.0, 0.2, 120))
-            q_sero_1 = _as_float1d(rng.normal(1.0, 0.2, 120))
-            ax.scatter(q_da_0, q_sero_0, c='tab:blue', alpha=0.5, label='Symbol 0 (DA)', s=30)
-            ax.scatter(q_da_1, q_sero_1, c='tab:red', alpha=0.5, label='Symbol 1 (SERO)', s=30)
-            # Decision boundary (y = x)
-            x = np.linspace(-0.5, 1.5, 100, dtype=float)
-            ax.plot(_as_float1d(x), _as_float1d(x), 'k--', alpha=0.5, label='Decision boundary')
+        grouped = df_points.groupby("symbol_tx")
+        for symbol, grp in grouped:
+            q_da_vals = grp["q_da"].to_numpy(dtype=float, copy=False)
+            q_sero_vals = grp["q_sero"].to_numpy(dtype=float, copy=False)
+            ax.scatter(
+                q_da_vals,
+                q_sero_vals,
+                s=18,
+                alpha=0.55,
+                label=_symbol_label(mode, int(_f(symbol))),
+            )
 
-        elif mode == 'CSK':
-            # 4 amplitude levels on DA
-            for level in range(4):
-                q_da = _as_float1d(rng.normal(level / 3.0, 0.15, 60))
-                q_sero = _as_float1d(rng.normal(0.0, 0.1, 60))
-                ax.scatter(q_da, q_sero, alpha=0.5, label=f'Level {level}', s=30)
-
-        else:  # Hybrid (2 bits: molecule bit + amplitude bit)
-            symbols = [(0, 0), (0, 1), (1, 0), (1, 1)]
-            colors = ['tab:blue', 'tab:cyan', 'tab:red', 'tab:orange']
-            for (mol, amp), color in zip(symbols, colors):
-                if mol == 0:  # DA
-                    q_da = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
-                    q_sero = _as_float1d(rng.normal(0.0, 0.1, 60))
-                else:        # SERO
-                    q_da = _as_float1d(rng.normal(0.0, 0.1, 60))
-                    q_sero = _as_float1d(rng.normal(0.5 + 0.5 * amp, 0.15, 60))
-                ax.scatter(q_da, q_sero, c=color, alpha=0.5, label=f'Symbol {mol}{amp}', s=30)
-
-        ax.set_xlabel(r'$q_{\mathrm{DA}}$ (nC)')
-        ax.set_ylabel(r'$q_{\mathrm{SERO}}$ (nC)')
-        ax.set_title(f'({chr(97 + idx)}) {mode} Constellation')
-        ax.legend(fontsize=8)
+        ax.set_xlabel(r"$q_{\mathrm{DA}}$ (C)")
+        ax.set_ylabel(r"$q_{\mathrm{SERO}}$ (C)")
+        title = f"{mode} (Nm={nm_value:.2g}, {'CTRL' if use_ctrl else 'No CTRL'})"
+        ax.set_title(f"({chr(97 + idx)}) {title}")
+        ax.legend(fontsize=8, loc="best")
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle('Figure S3: Constellation Diagrams', fontsize=14)
+    plt.suptitle("Figure S3: Data-driven Constellation Diagrams", fontsize=14)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -446,7 +555,7 @@ def plot_figure_s5_confusion_matrices(results_dir: Path, save_path: Path, strict
                             rel_diff = abs(candidate_nm - nm) / nm
                             if rel_diff <= tolerance:
                                 found_match = candidate_dir
-                                print(f"⚠️  Cache fallback: Using Nm={candidate_nm:.0f} for requested Nm={nm:.0f} "
+                                print(f"[warn]  Cache fallback: Using Nm={candidate_nm:.0f} for requested Nm={nm:.0f} "
                                       f"(±{rel_diff:.1%} difference)")
                                 break
                         except (ValueError, ZeroDivisionError):
@@ -690,17 +799,20 @@ def main() -> None:
     """Generate all supplementary figures."""
     import argparse
     
-    # NEW: Add argument parsing for strict mode AND data-only gating
-    parser = argparse.ArgumentParser(description="Generate supplementary figures S3–S6")
-    parser.add_argument("--strict", action="store_true", default=True,
-                        help="Fail if no real data exists for confusion matrices")
-    parser.add_argument("--allow-synthetic", action="store_false", dest="strict",
-                        help="Allow synthetic fallback for confusion matrices")
-    parser.add_argument("--only-data", action="store_true", default=True,
-                        help="Render only data-driven panels (S5). Disables S3/S4/S6 unless explicitly overridden.")
-    parser.add_argument("--include-synthetic", action="store_false", dest="only_data",
-                        help="Include synthetic panels S3/S4/S6 even in data-only mode")
+    parser = argparse.ArgumentParser(description="Generate supplementary figures S3-S6")
+    parser.add_argument(
+        "--include-synthetic",
+        action="store_true",
+        help="Include synthetic illustration panels (S3, S4, S6).",
+    )
+    parser.add_argument(
+        "--allow-fallback",
+        action="store_true",
+        help="Allow illustrative confusion matrices if caches are missing.",
+    )
     args = parser.parse_args()
+    include_synthetic = bool(args.include_synthetic)
+    strict_mode = not bool(args.allow_fallback)
     
     apply_ieee_style()
     
@@ -713,39 +825,42 @@ def main() -> None:
     figures_dir = results_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.only_data:
-        # S3
-        print("\nGenerating Figure S3: Constellation diagrams (synthetic)...")
-        plot_figure_s3_constellation(results_dir, figures_dir / "figS3_constellation.png")
-        print("✓ Figure S3 saved")
+    if strict_mode and not _has_required_confusion_inputs(results_dir):
+        raise RuntimeError(
+            "Required CSV/cache artifacts are missing. "
+            "Run data sweeps first or rerun with --allow-fallback."
+        )
 
-        # S4
-        print("\nGenerating Figure S4: SNR analysis (synthetic)...")
+    print("\nGenerating Figure S3: Constellation diagrams (data-driven)...")
+    plot_figure_s3_constellation(results_dir, figures_dir / "figS3_constellation.png")
+    print("✓ Figure S3 saved")
+
+    if include_synthetic:
+        print("\nGenerating Figure S4: SNR analysis (synthetic overlay)...")
         plot_figure_s4_snr_types(results_dir, figures_dir / "figS4_snr_types.png")
         print("✓ Figure S4 saved")
     else:
-        print("\n⏭️  Skipping S3/S4 (synthetic panels, use --include-synthetic to enable)")
+        print("\n[skip]  Skipping Figure S4 synthetic panel (use --include-synthetic to enable)")
 
     # S5 (always generate - data-driven)
     print("\nGenerating Figure S5: Confusion matrices (data-driven)...")
-    plot_figure_s5_confusion_matrices(results_dir, figures_dir / "figS5_confusion.png", 
-                                     strict_mode=args.strict)
+    plot_figure_s5_confusion_matrices(results_dir, figures_dir / "figS5_confusion.png",
+                                     strict_mode=strict_mode)
     print("✓ Figure S5 saved")
 
-    if not args.only_data:
-        # S6
+    if include_synthetic:
         print("\nGenerating Figure S6: Energy per bit (synthetic)...")
         plot_figure_s6_energy_per_bit(results_dir, figures_dir / "figS6_energy.png")
         print("✓ Figure S6 saved")
     else:
-        print("\n⏭️  Skipping S6 (synthetic panel, use --include-synthetic to enable)")
+        print("\n[skip]  Skipping Figure S6 synthetic panel (use --include-synthetic to enable)")
 
     print("\n" + "=" * 60)
-    mode_desc = "data-only" if args.only_data else "full (including synthetic)"
+    mode_desc = "full (synthetic + data)" if include_synthetic else "data-only"
     print(f"✓ Supplementary figures generated in {mode_desc} mode!")
     print(f"Results saved in: {figures_dir}")
-    if args.only_data:
-        print("💡 Use --include-synthetic to generate S3/S4/S6 panels")
+    if not include_synthetic:
+        print("[hint] Re-run with --include-synthetic to add reference overlays (S4/S6)")
     print("=" * 60)
 
 if __name__ == "__main__":

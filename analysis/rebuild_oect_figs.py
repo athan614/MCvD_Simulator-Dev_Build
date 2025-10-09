@@ -10,7 +10,7 @@ Notes:
   • Uses oect.oect_trio/oect_current to synthesize *noise-only* currents.
   • PSD via Welch (density) on long records; IEEE style for TMBMC figures.
 
-Run directly or via run_master.py (step: notebook_replicas).
+Run directly or via run_master.py (steps: oect_psd or notebook_replicas).
 """
 
 from __future__ import annotations

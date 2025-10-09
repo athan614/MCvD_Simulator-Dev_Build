@@ -46,6 +46,7 @@ try:
 except ImportError:
     from src.detection import calculate_ml_threshold
 from src.pipeline import run_sequence, calculate_proper_noise_sigma, _single_symbol_currents, _csk_dual_channel_Q, _resolve_decision_window
+from src.constants import get_nt_params
 from src.config_utils import preprocess_config
 
 # Progress UI
@@ -578,6 +579,9 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     Incorporates robust cache compatibility, finite filtering, and optional early-stop for MoSK/Hybrid.
     """
     mode = cfg['pipeline']['modulation']
+    detector_mode = str(cfg['pipeline'].get('detector_mode', 'zscore')).lower()
+    if detector_mode not in ('zscore', 'raw', 'whitened'):
+        detector_mode = 'zscore'
     threshold_file = _thresholds_filename(cfg)
 
     # ---------- small helpers ----------
@@ -627,6 +631,13 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             if have_use_ctrl != want_use_ctrl:
                 if verbose: print("  ↪︎ cache invalid: CTRL mismatch")
                 raise RuntimeError("cache: use_ctrl mismatch")
+
+            cached_mode = str(meta.get('detector_mode', 'zscore')).lower()
+            if cached_mode not in ('zscore', 'raw', 'whitened'):
+                cached_mode = 'zscore'
+            if cached_mode != detector_mode:
+                if verbose: print("  ↪︎ cache invalid: detector mode mismatch")
+                raise RuntimeError("cache: detector_mode mismatch")
 
             # NT pair + q_eff signs
             if meta.get('nt_pair_fp') != _fingerprint_nt_pair(cfg):
@@ -764,9 +775,22 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
 
         thresholds['mosk_threshold'] = float(prev_tau)
 
-        # --- NEW: persist MoSK detector metadata so decoding matches calibration ---
-        # Decision statistic used during calibration:
-        thresholds['mosk_statistic'] = 'sign_aware_diff'  # D = (sgn(qeff_DA)*q_da - sgn(qeff_SERO)*q_sero) / sigma_diff
+        # Persist MoSK detector metadata so decoding matches calibration
+        if detector_mode == 'raw':
+            mosk_statistic_label = 'sign_aware_diff_raw'
+            mosk_stat_units = 'raw_charge'
+            mosk_normalization = 'none'
+        elif detector_mode == 'whitened':
+            mosk_statistic_label = 'sign_aware_diff_whitened'
+            mosk_stat_units = 'whitened_sigma_diff'
+            mosk_normalization = 'sigma_diff'
+        else:
+            mosk_statistic_label = 'sign_aware_diff'
+            mosk_stat_units = 'normalized_sigma_diff'
+            mosk_normalization = 'sigma_diff'
+
+        thresholds['mosk_statistic'] = mosk_statistic_label
+        thresholds['mosk_stat_units'] = mosk_stat_units
         # Calculate empirical direction from collected data
         emp_dir = None
         if mosk_stats['da'] and mosk_stats['sero']:
@@ -774,11 +798,11 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 emp_dir = ">"
             else:
                 emp_dir = "<"
-        
+
         # Use empirical direction from data; fall back to sign hint
         chosen_dir = emp_dir if emp_dir else mosk_dir_hint
         thresholds['mosk_direction'] = chosen_dir     # DA wins when stat > threshold
-        
+
         # Comparator direction hint:
         thresholds['mosk_comparator'] = chosen_dir
 
@@ -790,7 +814,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             q_da, q_se = 0.0, 0.0
         thresholds['mosk_decision_meta'] = json.dumps({
             'qeff_signs': {'DA': (q_da >= 0.0), 'SERO': (q_se >= 0.0)},
-            'normalization': 'sigma_diff'
+            'normalization': mosk_normalization
         })
 
         thresholds['mosk_direction_hint'] = mosk_dir_hint
@@ -960,6 +984,8 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         thresholds['hybrid_direction_da_hint']   = ">" if s_da > 0 else "<" if s_da < 0 else "="
         thresholds['hybrid_direction_sero_hint'] = ">" if s_se > 0 else "<" if s_se < 0 else "="
 
+    thresholds['detector_mode'] = detector_mode
+
     # ---------- persist to disk with rich __meta__ (atomic) ----------
     if save_to_file:
         try:
@@ -995,6 +1021,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 "nt_pair_fp": _fingerprint_nt_pair(cfg),
                 "q_eff_signs": (s_da, s_se),
                 "version": "2.0",
+                "detector_mode": detector_mode,
                 "timestamp": time.time()
             }
             payload["__meta__"] = meta
@@ -1215,6 +1242,12 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
     if getattr(args, 'csk_dual', None) is not None:
         cfg.setdefault('pipeline', {})['csk_dual_channel'] = (args.csk_dual == 'on')
 
+    if getattr(args, 'detector_mode', None) is not None:
+        cfg.setdefault('pipeline', {})['detector_mode'] = str(args.detector_mode).lower()
+
+    if getattr(args, 'freeze_calibration', False):
+        cfg.setdefault('analysis', {})['freeze_calibration'] = True
+
     profile = str(getattr(args, 'channel_profile', 'tri')).lower()
     cfg.setdefault('pipeline', {})['channel_profile'] = profile
     if profile in ('single', 'dual'):
@@ -1372,10 +1405,80 @@ def _calculate_guard_sampling_load(
 def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
     """
     Atomic CSV write using temp file pattern (like _atomic_write_json).
+    Also emits a JSON sidecar with summary metadata for reproducibility.
     """
     tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
     df.to_csv(tmp, index=False)
     os.replace(tmp, csv_path)
+    metadata = _extract_csv_metadata(df)
+    _write_csv_metadata(csv_path, metadata)
+
+
+def _extract_csv_metadata(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Build a reproducibility-friendly metadata summary for a results DataFrame.
+    """
+    meta: Dict[str, Any] = {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+    }
+
+    numeric_candidates = [
+        "symbol_period_s",
+        "decision_window_s",
+        "guard_factor",
+        "Nm_per_symbol",
+        "distance_um",
+        "noise_sigma_single",
+        "noise_sigma_I_diff",
+        "noise_sigma_diff_charge",
+        "I_dc_used_A",
+        "gm_S",
+        "C_tot_F",
+        "rho_pre_ctrl",
+        "rho_cc",
+    ]
+
+    medians: Dict[str, float] = {}
+    for col in numeric_candidates:
+        if col in df.columns:
+            series = pd.to_numeric(df[col], errors="coerce")
+            series = series.replace([np.inf, -np.inf], np.nan).dropna()
+            if not series.empty:
+                medians[col] = float(series.median())
+    if medians:
+        meta["medians"] = medians
+
+    categorical_candidates = [
+        "mode",
+        "detector_mode",
+        "burst_shape",
+        "use_ctrl",
+    ]
+    categories: Dict[str, List[str]] = {}
+    for col in categorical_candidates:
+        if col in df.columns:
+            unique_vals = df[col].dropna().unique().tolist()
+            if unique_vals:
+                categories[col] = [str(v) for v in unique_vals]
+    if categories:
+        meta["categories"] = categories
+
+    return meta
+
+
+def _write_csv_metadata(csv_path: Path, metadata: Dict[str, Any]) -> None:
+    """
+    Persist metadata JSON next to the CSV (same basename + `.meta.json`).
+    """
+    meta_path = csv_path.with_suffix(csv_path.suffix + ".meta.json")
+    tmp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
+    metadata = dict(metadata)
+    metadata["generated_at"] = time.time()
+    metadata.setdefault("source_csv", str(csv_path))
+    with open(tmp_meta, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, ensure_ascii=False)
+    os.replace(tmp_meta, meta_path)
 
 def _with_file_lock(path: Path, fn: Callable[[], None], timeout_s: float = 60.0) -> None:
     """Very small cross-platform lock via .lock sentinel file."""
@@ -1485,26 +1588,18 @@ def load_completed_values(csv_path: Path, key: str, use_ctrl: Optional[bool] = N
         pass
     return set()
 
-def _value_key(v):
-    """
-    Canonicalize numeric values to consistent string representation.
-    Examples:
-    - 200, 200.0, 2e2 all become "200"
-    - 200.5 becomes "200.5"
-    - Non-numeric values fall back to str(v)
-    """
-    try:
-        vf = float(v)
-        return str(int(vf)) if vf.is_integer() else f"{vf:.6g}"
-    except Exception:
-        return str(v)
-
-# ENHANCEMENT: Export the canonical value key formatter for consistency across modules
 def canonical_value_key(v):
     """Convert a numeric parameter value to a standard string key for CSV/cache lookups."""
     if isinstance(v, (int, float)):
         return f"{float(v):.10g}"
     return str(v)
+
+
+def _value_key(v):
+    """
+    Backward-compatibility shim forwarding to the canonical value key helper.
+    """
+    return canonical_value_key(v)
 
 def _auto_refine_nm_points_from_df(df: pd.DataFrame,
                                    target: float = 0.01,
@@ -1621,7 +1716,7 @@ def seed_cache_path(mode: str, sweep: str, value: Union[float, int], seed: int,
         base = base / cache_tag
     return base / f"{sweep}_{ctrl_seg}" / vk / f"seed_{seed}.json"
 
-def read_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int, 
+def read_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int,
                     use_ctrl: Optional[bool] = None, cache_tag: Optional[str] = None) -> Optional[Dict[str, Any]]:
     p = seed_cache_path(mode, sweep, value, seed, use_ctrl, cache_tag)
     if p.exists():
@@ -1629,19 +1724,21 @@ def read_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int,
             data = json.loads(p.read_text())
             # Ensure the seed tag is present even for older cache files
             data.setdefault("__seed", int(seed))
+            data.setdefault("__value_key", canonical_value_key(value))
             return data
         except Exception:
             return None
     return None
 
-def write_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int, payload: Dict[str, Any], 
+def write_seed_cache(mode: str, sweep: str, value: Union[float, int], seed: int, payload: Dict[str, Any],
                      use_ctrl: Optional[bool] = None, cache_tag: Optional[str] = None) -> None:
     cache_path = seed_cache_path(mode, sweep, value, seed, use_ctrl, cache_tag)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    # Tag the payload with its seed for later de‑duplication in aggregations
+    # Tag the payload with its seed for later de-duplication in aggregations
     payload = dict(payload)
     payload.setdefault("__seed", int(seed))
+    payload.setdefault("__value_key", canonical_value_key(value))
     with open(tmp, "w", encoding='utf-8') as f:
         json.dump(_json_safe(payload), f, indent=2)
     os.replace(tmp, cache_path)
@@ -1694,6 +1791,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--no-ctrl", dest="use_ctrl", action="store_false", help="Disable CTRL subtraction (ablation)")
     parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none"], default="tqdm",
                     help="Progress UI backend")
+    parser.add_argument("--detector-mode", choices=["zscore", "raw", "whitened"], default="zscore",
+                        help="Detector statistic normalisation (default: zscore).")
+    parser.add_argument("--freeze-calibration", action="store_true",
+                        help="Reuse baseline thresholds/sigmas during parameter sweeps.")
     parser.add_argument("--nt-pairs", type=str, default="", help="CSV nt-pairs for CSK sweeps")
 
     # --- Baseline / variant helpers ---
@@ -1917,205 +2018,193 @@ def _adjacent_threshold_map(mu0: float, mu1: float, s0: float, s1: float, p0: fl
     return float(t_ml)
 
 def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_symbols: int = 100) -> Optional[Dict[str, Any]]:
+    """Calibrate decision statistics for the requested detector mode."""
     try:
-        # Import the dual-channel helper
         from src.pipeline import _csk_dual_channel_Q
-        
+
         cal_cfg = deepcopy(cfg)
         cal_cfg['pipeline']['sequence_length'] = num_symbols
         cal_cfg['disable_progress'] = True
+        if mode == 'MoSK':
+            cal_cfg['pipeline']['use_control_channel'] = False
+        detector_mode = str(cal_cfg['pipeline'].get('detector_mode', cfg.get('pipeline', {}).get('detector_mode', 'zscore'))).lower()
+        if detector_mode not in ('zscore', 'raw', 'whitened'):
+            detector_mode = 'zscore'
+        cal_cfg['pipeline']['detector_mode'] = detector_mode
+
         tx_symbols = [symbol] * num_symbols
         q_da_values: List[float] = []
         q_sero_values: List[float] = []
-        decision_stats: List[float] = []
+        stats_map: Dict[str, List[float]] = {key: [] for key in ('zscore', 'raw', 'whitened')}
         dt = cal_cfg['sim']['dt_s']
-        d = cal_cfg.setdefault('detection', {})
-        detection_window_s = d.get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
+        detection = cal_cfg.setdefault('detection', {})
+        detection_window_s = detection.get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
         sigma_da, sigma_sero = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
-        
-        # Initialize CSK dual-channel parameters with defaults
+
         target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'DA')
-        combiner = cal_cfg['pipeline'].get('csk_combiner', 'zscore')
+        combiner_cfg = cal_cfg['pipeline'].get('csk_combiner', 'zscore')
+        combiner_selected = cal_cfg['pipeline'].get('csk_selected_combiner', combiner_cfg)
         use_dual = bool(cal_cfg['pipeline'].get('csk_dual_channel', True))
         leakage = float(cal_cfg['pipeline'].get('csk_leakage_frac', 0.0))
-        
-        # Enhancement 2: Use 0.5 fallback if noise model is symmetric
-        rho_pre = float(cal_cfg.get('noise', {}).get('rho_corr',
-                        cal_cfg.get('noise', {}).get('rho_correlated', 0.9)))
+
+        rho_pre = float(cal_cfg.get('noise', {}).get('rho_corr', cal_cfg.get('noise', {}).get('rho_correlated', 0.9)))
         use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
 
         noise_cfg_cal = cal_cfg.get('noise', {})
-        # FIX: Logic should check if rho_correlated is NOT explicitly set (i.e., using default)
-        # If rho_between_channels_after_ctrl is not set AND model is symmetric, use 0.5
         if 'rho_between_channels_after_ctrl' not in noise_cfg_cal:
-            # Only use 0.5 if this is clearly a symmetric triplet setup
             rho_post_default = 0.5 if use_ctrl else 0.0
         else:
             rho_post_default = noise_cfg_cal['rho_between_channels_after_ctrl']
         rho_post = float(noise_cfg_cal.get('rho_between_channels_after_ctrl', rho_post_default))
-        rho_cc   = rho_post if (use_ctrl and mode != "MoSK") else rho_pre
-        rho_cc   = max(-1.0, min(1.0, rho_cc))
-        
-        # Use deterministic seeding for calibration consistency
-        seed = cal_cfg['pipeline'].get('random_seed', 0)
-        rng = np.random.default_rng(seed)
-        
-        # Auto-measure ρ after CTRL for validation (Enhancement 1)
+        rho_cc = rho_post if (use_ctrl and mode != 'MoSK') else rho_pre
+        rho_cc = max(-1.0, min(1.0, rho_cc))
+
+        rng = np.random.default_rng(cal_cfg['pipeline'].get('random_seed', 0))
+
         rho_cc_measured = np.nan
         if use_ctrl and (mode.startswith('CSK') or mode == 'Hybrid'):
             try:
-                # Generate noise-only samples for correlation measurement
-                # FIX D: Improve ρ measurement stability at low Nm
                 base_noise_samples = 20
-                # For very low Nm analysis, use more samples for stable correlation estimation
                 nm_value = cfg['pipeline'].get('Nm_per_symbol', 1e6)
-                if nm_value < 1000:  # Very low Nm regime
+                if nm_value < 1000:
                     noise_samples = 100
-                elif nm_value < 10000:  # Low Nm regime
+                elif nm_value < 10000:
                     noise_samples = 50
                 else:
                     noise_samples = base_noise_samples
+
                 q_da_noise, q_sero_noise = [], []
-                
-                # Temporarily set Nm to zero for noise-only measurement
                 cal_cfg_noise = deepcopy(cal_cfg)
-                cal_cfg_noise['pipeline']['Nm_per_symbol'] = 1e-6  # Minimal signal
-                
-                # Calculate detection samples for noise measurement
+                cal_cfg_noise['pipeline']['Nm_per_symbol'] = 1e-6
+
                 n_total_samples_noise = int(cal_cfg_noise['pipeline']['symbol_period_s'] / dt)
                 n_detect_samples_noise = min(int(detection_window_s / dt), n_total_samples_noise)
-                
+
                 for _ in range(noise_samples):
                     ig_n, ia_n, ic_n, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
-                    
-                    # Apply CTRL subtraction (same as main path)
                     sig_da_n = ig_n - ic_n
                     sig_sero_n = ia_n - ic_n
-                    
-                    # Integrate over decision window
                     q_da_n = float(np.trapezoid(sig_da_n[:n_detect_samples_noise], dx=dt))
                     q_sero_n = float(np.trapezoid(sig_sero_n[:n_detect_samples_noise], dx=dt))
-                    
                     q_da_noise.append(q_da_n)
                     q_sero_noise.append(q_sero_n)
-                
-                # Measure empirical correlation
+
                 if len(q_da_noise) >= 3:
                     rho_cc_measured = float(np.corrcoef(q_da_noise, q_sero_noise)[0, 1])
                     if not np.isfinite(rho_cc_measured):
                         rho_cc_measured = np.nan
-                        
             except Exception:
                 rho_cc_measured = np.nan
-        else:
-            rho_cc_measured = np.nan
-        
-        # Main symbol generation loop
+
         for s_tx in tx_symbols:
             ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, [], cal_cfg, rng)
             n_total_samples = len(ig)
             n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
             if n_detect_samples <= 1:
                 continue
-                
-            # Tail-gated integration
-            tail = float(cal_cfg['pipeline'].get('csk_tail_fraction', 1.0))
-            tail = min(max(tail, 0.1), 1.0)
-            i0 = int((1.0 - tail) * n_detect_samples)
 
-            use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
-            # For MoSK, do NOT subtract CTRL from the charges; for CSK/Hybrid keep the existing behavior.
-            subtract_for_q = (mode != "MoSK") and use_ctrl
-            
-            q_da_series   = (ig - ic) if subtract_for_q else ig
-            q_sero_series = (ia - ic) if subtract_for_q else ia
-            
-            q_da   = float(np.trapezoid(q_da_series[i0:n_detect_samples],   dx=dt))
-            q_sero = float(np.trapezoid(q_sero_series[i0:n_detect_samples], dx=dt))
-            
-            q_da_values.append(q_da); q_sero_values.append(q_sero)
-        
-        for q_da, q_sero in zip(q_da_values, q_sero_values):
-            if mode == "MoSK":
-                # Get q_eff signs to match runtime logic
-                q_eff_da = float(cal_cfg['neurotransmitters']['DA']['q_eff_e'])
-                q_eff_sero = float(cal_cfg['neurotransmitters']['SERO']['q_eff_e'])
+            q_da = float(np.trapezoid(ig[:n_detect_samples], dx=dt))
+            q_sero = float(np.trapezoid(ia[:n_detect_samples], dx=dt))
+            q_da_values.append(q_da)
+            q_sero_values.append(q_sero)
+
+            if mode == 'MoSK':
+                q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
+                q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
                 sign_da = 1.0 if q_eff_da >= 0 else -1.0
                 sign_sero = 1.0 if q_eff_sero >= 0 else -1.0
-                
-                # FIX: For MoSK, never subtract CTRL from the statistic itself.
-                # Use CTRL only via the (reduced) cross-correlation in the denominator.
-                cal_use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
-                # For MoSK, use pre-CTRL correlation since we don't subtract CTRL from charges
-                if mode == "MoSK":
-                    rho_cc = float(cal_cfg.get('noise', {}).get('rho_corr', 0.9))
-                else:
-                    rho_cc = float(cal_cfg.get('noise', {}).get(
-                        'rho_between_channels_after_ctrl' if cal_use_ctrl else 'rho_corr',
-                        0.9
-                    ))
-                sigma_diff = math.sqrt(
-                    sigma_da*sigma_da + sigma_sero*sigma_sero - 2.0*rho_cc*sigma_da*sigma_sero
+                sigma_diff = math.sqrt(sigma_da * sigma_da + sigma_sero * sigma_sero - 2.0 * rho_pre * sigma_da * sigma_sero)
+                sigma_diff = max(sigma_diff, 1e-15)
+                raw_stat = (sign_da * q_da) - (sign_sero * q_sero)
+                zscore_stat = raw_stat / sigma_diff
+                stats_map['raw'].append(float(raw_stat))
+                stats_map['zscore'].append(float(zscore_stat))
+                stats_map['whitened'].append(float(zscore_stat))
+            elif mode.startswith('CSK'):
+                primary_charge = q_da if str(target_channel).upper() == 'DA' else q_sero
+                stats_map['raw'].append(float(primary_charge))
+                stat_zscore = _csk_dual_channel_Q(
+                    q_da=q_da,
+                    q_sero=q_sero,
+                    sigma_da=sigma_da,
+                    sigma_sero=sigma_sero,
+                    rho_cc=rho_cc,
+                    combiner=combiner_selected,
+                    leakage_frac=leakage,
+                    target=target_channel,
+                    cfg=cal_cfg
                 )
-                if sigma_diff <= 1e-15:
-                    sigma_diff = 1e-15
-                # Always use optimal sign-aware difference (no CTRL subtraction)
-                D = (sign_da * q_da - sign_sero * q_sero) / max(sigma_diff, 1e-15)
-                decision_stats.append(float(D))
-            elif mode.startswith("CSK"):
-                if use_dual:
-                    Q = _csk_dual_channel_Q(
-                        q_da=q_da, q_sero=q_sero,
-                        sigma_da=sigma_da, sigma_sero=sigma_sero,
-                        rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
-                        target=target_channel,
-                        cfg=cal_cfg  # FIX: Pass cfg for shrinkage logic
-                    )
-                else:
-                    # Legacy single-channel
-                    Q = q_da if target_channel == 'DA' else q_sero
-                decision_stats.append(Q)
-            elif mode == "Hybrid":
-                mol_type = symbol >> 1  # 0: DA, 1: SERO (which channel carries amplitude)
-                combiner = str(cal_cfg['pipeline'].get('hybrid_combiner', cal_cfg['pipeline'].get('csk_combiner','zscore')))
-                leakage  = float(cal_cfg['pipeline'].get('hybrid_leakage_frac', cal_cfg['pipeline'].get('csk_leakage_frac', 0.0)))
-                target   = 'DA' if mol_type == 0 else 'SERO'
-                Q_amp = _csk_dual_channel_Q(
-                    q_da=q_da, q_sero=q_sero,
-                    sigma_da=sigma_da, sigma_sero=sigma_sero,
-                    rho_cc=rho_cc, combiner=combiner, leakage_frac=leakage,
-                    target=target, cfg=cal_cfg
+                stats_map['zscore'].append(float(stat_zscore))
+                stat_whitened = _csk_dual_channel_Q(
+                    q_da=q_da,
+                    q_sero=q_sero,
+                    sigma_da=sigma_da,
+                    sigma_sero=sigma_sero,
+                    rho_cc=rho_cc,
+                    combiner='whitened',
+                    leakage_frac=leakage,
+                    target=target_channel,
+                    cfg=cal_cfg
                 )
-                decision_stats.append(float(Q_amp))
-        
-        # Enhanced return with combiner metadata for CSK
-        # Keep aux raw charges for flexible combiners
+                stats_map['whitened'].append(float(stat_whitened))
+            elif mode == 'Hybrid':
+                mol_type = symbol >> 1
+                target = 'DA' if mol_type == 0 else 'SERO'
+                combiner_hybrid = str(cal_cfg['pipeline'].get('hybrid_combiner', combiner_cfg))
+                leakage_hybrid = float(cal_cfg['pipeline'].get('hybrid_leakage_frac', leakage))
+                raw_stat = q_da if target == 'DA' else q_sero
+                stats_map['raw'].append(float(raw_stat))
+                stat_zscore = _csk_dual_channel_Q(
+                    q_da=q_da,
+                    q_sero=q_sero,
+                    sigma_da=sigma_da,
+                    sigma_sero=sigma_sero,
+                    rho_cc=rho_cc,
+                    combiner=combiner_hybrid,
+                    leakage_frac=leakage_hybrid,
+                    target=target,
+                    cfg=cal_cfg
+                )
+                stats_map['zscore'].append(float(stat_zscore))
+                stat_whitened = _csk_dual_channel_Q(
+                    q_da=q_da,
+                    q_sero=q_sero,
+                    sigma_da=sigma_da,
+                    sigma_sero=sigma_sero,
+                    rho_cc=rho_cc,
+                    combiner='whitened',
+                    leakage_frac=leakage_hybrid,
+                    target=target,
+                    cfg=cal_cfg
+                )
+                stats_map['whitened'].append(float(stat_whitened))
+
         aux_q = list(zip(q_da_values, q_sero_values))
-        result = {
-            "q_values": decision_stats,
-            "aux_q": aux_q
+        chosen_stats = stats_map.get(detector_mode, stats_map['zscore'])
+        result: Dict[str, Any] = {
+            'q_values': chosen_stats,
+            'zscore_stats': stats_map['zscore'],
+            'raw_stats': stats_map['raw'],
+            'whitened_stats': stats_map['whitened'],
+            'aux_q': aux_q,
+            'detector_mode': detector_mode,
         }
-        
-        # Add combiner metadata for CSV traceability if enabled
-        if (mode.startswith('CSK') and 
-            cal_cfg['pipeline'].get('csk_store_combiner_meta', True)):
+
+        if mode.startswith('CSK') and cal_cfg['pipeline'].get('csk_store_combiner_meta', True):
             result.update({
-                'combiner': combiner,
+                'combiner': combiner_selected,
                 'rho_cc': rho_cc,
-                'rho_cc_measured': rho_cc_measured,  # Enhancement 1: Store measured correlation
-                'leakage_frac': leakage if combiner == 'leakage' else np.nan
+                'rho_cc_measured': rho_cc_measured,
+                'leakage_frac': leakage if combiner_selected == 'leakage' else np.nan
             })
-        
-        # FIX A: Always include rho_cc_measured for Hybrid mode (not just CSK)
-        try:
-            if 'rho_cc_measured' in locals() and np.isfinite(rho_cc_measured):
-                result['rho_cc_measured'] = float(rho_cc_measured)
-        except Exception:
-            pass
-            
+
+        if mode == 'Hybrid':
+            result['rho_cc_measured'] = float(rho_cc_measured) if np.isfinite(rho_cc_measured) else float('nan')
+
         return result
     except Exception:
         return None
+
 
 def _measure_rho_for_seed(cfg: Dict[str, Any], mode: str) -> float:
     """Measure cross-channel correlation for a specific seed."""
@@ -2176,78 +2265,189 @@ def run_single_instance(config: Dict[str, Any], seed: int, attach_isi_meta: bool
         print(f"❌ Simulation failed with seed {seed}: {e}")
         return None
 
+def _apply_sweep_param(cfg_obj: Dict[str, Any], param_name: str, param_value: Union[float, int]) -> None:
+    """
+    Apply a sweep parameter value to the working configuration, keeping all
+    secondary quantities (Ts, decision window, ISI memory) consistent with
+    the updated setting.
+    """
+    if '.' in param_name:
+        keys = param_name.split('.')
+        target = cfg_obj
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = param_value
+    else:
+        cfg_obj[param_name] = param_value
+
+    detection = cfg_obj.setdefault('detection', {})
+
+    if param_name == 'pipeline.distance_um':
+        Ts = calculate_dynamic_symbol_period(float(param_value), cfg_obj)
+        min_win = _enforce_min_window(cfg_obj, Ts)
+        cfg_obj['pipeline']['symbol_period_s'] = Ts
+        cfg_obj['pipeline']['time_window_s'] = max(cfg_obj['pipeline'].get('time_window_s', 0.0), min_win)
+        detection['decision_window_s'] = min_win
+        if cfg_obj['pipeline'].get('enable_isi', False):
+            D_da = cfg_obj['neurotransmitters']['DA']['D_m2_s']
+            lambda_da = cfg_obj['neurotransmitters']['DA']['lambda']
+            D_eff = D_da / (lambda_da ** 2)
+            time_95 = 3.0 * ((float(param_value) * 1e-6)**2) / D_eff
+            guard_factor = cfg_obj['pipeline'].get('guard_factor', 0.1)
+            isi_memory = math.ceil((1 + guard_factor) * time_95 / Ts)
+            cfg_obj['pipeline']['isi_memory_symbols'] = isi_memory
+    elif param_name == 'pipeline.guard_factor':
+        dist = float(cfg_obj['pipeline']['distance_um'])
+        Ts = calculate_dynamic_symbol_period(dist, cfg_obj)
+        min_win = _enforce_min_window(cfg_obj, Ts)
+        cfg_obj['pipeline']['symbol_period_s'] = Ts
+        cfg_obj['pipeline']['time_window_s'] = max(cfg_obj['pipeline'].get('time_window_s', 0.0), min_win)
+        detection['decision_window_s'] = min_win
+        if cfg_obj['pipeline'].get('enable_isi', False):
+            D_da = cfg_obj['neurotransmitters']['DA']['D_m2_s']
+            lambda_da = cfg_obj['neurotransmitters']['DA']['lambda']
+            D_eff = D_da / (lambda_da ** 2)
+            time_95 = 3.0 * ((dist * 1e-6)**2) / D_eff
+            guard_factor = float(param_value)
+            isi_memory = math.ceil((1 + guard_factor) * time_95 / Ts)
+            cfg_obj['pipeline']['isi_memory_symbols'] = isi_memory
+    elif param_name == 'pipeline.Nm_per_symbol':
+        Ts = float(cfg_obj['pipeline'].get('symbol_period_s',
+                 calculate_dynamic_symbol_period(float(cfg_obj['pipeline'].get('distance_um', 50.0)), cfg_obj)))
+        min_win = _enforce_min_window(cfg_obj, Ts)
+        cfg_obj['pipeline']['time_window_s'] = max(cfg_obj['pipeline'].get('time_window_s', 0.0), min_win)
+        detection['decision_window_s'] = min_win
+    elif param_name in ['oect.gm_S', 'oect.C_tot_F']:
+        Ts = float(cfg_obj['pipeline'].get('symbol_period_s',
+                 calculate_dynamic_symbol_period(float(cfg_obj['pipeline'].get('distance_um', 50.0)), cfg_obj)))
+        min_win = _enforce_min_window(cfg_obj, Ts)
+        cfg_obj['pipeline']['symbol_period_s'] = Ts
+        cfg_obj['pipeline']['time_window_s'] = max(cfg_obj['pipeline'].get('time_window_s', 0.0), min_win)
+        detection['decision_window_s'] = min_win
+
+
+def _get_param_value(cfg_obj: Dict[str, Any], param_name: str) -> Any:
+    if '.' in param_name:
+        keys = param_name.split('.')
+        target = cfg_obj
+        for key in keys[:-1]:
+            target = target.get(key, {})
+        return target.get(keys[-1])
+    return cfg_obj.get(param_name)
+
+
+def _build_freeze_snapshot(cfg_base: Dict[str, Any],
+                           param_name: str,
+                           baseline_value: Union[float, int, None],
+                           cal_seeds: List[int],
+                           recalibrate: bool) -> Optional[Dict[str, Any]]:
+    if baseline_value is None:
+        return None
+
+    cfg_snap = deepcopy(cfg_base)
+    _apply_sweep_param(cfg_snap, param_name, baseline_value)
+
+    detector_mode = str(cfg_snap['pipeline'].get('detector_mode', 'zscore')).lower()
+
+    thresholds: Dict[str, Union[float, List[float], str]] = {}
+    if cal_seeds:
+        thresholds = calibrate_thresholds_cached(cfg_snap, cal_seeds, recalibrate)
+
+    Ts = float(cfg_snap['pipeline']['symbol_period_s'])
+    dt = float(cfg_snap['sim']['dt_s'])
+    detection_window_s = _resolve_decision_window(cfg_snap, Ts, dt)
+    noise_components: Dict[str, float] = {}
+    sigma_da, sigma_sero = calculate_proper_noise_sigma(cfg_snap, detection_window_s, components_out=noise_components)
+
+    noise_cfg = cfg_snap.get('noise', {})
+    use_ctrl = bool(cfg_snap['pipeline'].get('use_control_channel', True))
+    mod = cfg_snap['pipeline']['modulation']
+
+    rho_pre = float(noise_cfg.get('rho_corr', noise_cfg.get('rho_correlated', 0.9)))
+    rho_post_default = 0.0
+    rho_post = float(noise_cfg.get('rho_between_channels_after_ctrl', rho_post_default))
+    rho_post = float(cfg_snap['pipeline'].get('rho_cc_measured', rho_post))
+
+    if mod == 'MoSK':
+        rho_for_diff = rho_pre
+    else:
+        rho_for_diff = rho_post if use_ctrl else rho_pre
+    rho_for_diff = max(-1.0, min(1.0, rho_for_diff))
+
+    sigma_diff = math.sqrt(max(
+        sigma_da * sigma_da + sigma_sero * sigma_sero - 2.0 * rho_for_diff * sigma_da * sigma_sero,
+        0.0
+    ))
+
+    cfg_mosk = deepcopy(cfg_snap)
+    cfg_mosk['pipeline']['modulation'] = 'MoSK'
+    sigma_da_mosk, sigma_sero_mosk = calculate_proper_noise_sigma(cfg_mosk, detection_window_s)
+    sigma_diff_mosk = math.sqrt(max(
+        sigma_da_mosk * sigma_da_mosk + sigma_sero_mosk * sigma_sero_mosk - 2.0 * rho_pre * sigma_da_mosk * sigma_sero_mosk,
+        0.0
+    ))
+
+    noise_payload = {
+        'sigma_da': float(sigma_da),
+        'sigma_sero': float(sigma_sero),
+        'sigma_diff': float(sigma_diff),
+        'sigma_diff_mosk': float(sigma_diff_mosk),
+        'rho_for_diff': float(rho_for_diff),
+        'rho_cc': float(rho_post if use_ctrl else rho_pre),
+        'detection_window_s': float(detection_window_s),
+        'noise_components': dict(noise_components),
+        'detector_mode': detector_mode,
+    }
+
+    fingerprint = json.dumps({
+        "thresholds": _json_safe(thresholds),
+        "noise": _json_safe(noise_payload),
+        "detector_mode": detector_mode,
+        "param": param_name,
+    }, sort_keys=True, allow_nan=True, default=str)
+    baseline_id = hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()[:12]
+
+    snapshot = {
+        'thresholds': thresholds,
+        'noise': noise_payload,
+        'detector_mode': detector_mode,
+        'baseline_id': baseline_id,
+        'sweep_param': param_name,
+        'baseline_value': baseline_value,
+    }
+    return snapshot
+
+
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False,
                          thresholds_override: Optional[Dict[str, Union[float, List[float], str]]] = None,
                          sweep_name: str = "ser_vs_nm", cache_tag: Optional[str] = None,
-                         recalibrate: bool = False) -> Optional[Dict[str, Any]]:
+                         recalibrate: bool = False,
+                         freeze_snapshot: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Worker for parameter sweep with window match; accepts optional precomputed thresholds."""
     try:
         cfg_run = deepcopy(cfg_base)
         cfg_run['disable_progress'] = True
         cfg_run['verbose'] = False
 
-        # Set sweep parameter
-        if '.' in param_name:
-            keys = param_name.split('.')
-            target = cfg_run
-            for key in keys[:-1]:
-                target = target[key]
-            target[keys[-1]] = param_value
-        else:
-            cfg_run[param_name] = param_value
+        # Set sweep parameter (maintaining window/ISI consistency)
+        _apply_sweep_param(cfg_run, param_name, param_value)
 
-        # Distance updates: recompute Ts and match window (+ ISI memory)
-        if param_name == 'pipeline.distance_um':
-            new_symbol_period = calculate_dynamic_symbol_period(cast(float, param_value), cfg_run)
-            dt = float(cfg_run['sim']['dt_s'])
-            min_pts = int(cfg_run.get('_min_decision_points', 4))
-            min_win = _enforce_min_window(cfg_run, new_symbol_period)
-            cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
-            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
-            if cfg_run['pipeline'].get('enable_isi', False):
-                D_da = cfg_run['neurotransmitters']['DA']['D_m2_s']
-                lambda_da = cfg_run['neurotransmitters']['DA']['lambda']
-                D_eff = D_da / (lambda_da ** 2)
-                time_95 = 3.0 * ((cast(float, param_value) * 1e-6)**2) / D_eff
-                guard_factor = cfg_run['pipeline'].get('guard_factor', 0.1)
-                isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
-                cfg_run['pipeline']['isi_memory_symbols'] = isi_memory
-
-        # Guard factor updates (ISI sweep): recompute Ts/window + thresholds
-        if param_name == 'pipeline.guard_factor':
-            # Update symbol period per the new guard factor, keeping distance fixed
-            dist = float(cfg_run['pipeline']['distance_um'])
-            new_symbol_period = calculate_dynamic_symbol_period(dist, cfg_run)
-            dt = float(cfg_run['sim']['dt_s'])
-            min_pts = int(cfg_run.get('_min_decision_points', 4))
-            min_win = _enforce_min_window(cfg_run, new_symbol_period)
-            cfg_run['pipeline']['symbol_period_s'] = new_symbol_period
-            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
-            if cfg_run['pipeline'].get('enable_isi', False):
-                D_da = cfg_run['neurotransmitters']['DA']['D_m2_s']
-                lambda_da = cfg_run['neurotransmitters']['DA']['lambda']
-                D_eff = D_da / (lambda_da ** 2)
-                time_95 = 3.0 * ((dist * 1e-6)**2) / D_eff
-                guard_factor = float(param_value)
-                isi_memory = math.ceil((1 + guard_factor) * time_95 / new_symbol_period)
-                cfg_run['pipeline']['isi_memory_symbols'] = isi_memory
-
-        # Apply consistent window guard for Nm_per_symbol sweeps (symmetry with distance sweeps)
-        elif param_name == 'pipeline.Nm_per_symbol':
-            # Apply consistent window guard for symmetry
-            dt = float(cfg_run['sim']['dt_s'])
-            min_pts = int(cfg_run.get('_min_decision_points', 4))
-            min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
-            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
-        elif param_name in ['oect.gm_S', 'oect.C_tot_F']:
-            min_win = _enforce_min_window(cfg_run, cfg_run['pipeline']['symbol_period_s'])
-            cfg_run['pipeline']['time_window_s'] = max(cfg_run['pipeline'].get('time_window_s', 0.0), min_win)
-            cfg_run.setdefault('detection', {})['decision_window_s'] = min_win
+        freeze_payload: Optional[Dict[str, Any]] = None
+        if freeze_snapshot:
+            thresholds_freeze = freeze_snapshot.get('thresholds', {})
+            if thresholds_override:
+                merged = dict(thresholds_freeze)
+                merged.update(thresholds_override)
+                thresholds_override = merged
+            else:
+                thresholds_override = dict(thresholds_freeze)
+            freeze_payload = freeze_snapshot.get('noise', {})
+            cfg_run['pipeline']['_freeze_calibration_active'] = True
+            cfg_run['pipeline']['_freeze_baseline_id'] = freeze_snapshot.get('baseline_id', '')
+            if freeze_payload:
+                cfg_run['pipeline']['_frozen_noise'] = freeze_payload
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
@@ -2277,6 +2477,9 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 result["__seed"] = int(seed)
             except Exception:
                 pass
+            if freeze_snapshot:
+                result['calibration_frozen'] = True
+                result['calibration_baseline_id'] = freeze_snapshot.get('baseline_id', '')
             mode = cfg_base['pipeline']['modulation']
             # FIX: Use effective CTRL setting from thresholds_override
             eff_use_ctrl = bool((thresholds_override or {}).get('use_control_channel',
@@ -2338,44 +2541,29 @@ def run_sweep(cfg: Dict[str, Any],
     if cfg['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
        sweep_param in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
         cal_seeds = list(range(10))
+
+    freeze_enabled = bool(cfg.get('analysis', {}).get('freeze_calibration', False))
+    freeze_snapshot: Optional[Dict[str, Any]] = None
+    if freeze_enabled and values_to_run:
+        baseline_value = _get_param_value(cfg, sweep_param)
+        snapshot_seeds = cal_seeds if cal_seeds else list(range(10))
+        freeze_snapshot = _build_freeze_snapshot(cfg, sweep_param, baseline_value, snapshot_seeds, recalibrate)
+        if freeze_snapshot:
+            for v in values_to_run:
+                thresholds_map[v] = dict(freeze_snapshot.get('thresholds', {}))
+        else:
+            print(f"?? Freeze calibration requested but baseline snapshot unavailable for {sweep_param}; proceeding without freeze.")
+            freeze_snapshot = None
+            freeze_enabled = False
+
+    if not freeze_enabled:
+        for v in values_to_run:
+            cfg_v = deepcopy(cfg)
+            _apply_sweep_param(cfg_v, sweep_param, v)
+            thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
+
     job_bar: Optional[Any] = None
     try:
-        for v in values_to_run:
-                cfg_v = deepcopy(cfg)
-                if '.' in sweep_param:
-                    keys = sweep_param.split('.')
-                    tgt = cfg_v
-                    for k in keys[:-1]:
-                        tgt = tgt[k]
-                    tgt[keys[-1]] = v
-                else:
-                    cfg_v[sweep_param] = v
-                # keep detection window consistent with the parameter being swept
-                if sweep_param == 'pipeline.distance_um':
-                    Ts = calculate_dynamic_symbol_period(cast(float, v), cfg_v)
-                    cfg_v['pipeline']['symbol_period_s'] = Ts
-                    dt = float(cfg_v['sim']['dt_s'])
-                    min_pts = int(cfg_v.get('_min_decision_points', 4))
-                    min_win = _enforce_min_window(cfg_v, Ts)
-                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                    cfg_v['detection']['decision_window_s'] = min_win
-                elif sweep_param == 'pipeline.guard_factor':
-                    dist = float(cfg_v['pipeline']['distance_um'])
-                    Ts = calculate_dynamic_symbol_period(dist, cfg_v)
-                    cfg_v['pipeline']['symbol_period_s'] = Ts
-                    dt = float(cfg_v['sim']['dt_s'])
-                    min_pts = int(cfg_v.get('_min_decision_points', 4))
-                    min_win = _enforce_min_window(cfg_v, Ts)
-                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                    cfg_v['detection']['decision_window_s'] = min_win
-                elif sweep_param in ['oect.gm_S', 'oect.C_tot_F']:
-                    Ts = float(cfg_v['pipeline'].get('symbol_period_s', calculate_dynamic_symbol_period(float(cfg_v['pipeline'].get('distance_um', 50.0)), cfg_v)))
-                    min_win = _enforce_min_window(cfg_v, Ts)
-                    cfg_v['pipeline']['symbol_period_s'] = Ts
-                    cfg_v['pipeline']['time_window_s'] = max(cfg_v['pipeline'].get('time_window_s', 0.0), min_win)
-                    cfg_v.setdefault('detection', {})['decision_window_s'] = min_win
-                thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
-    
         # Determine how many seed-jobs remain (for progress accounting)
         # --- NEW: resolve sweep folder early (for seed cache lookups) ---
         if "Nm_per_symbol" in sweep_param:
@@ -2471,7 +2659,7 @@ def run_sweep(cfg: Dict[str, Any],
                 seeds_to_run = list(seeds)
     
             # Submit only missing seeds
-            thresholds_override = thresholds_map.get(v)
+            thresholds_override = dict(thresholds_map.get(v, {}))
             
             # Account instantly for cached seeds in the bar
             results: List[Dict[str, Any]] = list(cached_results)
@@ -2513,7 +2701,8 @@ def run_sweep(cfg: Dict[str, Any],
                     s = seeds_to_run[idx]
                     fut = pool.submit(
                         run_param_seed_combo, cfg, sweep_param, v, s, debug_calibration, thresholds_override,
-                        sweep_name=sweep_folder, cache_tag=cache_tag, recalibrate=recalibrate
+                        sweep_name=sweep_folder, cache_tag=cache_tag, recalibrate=recalibrate,
+                        freeze_snapshot=freeze_snapshot
                     )
                     pending.add(fut)
                     fut_seed[fut] = s  # NEW: Track which seed this future handles
@@ -2577,7 +2766,8 @@ def run_sweep(cfg: Dict[str, Any],
                             retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
                             retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
                                                     debug_calibration, thresholds_override,
-                                                    sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate)
+                                                    sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate,
+                                                    freeze_snapshot=freeze_snapshot)
                             pending.add(retry_fut)
                             fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
                         continue  # NEW: Skip to next iteration after timeout handling
@@ -2623,15 +2813,44 @@ def run_sweep(cfg: Dict[str, Any],
             total_symbols = len(results) * cfg['pipeline']['sequence_length']
             total_errors = sum(cast(int, r['errors']) for r in results)
             ser = total_errors / total_symbols if total_symbols > 0 else 1.0
+            if total_symbols > 0:
+                z = 1.96
+                p_hat = total_errors / total_symbols
+                den = 1.0 + (z * z) / total_symbols
+                center = (p_hat + (z * z) / (2 * total_symbols)) / den
+                half = z * math.sqrt((p_hat * (1.0 - p_hat) / total_symbols) + (z * z) / (4 * total_symbols * total_symbols)) / den
+                ci_low = max(0.0, center - half)
+                ci_high = min(1.0, center + half)
+            else:
+                ci_low = float('nan')
+                ci_high = float('nan')
     
             # pooled decision stats for SNR proxy
             all_a: List[float] = []
             all_b: List[float] = []
+            charge_da_all: List[float] = []
+            charge_sero_all: List[float] = []
+            current_da_all: List[float] = []
+            current_sero_all: List[float] = []
             for r in results:
                 all_a.extend(cast(List[float], r.get('stats_da', [])))
                 all_b.extend(cast(List[float], r.get('stats_sero', [])))
+                charge_da_all.extend(cast(List[float], r.get('stats_charge_da', [])))
+                charge_sero_all.extend(cast(List[float], r.get('stats_charge_sero', [])))
+                current_da_all.extend(cast(List[float], r.get('stats_current_da', [])))
+                current_sero_all.extend(cast(List[float], r.get('stats_current_sero', [])))
             snr_lin = calculate_snr_from_stats(all_a, all_b) if all_a and all_b else 0.0
             snr_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
+            mean_charge_da = float(np.nanmean(charge_da_all)) if charge_da_all else float('nan')
+            mean_charge_sero = float(np.nanmean(charge_sero_all)) if charge_sero_all else float('nan')
+            mean_current_da = float(np.nanmean(current_da_all)) if current_da_all else float('nan')
+            mean_current_sero = float(np.nanmean(current_sero_all)) if current_sero_all else float('nan')
+            delta_q_diff = float(mean_charge_da - mean_charge_sero) if (
+                np.isfinite(mean_charge_da) and np.isfinite(mean_charge_sero)
+            ) else float('nan')
+            delta_i_diff_raw = float(mean_current_da - mean_current_sero) if (
+                np.isfinite(mean_current_da) and np.isfinite(mean_current_sero)
+            ) else float('nan')
     
             # ISI context
             isi_enabled = any(bool(r.get('isi_enabled', False)) for r in results)
@@ -2644,24 +2863,45 @@ def run_sweep(cfg: Dict[str, Any],
             ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
             ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
             ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
+            ns_diff_charge = [float(r.get('noise_sigma_diff_charge', float('nan'))) for r in results]
             ns_thermal = [float(r.get('noise_sigma_thermal', float('nan'))) for r in results]
             ns_flicker = [float(r.get('noise_sigma_flicker', float('nan'))) for r in results]
             ns_drift = [float(r.get('noise_sigma_drift', float('nan'))) for r in results]
+            ns_single = [float(r.get('noise_sigma_single', float('nan'))) for r in results]
             thermal_fracs = [float(r.get('noise_thermal_fraction', float('nan'))) for r in results]
+            rho_pre_vals = [float(r.get('rho_pre_ctrl', float('nan'))) for r in results]
+            burst_shapes = [str(r.get('burst_shape', '')) for r in results if r.get('burst_shape') not in (None, '')]
+            trelease_vals = [float(r.get('T_release_ms', float('nan'))) for r in results]
             arr_da = np.asarray(ns_da, dtype=float)
+            arr_rho_pre = np.asarray(rho_pre_vals, dtype=float)
             arr_sero = np.asarray(ns_sero, dtype=float)
             arr_diff = np.asarray(ns_diff, dtype=float)
+            arr_diff_charge = np.asarray(ns_diff_charge, dtype=float)
             arr_thermal = np.asarray(ns_thermal, dtype=float)
             arr_flicker = np.asarray(ns_flicker, dtype=float)
             arr_drift = np.asarray(ns_drift, dtype=float)
+            arr_single = np.asarray(ns_single, dtype=float)
             arr_thermal_frac = np.asarray(thermal_fracs, dtype=float)
             med_sigma_da = float(np.nanmedian(arr_da)) if np.isfinite(arr_da).any() else float('nan')
             med_sigma_sero = float(np.nanmedian(arr_sero)) if np.isfinite(arr_sero).any() else float('nan')
             med_sigma_diff = float(np.nanmedian(arr_diff)) if np.isfinite(arr_diff).any() else float('nan')
+            med_sigma_diff_charge = float(np.nanmedian(arr_diff_charge)) if np.isfinite(arr_diff_charge).any() else float('nan')
+            med_sigma_single = float(np.nanmedian(arr_single)) if np.isfinite(arr_single).any() else float('nan')
             med_sigma_thermal = float(np.nanmedian(arr_thermal)) if np.isfinite(arr_thermal).any() else float('nan')
             med_sigma_flicker = float(np.nanmedian(arr_flicker)) if np.isfinite(arr_flicker).any() else float('nan')
             med_sigma_drift = float(np.nanmedian(arr_drift)) if np.isfinite(arr_drift).any() else float('nan')
             med_thermal_frac = float(np.nanmedian(arr_thermal_frac)) if np.isfinite(arr_thermal_frac).any() else float('nan')
+            med_rho_pre = float(np.nanmedian(arr_rho_pre)) if np.isfinite(arr_rho_pre).any() else float('nan')
+
+            sigma_diff_current_vals: List[float] = []
+            for sigma_charge_val, res in zip(ns_diff_charge, results):
+                det_win = float(res.get('detection_window_s', decision_window_s))
+                if det_win > 0 and math.isfinite(sigma_charge_val):
+                    sigma_diff_current_vals.append(float(sigma_charge_val) / det_win)
+                else:
+                    sigma_diff_current_vals.append(float('nan'))
+            arr_diff_current = np.asarray(sigma_diff_current_vals, dtype=float)
+            med_sigma_diff_current = float(np.nanmedian(arr_diff_current)) if np.isfinite(arr_diff_current).any() else float('nan')
     
             delta_stat_values: List[float] = []
             for r in results:
@@ -2677,7 +2917,14 @@ def run_sweep(cfg: Dict[str, Any],
                 if np.isfinite(delta_val):
                     delta_stat_values.append(delta_val)
             med_delta_stat = float(np.nanmedian(np.asarray(delta_stat_values, dtype=float))) if delta_stat_values else float('nan')
-            delta_I_diff = float(med_delta_stat * med_sigma_diff) if (np.isfinite(med_delta_stat) and np.isfinite(med_sigma_diff)) else float('nan')
+            delta_Q_diff = float(delta_q_diff) if np.isfinite(delta_q_diff) else float('nan')
+            delta_over_sigma_Q = float(delta_Q_diff / med_sigma_diff_charge) if (
+                np.isfinite(delta_Q_diff) and np.isfinite(med_sigma_diff_charge) and med_sigma_diff_charge > 0
+            ) else float('nan')
+            delta_I_diff = float(delta_i_diff_raw) if np.isfinite(delta_i_diff_raw) else float('nan')
+            delta_over_sigma_I = float(delta_I_diff / med_sigma_diff_current) if (
+                np.isfinite(delta_I_diff) and np.isfinite(med_sigma_diff_current) and med_sigma_diff_current > 0
+            ) else float('nan')
     
             i_dc_vals = np.asarray([r.get('I_dc_used_A', float('nan')) for r in results], dtype=float)
             v_g_vals = np.asarray([r.get('V_g_bias_V_used', float('nan')) for r in results], dtype=float)
@@ -2692,6 +2939,8 @@ def run_sweep(cfg: Dict[str, Any],
             med_V_g_bias = _finite_median(v_g_vals)
             med_gm = _finite_median(gm_vals)
             med_c_tot = _finite_median(c_tot_vals)
+            med_t_release = _finite_median(np.asarray(trelease_vals, dtype=float))
+            burst_shape_val = burst_shapes[0] if burst_shapes else ''
     
             mode_name = cfg['pipeline']['modulation']
             snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
@@ -2707,7 +2956,12 @@ def run_sweep(cfg: Dict[str, Any],
                 current_distance = float(v)
             if sweep_param == 'pipeline.Nm_per_symbol':
                 current_nm = float(v)
-    
+            detector_mode = str(cfg['pipeline'].get('detector_mode', 'zscore')).lower()
+            for r in results:
+                if r.get('detector_mode'):
+                    detector_mode = str(r.get('detector_mode')).lower()
+                    break
+
             row: Dict[str, Any] = {
                 sweep_param: v,
                 'ser': ser,
@@ -2724,16 +2978,24 @@ def run_sweep(cfg: Dict[str, Any],
                 'noise_sigma_da': med_sigma_da,
                 'noise_sigma_sero': med_sigma_sero,
                 'noise_sigma_I_diff': med_sigma_diff,
+                'noise_sigma_diff_charge': med_sigma_diff_charge,
+                'noise_sigma_single': med_sigma_single,
                 'noise_sigma_thermal': med_sigma_thermal,
                 'noise_sigma_flicker': med_sigma_flicker,
                 'noise_sigma_drift': med_sigma_drift,
                 'noise_thermal_fraction': med_thermal_frac,
+                'rho_pre_ctrl': med_rho_pre,
                 'I_dc_used_A': med_I_dc,
                 'V_g_bias_V_used': med_V_g_bias,
                 'gm_S': med_gm,
                 'C_tot_F': med_c_tot,
                 'delta_over_sigma': med_delta_stat,
+                'delta_Q_diff': delta_Q_diff,
+                'sigma_Q_diff': med_sigma_diff_charge,
+                'delta_over_sigma_Q': delta_over_sigma_Q,
                 'delta_I_diff': delta_I_diff,
+                'sigma_I_diff': med_sigma_diff_current,
+                'delta_over_sigma_I': delta_over_sigma_I,
                 'distance_um': current_distance,
                 'Nm_per_symbol': current_nm,
                 'rho_cc': float(cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.0)),
@@ -2742,7 +3004,24 @@ def run_sweep(cfg: Dict[str, Any],
                 'ctrl_auto_applied': bool(thresholds_map.get(v, {}).get('ctrl_auto_applied', False)),
                 'rho_cc_measured': float(rho_cc_raw) if isinstance(rho_cc_raw, (int, float)) else float('nan'),
                 'mode': mode_name,
+                'detector_mode': detector_mode,
+                'ser_ci_low': float(ci_low),
+                'ser_ci_high': float(ci_high),
+                'burst_shape': burst_shape_val,
+                'T_release_ms': med_t_release,
             }
+            freeze_flags = [bool(r.get('calibration_frozen', False)) for r in results]
+            baseline_ids = {str(r.get('calibration_baseline_id', '')).strip() for r in results if r.get('calibration_baseline_id')}
+            if freeze_snapshot and freeze_snapshot.get('baseline_id'):
+                baseline_ids.add(str(freeze_snapshot['baseline_id']))
+            row['calibration_frozen'] = bool(freeze_snapshot) or any(freeze_flags)
+            row['calibration_baseline_id'] = next(iter(baseline_ids)) if baseline_ids else ''
+            if freeze_snapshot:
+                row['calibration_baseline_param'] = freeze_snapshot.get('sweep_param', '')
+                row['calibration_baseline_value'] = freeze_snapshot.get('baseline_value', float('nan'))
+            else:
+                row['calibration_baseline_param'] = ''
+                row['calibration_baseline_value'] = float('nan')
             # Duplicate Nm column name for plotting compatibility
             if sweep_param == 'pipeline.Nm_per_symbol':
                 row['pipeline_Nm_per_symbol'] = v
@@ -4405,14 +4684,14 @@ def _run_guard_frontier(
         return float(cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
 
     frames_tradeoff: List[pd.DataFrame] = []
-    frontier_rows: List[Dict[str, Any]] = []
     distances_recomputed: set = set()
-    distances_considered: set = set()
+    nm_lookup: Dict[float, float] = {}
 
     try:
         for dist in distance_candidates:
             dist_float = float(dist)
             nm_target = _nm_for_distance(dist_float)
+            nm_lookup[dist_float] = nm_target
     
             existing_for_dist = existing_tradeoff.copy()
             if not existing_for_dist.empty:
@@ -4529,11 +4808,11 @@ def _run_guard_frontier(
                     except Exception:
                         pass
                 continue
-    
+
             df_guard_combined = pd.concat(combined_parts, ignore_index=True)
             if 'distance_um' not in df_guard_combined.columns:
                 df_guard_combined['distance_um'] = dist_float
-    
+
             guard_col = 'guard_factor' if 'guard_factor' in df_guard_combined.columns else 'pipeline.guard_factor'
             df_guard_combined[guard_col] = pd.to_numeric(df_guard_combined[guard_col], errors='coerce')
             df_guard_combined['symbol_period_s'] = pd.to_numeric(df_guard_combined['symbol_period_s'], errors='coerce')
@@ -4541,36 +4820,6 @@ def _run_guard_frontier(
             df_guard_combined = df_guard_combined.dropna(subset=[guard_col, 'symbol_period_s', 'ser'])
             if df_guard_combined.empty:
                 continue
-    
-            df_guard_combined['IRT'] = (
-                bits_per_symbol / df_guard_combined['symbol_period_s']
-            ) * (1.0 - df_guard_combined['ser'])
-    
-            best_idx = int(df_guard_combined['IRT'].idxmax())
-    
-            guard_val_raw = df_guard_combined.at[best_idx, guard_col]
-            guard_val = _coerce_float(guard_val_raw)
-            irt_val = _coerce_float(df_guard_combined.at[best_idx, 'IRT'])
-            ser_val = _coerce_float(df_guard_combined.at[best_idx, 'ser'])
-            symbol_period_val = _coerce_float(df_guard_combined.at[best_idx, 'symbol_period_s'])
-            if 'Nm_per_symbol' in df_guard_combined.columns:
-                nm_val_raw = df_guard_combined.at[best_idx, 'Nm_per_symbol']
-                nm_val = _coerce_float(nm_val_raw, float(nm_target))
-            else:
-                nm_val = float(nm_target)
-    
-            distances_considered.add(dist_float)
-            frontier_rows.append({
-                'distance_um': dist_float,
-                'best_guard_factor': guard_val,
-                'max_irt_bps': irt_val,
-                'ser_at_best_guard': ser_val,
-                'symbol_period_s': symbol_period_val,
-                'Nm_per_symbol': nm_val,
-                'use_ctrl': desired_ctrl,
-                'mode': mode,
-                'bits_per_symbol': bits_per_symbol,
-            })
             if distance_task:
                 try:
                     distance_task.update(1, description=f'{mode} d={dist_float:.0f}um')
@@ -4602,36 +4851,81 @@ def _run_guard_frontier(
             combined_tradeoff['distance_um'] = pd.to_numeric(combined_tradeoff.get('distance_um', pd.Series(dtype=float)), errors='coerce')
         else:
             combined_tradeoff['distance_um'] = pd.to_numeric(combined_tradeoff['distance_um'], errors='coerce')
-        if 'guard_factor' not in combined_tradeoff.columns and 'pipeline.guard_factor' in combined_tradeoff.columns:
-            combined_tradeoff['guard_factor'] = pd.to_numeric(combined_tradeoff['pipeline.guard_factor'], errors='coerce')
-        elif 'guard_factor' in combined_tradeoff.columns:
-            combined_tradeoff['guard_factor'] = pd.to_numeric(combined_tradeoff['guard_factor'], errors='coerce')
-        subset_cols = ['distance_um', 'guard_factor']
+        guard_col = 'guard_factor' if 'guard_factor' in combined_tradeoff.columns else 'pipeline.guard_factor'
+        combined_tradeoff[guard_col] = pd.to_numeric(combined_tradeoff[guard_col], errors='coerce')
+        combined_tradeoff['symbol_period_s'] = pd.to_numeric(combined_tradeoff['symbol_period_s'], errors='coerce')
+        combined_tradeoff['ser'] = pd.to_numeric(combined_tradeoff['ser'], errors='coerce')
+        subset_cols = ['distance_um', guard_col, 'symbol_period_s', 'ser']
         if 'use_ctrl' in combined_tradeoff.columns:
             subset_cols.append('use_ctrl')
+            combined_tradeoff = combined_tradeoff[combined_tradeoff['use_ctrl'] == desired_ctrl]
         combined_tradeoff = combined_tradeoff.dropna(subset=subset_cols)
-        combined_tradeoff = combined_tradeoff.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
+        combined_tradeoff = combined_tradeoff.drop_duplicates(subset=subset_cols, keep='last').sort_values(['distance_um', guard_col])
         _atomic_write_csv(tradeoff_csv, combined_tradeoff)
         print(f"?? Guard trade-off data saved to {tradeoff_csv} ({len(combined_tradeoff)} rows)")
+    elif not frames_tradeoff:
+        print(f"?? Guard trade-off not updated (no new data) at {tradeoff_csv}")
 
-    if frontier_rows:
-        df_frontier_new = pd.DataFrame(frontier_rows)
-        if not existing_frontier.empty and distances_considered:
-            mask_front = pd.Series(True, index=existing_frontier.index)
-            if 'distance_um' in existing_frontier.columns:
-                dist_series = pd.to_numeric(existing_frontier['distance_um'], errors='coerce')
-                mask_front &= ~dist_series.apply(lambda x: any(abs(x - d) < 1e-6 for d in distances_considered))
-            if 'use_ctrl' in existing_frontier.columns:
-                mask_front |= existing_frontier['use_ctrl'] != desired_ctrl
-            existing_frontier = existing_frontier[mask_front]
-        combined_frontier = pd.concat([existing_frontier, df_frontier_new], ignore_index=True)
+    def _compute_frontier(df_source: pd.DataFrame) -> pd.DataFrame:
+        if df_source.empty:
+            return pd.DataFrame()
+        df_front = df_source.copy()
+        guard_name = 'guard_factor' if 'guard_factor' in df_front.columns else 'pipeline.guard_factor'
+        df_front['distance_um'] = pd.to_numeric(df_front['distance_um'], errors='coerce')
+        df_front[guard_name] = pd.to_numeric(df_front[guard_name], errors='coerce')
+        df_front['symbol_period_s'] = pd.to_numeric(df_front['symbol_period_s'], errors='coerce')
+        df_front['ser'] = pd.to_numeric(df_front['ser'], errors='coerce')
+        df_front = df_front.dropna(subset=['distance_um', guard_name, 'symbol_period_s', 'ser'])
+        if df_front.empty:
+            return pd.DataFrame()
+        df_front['IRT'] = (bits_per_symbol / df_front['symbol_period_s']) * (1.0 - df_front['ser'])
+        rows: List[Dict[str, Any]] = []
+        for dist_val, group in df_front.groupby('distance_um'):
+            if group.empty:
+                continue
+            idx = group['IRT'].idxmax()
+            if idx is None or idx not in group.index:
+                continue
+            row = group.loc[idx]
+            dist_val_f = _coerce_float(dist_val)
+            guard_val = _coerce_float(row.get(guard_name))
+            irt_val = _coerce_float(row.get('IRT'))
+            ser_val = _coerce_float(row.get('ser'))
+            symbol_period_val = _coerce_float(row.get('symbol_period_s'))
+            nm_raw = row.get('Nm_per_symbol')
+            nm_default = _coerce_float(
+                nm_lookup.get(dist_val_f, cfg_base['pipeline'].get('Nm_per_symbol', 1e4))
+            )
+            nm_val = _coerce_float(nm_raw, nm_default)
+            if not math.isfinite(nm_val):
+                nm_val = nm_default
+            rows.append({
+                'distance_um': dist_val_f,
+                'best_guard_factor': guard_val,
+                'max_irt_bps': irt_val,
+                'ser_at_best_guard': ser_val,
+                'symbol_period_s': symbol_period_val,
+                'Nm_per_symbol': nm_val,
+                'use_ctrl': desired_ctrl,
+                'mode': mode,
+                'bits_per_symbol': bits_per_symbol,
+            })
+        if not rows:
+            return pd.DataFrame()
+        df_frontier = pd.DataFrame(rows)
+        df_frontier.sort_values(by=['distance_um'], inplace=True)
+        return df_frontier
+
+    if not combined_tradeoff.empty:
+        combined_frontier = _compute_frontier(combined_tradeoff)
     else:
-        combined_frontier = existing_frontier
+        combined_frontier = existing_frontier.copy()
 
     if not combined_frontier.empty:
         combined_frontier['distance_um'] = pd.to_numeric(combined_frontier['distance_um'], errors='coerce')
         subset_cols = ['distance_um']
         if 'use_ctrl' in combined_frontier.columns:
+            combined_frontier['use_ctrl'] = combined_frontier['use_ctrl'].astype(bool)
             subset_cols.append('use_ctrl')
         combined_frontier = combined_frontier.dropna(subset=subset_cols)
         combined_frontier = combined_frontier.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
