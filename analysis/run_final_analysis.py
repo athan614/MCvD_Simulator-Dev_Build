@@ -17,7 +17,7 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError, Future
 import multiprocessing as mp
 import psutil
-from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set
+from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable
 import gc
 import os
 import platform
@@ -616,6 +616,42 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 out.append(xf)
         return out
 
+    collect_trace = bool(cfg.get('analysis', {}).get('store_calibration_stats', False))
+    calibration_trace: Dict[str, Dict[str, Any]] = {} if collect_trace else {}
+
+    def _accumulate_trace(mode_key: str, symbol_key: Union[int, str], result: Optional[Dict[str, Any]]) -> None:
+        if not collect_trace or not result:
+            return
+        symbol_map = calibration_trace.setdefault(mode_key, {})
+        entry = symbol_map.setdefault(str(symbol_key), {})
+        detector_mode_local = str(result.get('detector_mode', cfg['pipeline'].get('detector_mode', 'zscore'))).lower()
+        entry.setdefault('detector_mode', detector_mode_local)
+
+        def _extend_entry(key: str, values: Iterable[Any]) -> None:
+            existing = entry.setdefault(key, [])
+            for val in values:
+                try:
+                    fv = float(val)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    existing.append(fv)
+
+        for key in ('q_values', 'raw_stats', 'whitened_stats', 'zscore_stats'):
+            if key in result:
+                _extend_entry(key, result[key])
+
+        if 'aux_q' in result:
+            aux_list = entry.setdefault('aux_q', [])
+            aux_list.extend([[float(a), float(b)] for a, b in result['aux_q']])
+
+        if 'channel_integrals' in result:
+            ci_dest = entry.setdefault('channel_integrals', {})
+            channel_integrals = result['channel_integrals']
+            for ci_key, pairs in channel_integrals.items():
+                dest = ci_dest.setdefault(ci_key, [])
+                dest.extend([[float(a), float(b)] for a, b in pairs])
+
     # ---------- try cache unless recalibrate ----------
     if threshold_file.exists() and not recalibrate and save_to_file:
         try:
@@ -697,7 +733,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     cal_cfg.setdefault('detection', {})['decision_window_s'] = float(min_win)
     cal_cfg['pipeline']['time_window_s'] = max(float(cal_cfg['pipeline'].get('time_window_s', 0.0)), float(min_win))
 
-    thresholds: Dict[str, Union[float, List[float], str]] = {}
+    thresholds: Dict[str, Any] = {}
 
     # ----- shared ES knobs -----
     eps          = float(cfg.get('_cal_eps_rel', 0.01))
@@ -742,8 +778,10 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             r_se = run_calibration_symbols(cal_cfg_mosk, 1, mode='MoSK')  # SERO class
             if r_da and 'q_values' in r_da:
                 mosk_stats['da'].extend(_clean(r_da['q_values']))
+                _accumulate_trace('MoSK', 0, r_da)
             if r_se and 'q_values' in r_se:
                 mosk_stats['sero'].extend(_clean(r_se['q_values']))
+                _accumulate_trace('MoSK', 1, r_se)
 
             # Early-stop only when enough data per class
             if es_mosk and used >= min_seeds and \
@@ -851,6 +889,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 r = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
                 if r and 'q_values' in r:
                     level_stats[level].extend(_clean(r['q_values']))
+                    _accumulate_trace('CSK', level, r)
 
             # Only check stability when each class has enough samples
             if used >= min_seeds and all(len(level_stats[i]) >= min_per_cls for i in range(M)):
@@ -928,6 +967,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                     elif sym == 1: stats['da_high'].extend(vals)
                     elif sym == 2: stats['sero_low'].extend(vals)
                     elif sym == 3: stats['sero_high'].extend(vals)
+                    _accumulate_trace('Hybrid', sym, r)
 
             if es_hybrid and used >= min_seeds and \
                min(len(stats['da_low']), len(stats['da_high'])) >= min_per_cls and \
@@ -1086,6 +1126,9 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         thresholds['use_control_channel'] = bool(ctrl_use)
         thresholds['ctrl_auto_applied'] = bool(cfg.get('_ctrl_auto', False))
 
+    if collect_trace and calibration_trace:
+        thresholds['_calibration_trace'] = calibration_trace
+
     return thresholds
 
 def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False) -> Dict[str, Union[float, List[float], str]]:
@@ -1215,6 +1258,9 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         # Validate range
         if not (0.1 <= args.decision_window_frac <= 1.0):
             raise ValueError(f"--decision-window-frac must be between 0.1 and 1.0, got {args.decision_window_frac}")
+
+    if getattr(args, 'store_calibration_stats', False):
+        cfg.setdefault('analysis', {})['store_calibration_stats'] = True
     
     # Analysis overrides
     if args.allow_ts_exceed:
@@ -1795,6 +1841,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Detector statistic normalisation (default: zscore).")
     parser.add_argument("--freeze-calibration", action="store_true",
                         help="Reuse baseline thresholds/sigmas during parameter sweeps.")
+    parser.add_argument("--store-calibration-stats", action="store_true",
+                        help="Persist per-symbol calibration statistics (raw/zscore/whitened, integrals) into the threshold cache.")
     parser.add_argument("--nt-pairs", type=str, default="", help="CSV nt-pairs for CSK sweeps")
 
     # --- Baseline / variant helpers ---
@@ -2035,6 +2083,14 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         tx_symbols = [symbol] * num_symbols
         q_da_values: List[float] = []
         q_sero_values: List[float] = []
+        q_da_tail_single: List[float] = []
+        q_sero_tail_single: List[float] = []
+        q_da_tail_diff: List[float] = []
+        q_sero_tail_diff: List[float] = []
+        q_da_full_single: List[float] = []
+        q_sero_full_single: List[float] = []
+        q_da_full_diff: List[float] = []
+        q_sero_full_diff: List[float] = []
         stats_map: Dict[str, List[float]] = {key: [] for key in ('zscore', 'raw', 'whitened')}
         dt = cal_cfg['sim']['dt_s']
         detection = cal_cfg.setdefault('detection', {})
@@ -2103,10 +2159,63 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             if n_detect_samples <= 1:
                 continue
 
-            q_da = float(np.trapezoid(ig[:n_detect_samples], dx=dt))
-            q_sero = float(np.trapezoid(ia[:n_detect_samples], dx=dt))
-            q_da_values.append(q_da)
-            q_sero_values.append(q_sero)
+            tail_fraction = float(cal_cfg['pipeline'].get('csk_tail_fraction',
+                                                          detection.get('tail_fraction',
+                                                                        cal_cfg['pipeline'].get('hybrid_tail_fraction', 1.0))))
+            if mode == 'MoSK':
+                tail_fraction = 1.0
+            tail_fraction = min(max(tail_fraction, 0.1), 1.0)
+            i0 = int((1.0 - tail_fraction) * n_detect_samples)
+            i0 = min(max(i0, 0), max(n_detect_samples - 1, 0))
+
+            sig_da_full = ig[:n_detect_samples]
+            sig_sero_full = ia[:n_detect_samples]
+            sig_ctrl_full = ic[:n_detect_samples]
+            if sig_ctrl_full.shape[0] < n_detect_samples:
+                pad_width = n_detect_samples - sig_ctrl_full.shape[0]
+                sig_ctrl_full = np.pad(sig_ctrl_full, (0, pad_width), mode='constant')
+
+            use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
+            subtract_for_q = (mode != 'MoSK') and use_ctrl
+
+            sig_da_single_tail = sig_da_full[i0:n_detect_samples]
+            sig_sero_single_tail = sig_sero_full[i0:n_detect_samples]
+            q_da_tail_single_val = float(np.trapezoid(sig_da_single_tail, dx=dt))
+            q_sero_tail_single_val = float(np.trapezoid(sig_sero_single_tail, dx=dt))
+
+            if use_ctrl and len(sig_ctrl_full):
+                sig_ctrl_tail = sig_ctrl_full[i0:n_detect_samples]
+                sig_da_diff_tail = (sig_da_single_tail - sig_ctrl_tail)
+                sig_sero_diff_tail = (sig_sero_single_tail - sig_ctrl_tail)
+                sig_da_diff_full = sig_da_full - sig_ctrl_full
+                sig_sero_diff_full = sig_sero_full - sig_ctrl_full
+            else:
+                sig_da_diff_tail = sig_da_single_tail
+                sig_sero_diff_tail = sig_sero_single_tail
+                sig_da_diff_full = sig_da_full
+                sig_sero_diff_full = sig_sero_full
+
+            q_da_tail_diff_val = float(np.trapezoid(sig_da_diff_tail, dx=dt))
+            q_sero_tail_diff_val = float(np.trapezoid(sig_sero_diff_tail, dx=dt))
+            q_da_full_single_val = float(np.trapezoid(sig_da_full, dx=dt))
+            q_sero_full_single_val = float(np.trapezoid(sig_sero_full, dx=dt))
+            q_da_full_diff_val = float(np.trapezoid(sig_da_diff_full, dx=dt))
+            q_sero_full_diff_val = float(np.trapezoid(sig_sero_diff_full, dx=dt))
+
+            q_da_values.append(q_da_tail_diff_val if subtract_for_q else q_da_tail_single_val)
+            q_sero_values.append(q_sero_tail_diff_val if subtract_for_q else q_sero_tail_single_val)
+
+            q_da_tail_single.append(q_da_tail_single_val)
+            q_sero_tail_single.append(q_sero_tail_single_val)
+            q_da_tail_diff.append(q_da_tail_diff_val)
+            q_sero_tail_diff.append(q_sero_tail_diff_val)
+            q_da_full_single.append(q_da_full_single_val)
+            q_sero_full_single.append(q_sero_full_single_val)
+            q_da_full_diff.append(q_da_full_diff_val)
+            q_sero_full_diff.append(q_sero_full_diff_val)
+
+            q_da = q_da_values[-1]
+            q_sero = q_sero_values[-1]
 
             if mode == 'MoSK':
                 q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
@@ -2179,7 +2288,13 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
                 )
                 stats_map['whitened'].append(float(stat_whitened))
 
-        aux_q = list(zip(q_da_values, q_sero_values))
+        aux_q = [(float(a), float(b)) for a, b in zip(q_da_values, q_sero_values)]
+        channel_integrals = {
+            'tail_single': [(float(a), float(b)) for a, b in zip(q_da_tail_single, q_sero_tail_single)],
+            'tail_diff': [(float(a), float(b)) for a, b in zip(q_da_tail_diff, q_sero_tail_diff)],
+            'full_single': [(float(a), float(b)) for a, b in zip(q_da_full_single, q_sero_full_single)],
+            'full_diff': [(float(a), float(b)) for a, b in zip(q_da_full_diff, q_sero_full_diff)],
+        }
         chosen_stats = stats_map.get(detector_mode, stats_map['zscore'])
         result: Dict[str, Any] = {
             'q_values': chosen_stats,
@@ -2188,6 +2303,7 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             'whitened_stats': stats_map['whitened'],
             'aux_q': aux_q,
             'detector_mode': detector_mode,
+            'channel_integrals': channel_integrals,
         }
 
         if mode.startswith('CSK') and cal_cfg['pipeline'].get('csk_store_combiner_meta', True):

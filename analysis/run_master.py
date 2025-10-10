@@ -454,6 +454,9 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     if hasattr(args, 'ctrl_snr_min_gain_db') and args.ctrl_snr_min_gain_db != 0.0:
         cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
 
+    if getattr(args, 'store_calibration_stats', False):
+        cmd.append("--store-calibration-stats")
+
     # Pass logging controls through to child...
     return cmd
 
@@ -644,7 +647,10 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
         cmd.extend(["--ctrl-rho-min-abs", str(args.ctrl_rho_min_abs)])
     if hasattr(args, 'ctrl_snr_min_gain_db') and args.ctrl_snr_min_gain_db != 0.0:
         cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
-    
+
+    if getattr(args, 'store_calibration_stats', False):
+        cmd.append("--store-calibration-stats")
+
     return cmd
 
 def _child_max_workers(args: argparse.Namespace, num_modes: int = 1) -> Optional[int]:
@@ -712,6 +718,8 @@ def main() -> None:
     p.add_argument("--extreme-mode", action="store_true", help="Pass through to run_final_analysis (max P-core threads)")
     p.add_argument("--beast-mode", action="store_true", help="Pass through to run_final_analysis (P-cores minus margin)")
     p.add_argument("--max-workers", type=int, default=None, help="Override worker count in run_final_analysis")
+    p.add_argument("--store-calibration-stats", action="store_true",
+                   help="Forward to analysis runner to persist full calibration statistics.")
     
     # NEW: Decision window and ISI optimization toggles
     p.add_argument("--decision-window-policy", choices=["fixed", "fraction_of_Ts", "full_Ts"], default=None,
@@ -934,6 +942,7 @@ def main() -> None:
                 args.max_symbol_duration_s = 0.0
             if getattr(args, "guard_samples_cap", None) is None:
                 args.guard_samples_cap = 0.0
+            args.store_calibration_stats = True
 
             search_len = getattr(args, "lod_seq_len", 250)
             validate_len = getattr(args, "lod_validate_seq_len", None)
@@ -1050,6 +1059,8 @@ def main() -> None:
         flag_list.append("--extreme-mode")
     elif args.beast_mode:
         flag_list.append("--beast-mode")
+    if args.store_calibration_stats:
+        flag_list.append("--store-calibration-stats")
     if args.max_workers is not None:
         flag_list.append(f"--max-workers={args.max_workers}")
     if args.studies:
