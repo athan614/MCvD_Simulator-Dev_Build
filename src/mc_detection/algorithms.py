@@ -18,7 +18,7 @@ from scipy.stats import norm # type: ignore[import]
 # ------------------------------------------------------------------
 #  Helper - integrate drain current over decision window
 # ------------------------------------------------------------------
-def integrate_current(i_t: np.ndarray, dt: float, win_s: float) -> float:
+def integrate_current(i_t: np.ndarray, dt: float, win_s: float, anchor: str = "start") -> float:
     """
     Integrate current over decision window to get charge.
     
@@ -31,13 +31,24 @@ def integrate_current(i_t: np.ndarray, dt: float, win_s: float) -> float:
     win_s : float
         Integration window [s]
         
+    anchor : str, optional
+        'start' to integrate from the beginning, 'tail'/'end' for the most recent samples.
+
     Returns
     -------
     float
         Integrated charge [C]
     """
     n_int = min(int(win_s / dt), len(i_t))
-    return dt * np.sum(i_t[:n_int])
+    if n_int <= 0:
+        return 0.0
+    anchor_norm = str(anchor).lower()
+    if anchor_norm in ("tail", "end"):
+        start = max(len(i_t) - n_int, 0)
+        slice_view = i_t[start:start + n_int]
+    else:
+        slice_view = i_t[:n_int]
+    return dt * float(np.sum(slice_view))
 
 
 # ------------------------------------------------------------------
@@ -65,6 +76,8 @@ def detect_mosk(
 
     win = float(detection_cfg.get('decision_window_s', pipeline_cfg.get('symbol_period_s', 0.0)))
     dt = float(sim_cfg.get('dt_s', 1.0))
+    anchor = str(detection_cfg.get('decision_window_anchor', 'start')).lower()
+    tail_mode = anchor in ('tail', 'end')
 
     detector_mode = detector_mode or str(pipeline_cfg.get('detector_mode', 'zscore')).lower()
     if detector_mode not in ('raw', 'zscore', 'whitened'):
@@ -87,8 +100,13 @@ def detect_mosk(
     if n_int <= 0:
         return 1
 
-    q_da = float(np.trapezoid(i_da_use[:n_int], dx=dt))
-    q_sero = float(np.trapezoid(i_sero_use[:n_int], dx=dt))
+    start = max(len(i_da_use) - n_int, 0) if tail_mode else 0
+    end = start + n_int
+    slice_da = i_da_use[start:end]
+    slice_sero = i_sero_use[start:end]
+
+    q_da = float(np.trapezoid(slice_da, dx=dt))
+    q_sero = float(np.trapezoid(slice_sero, dx=dt))
 
     from ..constants import get_nt_params
 
@@ -100,7 +118,7 @@ def detect_mosk(
     raw_stat = (sign_da * q_da) - (sign_sero * q_sero)
 
     if sigma_diff is None:
-        diff_samples = (sign_da * i_da_use[:n_int]) - (sign_sero * i_sero_use[:n_int])
+        diff_samples = (sign_da * slice_da) - (sign_sero * slice_sero)
         sigma_est = float(np.std(diff_samples, ddof=1) * np.sqrt(dt))
         sigma_diff = max(sigma_est, 1e-15)
 
@@ -195,14 +213,16 @@ def detect_csk_binary(i_ch: np.ndarray,
     int
         0 for low concentration, 1 for high concentration
     """
-    win = cfg['detection']['decision_window_s']
-    dt = cfg['sim']['dt_s']
+    win = float(cfg['detection']['decision_window_s'])
+    dt = float(cfg['sim']['dt_s'])
+    anchor = str(cfg['detection'].get('decision_window_anchor', 'start')).lower()
+    win_eff = max(win, dt)
     
     # Differential measurement
     i_diff = i_ch - i_ctrl
     
     # Average current over decision window
-    q_avg = integrate_current(i_diff, dt, win) / win
+    q_avg = integrate_current(i_diff, dt, win_eff, anchor=anchor) / win_eff
     
     return int(q_avg < threshold)   # Flip to < if negative signals mean higher levels (depletion mode)
 
@@ -235,14 +255,16 @@ def detect_csk_mary(i_ch: np.ndarray,
     int
         Detected symbol (0 to M-1)
     """
-    win = cfg['detection']['decision_window_s']
-    dt = cfg['sim']['dt_s']
+    win = float(cfg['detection']['decision_window_s'])
+    dt = float(cfg['sim']['dt_s'])
+    anchor = str(cfg['detection'].get('decision_window_anchor', 'start')).lower()
+    win_eff = max(win, dt)
     
     # Differential measurement
     i_diff = i_ch - i_ctrl
     
-    # Average current over decision window (signed—no abs; handles negative depletion currents)
-    q_avg = integrate_current(i_diff, dt, win) / win    # Signed value (e.g., more negative = higher level if depletion)
+    # Average current over decision window (signed-no abs; handles negative depletion currents)
+    q_avg = integrate_current(i_diff, dt, win_eff, anchor=anchor) / win_eff    # Signed value (e.g., more negative = higher level if depletion)
     
     # Find symbol by comparing to thresholds (calibrated on signed stats)
     symbol = 0

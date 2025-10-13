@@ -93,6 +93,20 @@ def _log_oect_figures(prefix: str = "[oect]") -> None:
         status = "available" if full_path.exists() else "missing"
         print(f"{prefix}   - {rel_path} ({status})")
 
+
+def _extend_nm_grid_flags(cmd: List[str], args: argparse.Namespace) -> None:
+    """Append Nm grid overrides to the child command if provided."""
+    if getattr(args, "nm_grid", ""):
+        cmd.extend(["--nm-grid", args.nm_grid])
+    for attr, flag in (
+        ("nm_grid_mosk", "--nm-grid-mosk"),
+        ("nm_grid_csk", "--nm-grid-csk"),
+        ("nm_grid_hybrid", "--nm-grid-hybrid"),
+    ):
+        value = getattr(args, attr, "")
+        if value:
+            cmd.extend([flag, value])
+
 STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR = project_root / "results"
@@ -367,8 +381,7 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
     # Nm grid override (forward sweep parameters)
-    if args.nm_grid:
-        cmd.extend(["--nm-grid", args.nm_grid])
+    _extend_nm_grid_flags(cmd, args)
     # Forward new optimization flags
     if args.distances:
         for dist_spec in args.distances:
@@ -509,8 +522,7 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
     # Nm grid override (forward sweep parameters)
-    if args.nm_grid:
-        cmd.extend(["--nm-grid", args.nm_grid])
+    _extend_nm_grid_flags(cmd, args)
     # Forward new optimization flags
     if args.distances:
         for dist_spec in args.distances:
@@ -630,8 +642,7 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
     # Pass through all other relevant arguments...
     if args.nt_pairs:
         cmd.extend(["--nt-pairs", args.nt_pairs])
-    if args.nm_grid:
-        cmd.extend(["--nm-grid", args.nm_grid])
+    _extend_nm_grid_flags(cmd, args)
     if args.distances:
         for dist_spec in args.distances:
             cmd.extend(["--distances", dist_spec])
@@ -713,8 +724,13 @@ def main() -> None:
     p.add_argument("--gain-step", action=BooleanOptionalAction, default=True,
                    help="Run the ΔI/ΔQ gain plot step (use --no-gain-step to skip).")
     p.add_argument("--nm-grid", type=str, default="",
-                    help="Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). "
-                         "If not provided, uses cfg['Nm_range'] from YAML (pass-through to run_final_analysis).")
+                   help="Global Nm values for SER sweeps (pass-through to run_final_analysis).")
+    p.add_argument("--nm-grid-mosk", type=str, default="",
+                   help="Nm grid override for MoSK only.")
+    p.add_argument("--nm-grid-csk", type=str, default="",
+                   help="Nm grid override for CSK only.")
+    p.add_argument("--nm-grid-hybrid", type=str, default="",
+                   help="Nm grid override for Hybrid only.")
     p.add_argument("--extreme-mode", action="store_true", help="Pass through to run_final_analysis (max P-core threads)")
     p.add_argument("--beast-mode", action="store_true", help="Pass through to run_final_analysis (P-cores minus margin)")
     p.add_argument("--max-workers", type=int, default=None, help="Override worker count in run_final_analysis")
@@ -1047,6 +1063,14 @@ def main() -> None:
         flag_list.append(f"--nt-pairs={args.nt_pairs}")
     if args.nm_grid:
         flag_list.append(f"--nm-grid={args.nm_grid}")
+    for attr, flag in (
+        ("nm_grid_mosk", "--nm-grid-mosk"),
+        ("nm_grid_csk", "--nm-grid-csk"),
+        ("nm_grid_hybrid", "--nm-grid-hybrid"),
+    ):
+        value = getattr(args, attr, "")
+        if value:
+            flag_list.append(f"{flag}={value}")
     if args.csk_baselines:
         flag_list.append("--csk-baselines")
     if args.channel_suite:
@@ -1346,6 +1370,9 @@ def main() -> None:
                                 'cal_min_seeds': getattr(args, 'cal_min_seeds', 4),
                                 'cal_min_samples': getattr(args, 'cal_min_samples', 50),
                                 'nm_grid': getattr(args, 'nm_grid', ''),
+                                'nm_grid_mosk': getattr(args, 'nm_grid_mosk', ''),
+                                'nm_grid_csk': getattr(args, 'nm_grid_csk', ''),
+                                'nm_grid_hybrid': getattr(args, 'nm_grid_hybrid', ''),
                                 'decision_window_policy': getattr(args, 'decision_window_policy', None),
                                 'decision_window_frac': getattr(args, 'decision_window_frac', None),
                                 'allow_ts_exceed': getattr(args, 'allow_ts_exceed', False),

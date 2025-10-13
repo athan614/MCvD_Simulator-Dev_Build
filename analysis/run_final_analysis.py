@@ -67,7 +67,82 @@ DEFAULT_MODE_DISTANCES: Dict[str, List[int]] = {
     "Hybrid": [15, 20, 25, 30, 35, 40, 45, 55, 65, 75, 85, 95, 105, 115, 125, 150],
 }
 
+DEFAULT_NM_RANGES: Dict[str, List[int]] = {
+    "MoSK": [200, 350, 650, 1100, 1750, 2250, 2500, 2900, 3300, 3600],
+    "Hybrid": [500, 950, 1600, 2800, 4400, 5600, 6500, 7200, 8400, 10000],
+    "CSK": [1000, 1800, 3000, 5400, 8400, 10800, 12000, 13800, 16200, 19200],
+}
+
+def _normalize_nm_values(values: Iterable[Any]) -> List[int]:
+    """Normalize an iterable of Nm values into a sorted list of positive integers."""
+    result: List[int] = []
+    seen: Set[int] = set()
+    for value in values:
+        if value is None:
+            continue
+        try:
+            nm = int(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid Nm value '{value}'") from exc
+        if nm <= 0:
+            raise ValueError(f"Nm value must be positive, got {nm}")
+        if nm not in seen:
+            seen.add(nm)
+            result.append(nm)
+    if not result:
+        raise ValueError("No Nm values supplied")
+    return result
+
+
+def _parse_nm_grid_spec(spec: str) -> List[int]:
+    """Parse a comma/semicolon separated Nm grid specification from CLI flags."""
+    cleaned = (spec or "").strip()
+    if not cleaned:
+        raise ValueError("Empty Nm grid specification")
+    tokens = [token.strip() for token in cleaned.replace(';', ',').split(',') if token.strip()]
+    return _normalize_nm_values(tokens)
+
+
+def _get_cfg_nm_grid(cfg_nm: Any, mode: str) -> Optional[List[int]]:
+    """Return Nm grid for the given mode from config, handling dict or legacy list."""
+    if cfg_nm is None:
+        return None
+    canonical = _canonical_mode_name(mode)
+    if isinstance(cfg_nm, dict):
+        for key, values in cfg_nm.items():
+            if _canonical_mode_name(str(key)) == canonical:
+                try:
+                    return _normalize_nm_values(values)
+                except ValueError:
+                    return None
+        return None
+    if isinstance(cfg_nm, (list, tuple)):
+        try:
+            return _normalize_nm_values(cfg_nm)
+        except ValueError:
+            return None
+    return None
+
 DEFAULT_GUARD_SAMPLES_CAP: float = 4.0e7  # per-seed limit on total time samples (sequence_length * Ts/dt)
+
+DIAGNOSTIC_THRESHOLD_KEYS: Set[str] = {
+    "q_values",
+    "raw_stats",
+    "zscore_stats",
+    "whitened_stats",
+    "aux_q",
+    "channel_integrals",
+    "_calibration_trace",
+}
+
+
+def _should_apply_threshold_key(key: Any) -> bool:
+    """Return True when a threshold entry should be copied into the runtime pipeline."""
+    if not isinstance(key, str):
+        return True
+    if key.startswith("__"):
+        return False
+    return key not in DIAGNOSTIC_THRESHOLD_KEYS
 
 def _canonical_mode_name(mode: str) -> str:
     if not mode:
@@ -1333,7 +1408,6 @@ def calculate_snr_from_stats(stats_a: List[float], stats_b: List[float]) -> floa
 
 def estimate_isi_overlap_ratio(cfg: Dict[str, Any]) -> float:
     """
-    Cheap, physics‑guided ISI tail proxy.
     """
     if not cfg['pipeline'].get('enable_isi', False):
         return 0.0
@@ -1975,6 +2049,26 @@ def parse_arguments() -> argparse.Namespace:
                        help="Minimum SNR gain in dB to keep CTRL enabled (default: 0.0)")
     
     args = parser.parse_args()
+
+    cli_nm_overrides: Dict[str, List[int]] = {}
+    if getattr(args, "nm_grid", "").strip():
+        try:
+            cli_nm_overrides["__global__"] = _parse_nm_grid_spec(args.nm_grid)
+        except ValueError as exc:
+            print(f"⚠️  Invalid --nm-grid format: {args.nm_grid}. Error: {exc}")
+            print("   Ignoring global Nm grid override.")
+    for attr, mode_name in (("nm_grid_mosk", "MoSK"),
+                            ("nm_grid_csk", "CSK"),
+                            ("nm_grid_hybrid", "Hybrid")):
+        spec = getattr(args, attr, "")
+        if spec and spec.strip():
+            try:
+                cli_nm_overrides[_canonical_mode_name(mode_name)] = _parse_nm_grid_spec(spec)
+            except ValueError as exc:
+                flag_name = attr.replace("_", "-")
+                print(f"⚠️  Invalid --{flag_name} format: {spec}. Error: {exc}")
+                print(f"   Ignoring Nm grid override for {mode_name}.")
+    args.cli_nm_overrides = cli_nm_overrides
     
     raw_distance_specs = args.distances or []
     if raw_distance_specs is None:
@@ -2095,6 +2189,8 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
         dt = cal_cfg['sim']['dt_s']
         detection = cal_cfg.setdefault('detection', {})
         detection_window_s = detection.get('decision_window_s', cal_cfg['pipeline']['symbol_period_s'])
+        anchor_token = str(detection.get('decision_window_anchor', 'start')).lower()
+        tail_mode = anchor_token in ('tail', 'end')
         sigma_da, sigma_sero = calculate_proper_noise_sigma(cal_cfg, detection_window_s)
 
         target_channel = cal_cfg['pipeline'].get('csk_target_channel', 'DA')
@@ -2135,15 +2231,17 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
 
                 n_total_samples_noise = int(cal_cfg_noise['pipeline']['symbol_period_s'] / dt)
                 n_detect_samples_noise = min(int(detection_window_s / dt), n_total_samples_noise)
-
-                for _ in range(noise_samples):
-                    ig_n, ia_n, ic_n, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
-                    sig_da_n = ig_n - ic_n
-                    sig_sero_n = ia_n - ic_n
-                    q_da_n = float(np.trapezoid(sig_da_n[:n_detect_samples_noise], dx=dt))
-                    q_sero_n = float(np.trapezoid(sig_sero_n[:n_detect_samples_noise], dx=dt))
-                    q_da_noise.append(q_da_n)
-                    q_sero_noise.append(q_sero_n)
+                start_noise = max(n_total_samples_noise - n_detect_samples_noise, 0) if tail_mode else 0
+                end_noise = n_total_samples_noise if tail_mode else n_detect_samples_noise
+                if end_noise - start_noise > 1:
+                    for _ in range(noise_samples):
+                        ig_n, ia_n, ic_n, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
+                        sig_da_n = ig_n - ic_n
+                        sig_sero_n = ia_n - ic_n
+                        q_da_n = float(np.trapezoid(sig_da_n[start_noise:end_noise], dx=dt))
+                        q_sero_n = float(np.trapezoid(sig_sero_n[start_noise:end_noise], dx=dt))
+                        q_da_noise.append(q_da_n)
+                        q_sero_noise.append(q_sero_n)
 
                 if len(q_da_noise) >= 3:
                     rho_cc_measured = float(np.corrcoef(q_da_noise, q_sero_noise)[0, 1])
@@ -2159,32 +2257,39 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
             if n_detect_samples <= 1:
                 continue
 
-            tail_fraction = float(cal_cfg['pipeline'].get('csk_tail_fraction',
-                                                          detection.get('tail_fraction',
-                                                                        cal_cfg['pipeline'].get('hybrid_tail_fraction', 1.0))))
-            if mode == 'MoSK':
-                tail_fraction = 1.0
-            tail_fraction = min(max(tail_fraction, 0.1), 1.0)
-            i0 = int((1.0 - tail_fraction) * n_detect_samples)
-            i0 = min(max(i0, 0), max(n_detect_samples - 1, 0))
+            start_idx = max(n_total_samples - n_detect_samples, 0) if tail_mode else 0
+            end_idx = n_total_samples if tail_mode else n_detect_samples
+            window_len = max(end_idx - start_idx, 0)
+            if window_len <= 1:
+                continue
 
-            sig_da_full = ig[:n_detect_samples]
-            sig_sero_full = ia[:n_detect_samples]
-            sig_ctrl_full = ic[:n_detect_samples]
-            if sig_ctrl_full.shape[0] < n_detect_samples:
-                pad_width = n_detect_samples - sig_ctrl_full.shape[0]
+            sig_da_full = ig[start_idx:end_idx]
+            sig_sero_full = ia[start_idx:end_idx]
+            sig_ctrl_full = ic[start_idx:end_idx] if ic.size else np.zeros(window_len)
+            if sig_ctrl_full.shape[0] < window_len:
+                pad_width = window_len - sig_ctrl_full.shape[0]
                 sig_ctrl_full = np.pad(sig_ctrl_full, (0, pad_width), mode='constant')
+
+            tail_fraction = 1.0 if (tail_mode or mode == 'MoSK') else float(
+                cal_cfg['pipeline'].get(
+                    'csk_tail_fraction',
+                    detection.get('tail_fraction', cal_cfg['pipeline'].get('hybrid_tail_fraction', 1.0))
+                )
+            )
+            tail_fraction = min(max(tail_fraction, 0.1), 1.0)
+            tail_start = int((1.0 - tail_fraction) * window_len)
+            tail_start = min(max(tail_start, 0), max(window_len - 1, 0))
 
             use_ctrl = bool(cal_cfg['pipeline'].get('use_control_channel', True))
             subtract_for_q = (mode != 'MoSK') and use_ctrl
 
-            sig_da_single_tail = sig_da_full[i0:n_detect_samples]
-            sig_sero_single_tail = sig_sero_full[i0:n_detect_samples]
+            sig_da_single_tail = sig_da_full[tail_start:]
+            sig_sero_single_tail = sig_sero_full[tail_start:]
             q_da_tail_single_val = float(np.trapezoid(sig_da_single_tail, dx=dt))
             q_sero_tail_single_val = float(np.trapezoid(sig_sero_single_tail, dx=dt))
 
             if use_ctrl and len(sig_ctrl_full):
-                sig_ctrl_tail = sig_ctrl_full[i0:n_detect_samples]
+                sig_ctrl_tail = sig_ctrl_full[tail_start:]
                 sig_da_diff_tail = (sig_da_single_tail - sig_ctrl_tail)
                 sig_sero_diff_tail = (sig_sero_single_tail - sig_ctrl_tail)
                 sig_da_diff_full = sig_da_full - sig_ctrl_full
@@ -2332,8 +2437,10 @@ def _measure_rho_for_seed(cfg: Dict[str, Any], mode: str) -> float:
     cal = deepcopy(cfg)
     cal['pipeline']['Nm_per_symbol'] = 1e-6  # Minimal signal
     dt = float(cal['sim']['dt_s'])
-    win = float(cal.get('detection', {}).get('decision_window_s',
-                  cal['pipeline'].get('symbol_period_s', dt)))
+    detect_cfg = cal.setdefault('detection', {})
+    win = float(detect_cfg.get('decision_window_s', cal['pipeline'].get('symbol_period_s', dt)))
+    anchor = str(detect_cfg.get('decision_window_anchor', 'start')).lower()
+    tail_mode = anchor in ('tail', 'end')
     n = max(1, int(win / dt))
     qd, qs = [], []
     rng = np.random.default_rng(cal['pipeline'].get('random_seed', 0))
@@ -2342,8 +2449,13 @@ def _measure_rho_for_seed(cfg: Dict[str, Any], mode: str) -> float:
         ig, ia, ic, _ = _single_symbol_currents(0, [], cal, rng)
         sig_da = ig - ic
         sig_se = ia - ic
-        qd.append(float(np.trapezoid(sig_da[:n], dx=dt)))
-        qs.append(float(np.trapezoid(sig_se[:n], dx=dt)))
+        n_int = min(n, sig_da.shape[0], sig_se.shape[0])
+        if n_int <= 1:
+            continue
+        start = max(sig_da.shape[0] - n_int, 0) if tail_mode else 0
+        end = start + n_int
+        qd.append(float(np.trapezoid(sig_da[start:end], dx=dt)))
+        qs.append(float(np.trapezoid(sig_se[start:end], dx=dt)))
     
     r = float(np.corrcoef(qd, qs)[0, 1]) if len(qd) >= 3 else float('nan')
     return r if np.isfinite(r) else float('nan')
@@ -2570,14 +2682,14 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             for k, v in thresholds_override.items():
                 if isinstance(k, str) and k.startswith('noise.'):
                     cfg_run.setdefault('noise', {})[k.split('.', 1)[1]] = v
-                else:
+                elif _should_apply_threshold_key(k):
                     cfg_run['pipeline'][k] = v
         elif cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
              param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
             cal_seeds = list(range(10))
             thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds, recalibrate)
             for k, v in thresholds.items():
-                if not str(k).startswith("__"):
+                if _should_apply_threshold_key(k):
                     cfg_run['pipeline'][k] = v
             if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
                 target_ch = cfg_run['pipeline'].get('csk_target_channel', 'DA').lower()
@@ -3800,7 +3912,8 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         cal_seeds = list(range(10))
         thresholds = calibrate_thresholds(cfg_final, cal_seeds, recalibrate=False, save_to_file=True, verbose=False)
         for k, v in thresholds.items():
-            cfg_final['pipeline'][k] = v
+            if _should_apply_threshold_key(k):
+                cfg_final['pipeline'][k] = v
 
         # NEW: Cap validation seeds for performance
         max_validation_seeds = cfg_base.get('max_lod_validation_seeds', len(seeds))
@@ -4449,7 +4562,8 @@ def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_
         cal_seeds = list(range(10))
         thresholds = calibrate_thresholds_cached(cfg_pair, cal_seeds, args.recalibrate)
         for k, v in thresholds.items():
-            cfg_pair['pipeline'][k] = v
+            if _should_apply_threshold_key(k):
+                cfg_pair['pipeline'][k] = v
         out_csv = data_dir / f"ser_vs_nm_csk_{first.lower()}_{second.lower()}.csv"
         print(f"  • Running SER vs Nm for pair {first}-{second} → {out_csv.name}")
         
@@ -5376,19 +5490,23 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     pm.set_status(mode=mode, sweep="SER vs Nm")
 
     # Pre-compute job counts for consistent totals
-    # 🛠 CLI override for Nm grid (preserves YAML default behavior)
-    nm_values: List[Union[float, int]]
-    if args.nm_grid.strip():
-        try:
-            nm_values = [int(float(x.strip())) for x in args.nm_grid.split(',') if x.strip()]
-            print(f"📋 Using CLI Nm grid: {nm_values}")
-        except ValueError as e:
-            print(f"⚠️  Invalid --nm-grid format: {args.nm_grid}. Error: {e}")
-            print("   Using YAML default instead.")
-            nm_values = list(cfg.get('Nm_range', [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000]))
+    canonical_mode = _canonical_mode_name(mode)
+    overrides: Dict[str, List[int]] = getattr(args, 'cli_nm_overrides', {})
+    if canonical_mode in overrides:
+        raw_nm_values = overrides[canonical_mode]
+        print(f"CLI Nm grid for {canonical_mode}: {raw_nm_values}")
+    elif "__global__" in overrides:
+        raw_nm_values = overrides["__global__"]
+        print(f"CLI Nm grid override (global): {raw_nm_values}")
     else:
-        nm_values = list(cfg.get('Nm_range', [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000]))
-        print(f"📋 Using YAML Nm_range: {nm_values}")
+        cfg_nm = _get_cfg_nm_grid(cfg.get('Nm_range'), canonical_mode)
+        if cfg_nm is not None:
+            raw_nm_values = cfg_nm
+            print(f"CFG Nm_range[{canonical_mode}]: {raw_nm_values}")
+        else:
+            raw_nm_values = DEFAULT_NM_RANGES.get(canonical_mode, DEFAULT_NM_RANGES['MoSK'])
+            print(f"CFG default Nm_range[{canonical_mode}]: {raw_nm_values}")
+    nm_values: List[Union[float, int]] = [cast(Union[float, int], int(v)) for v in raw_nm_values]
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
     ser_jobs = len(nm_values) * args.num_seeds
     lod_seed_cap = 10

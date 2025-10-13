@@ -45,22 +45,32 @@ def _resolve_decision_window(cfg: Dict[str, Any], Ts: float, dt: float) -> float
     so downstream code (noise model, logging, plotting) observes a consistent value.
     """
     detection = cfg.setdefault('detection', {})
+    pipeline_cfg = cfg.setdefault('pipeline', {})
     policy = str(detection.get('decision_window_policy', 'full_ts')).lower()
 
     if policy in ('full_ts', 'full', 'ts'):
         win_s = Ts
+        anchor = detection.get('decision_window_anchor', 'start')
     elif policy in ('fraction_of_ts', 'fraction', 'frac', 'tail', 'tail_fraction'):
         frac = float(detection.get('decision_window_fraction', 0.9))
         frac = min(max(frac, 0.1), 1.0)
         win_s = frac * Ts
+        anchor = 'tail'
     else:  # 'fixed' (legacy)
         win_s = float(detection.get('decision_window_s', Ts))
+        anchor = detection.get('decision_window_anchor', 'start')
 
     min_samples = int(detection.get('min_decision_samples', 16))
     win_s = max(min_samples * dt, min(win_s, Ts))
 
     detection['decision_window_s'] = win_s
+    detection['decision_window_anchor'] = str(anchor).lower()
+
+    # Ensure generator produces at least a full symbol so the tail exists.
+    pipeline_cfg['symbol_period_s'] = Ts
+
     cfg['detection'] = detection
+    cfg['pipeline'] = pipeline_cfg
     return win_s
 
 def _csk_dual_channel_Q(
@@ -189,7 +199,8 @@ def calculate_proper_noise_sigma(
     johnson_charge_var = psd_johnson * T_int
 
     K_f = alpha_H / N_c
-    flicker_charge_var = K_f * I_dc**2 * max(0.0, np.log(2 * np.pi * T_int)) * T_int if f_max > f_min else 0.0
+    log_span = math.log(f_max / f_min) if (f_max > f_min and f_min > 0.0) else 0.0
+    flicker_charge_var = K_f * I_dc**2 * max(log_span, 0.0) * T_int
 
     drift_charge_var = 0.0
 
@@ -213,7 +224,7 @@ def calculate_proper_noise_sigma(
     if use_ctrl_for_noise:
         # Differential measurement: benefits from common-mode rejection
         rejection = max(0.0, 1.0 - effective_rho)
-        thermal_var_effective = 2.0 * thermal_var_single * rejection
+        thermal_var_effective = 2.0 * thermal_var_single  # thermal noise remains uncorrelated; no rejection
         flicker_var_effective = 2.0 * flicker_var_single * rejection
         drift_var_effective = 2.0 * drift_var_single * rejection
     else:
@@ -573,14 +584,19 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
         try:
             dt = cfg['sim']['dt_s']
             win_s = cfg['detection'].get('decision_window_s', cfg['pipeline']['symbol_period_s'])
+            anchor_token = str(cfg['detection'].get('decision_window_anchor', 'start')).lower()
+            tail_mode = anchor_token in ('tail', 'end')
             n_int = min(int(win_s / dt), n_samples)
-            isi_mass = float(np.trapezoid(isi_da[:n_int], dx=dt) + np.trapezoid(isi_sero[:n_int], dx=dt))
-            sym_mass = float(np.trapezoid(sym_da[:n_int], dx=dt) + np.trapezoid(sym_sero[:n_int], dx=dt))
-            denom = max(sym_mass, 1e-30)
-            ratio = isi_mass / denom
-            metrics = cfg.setdefault('_metrics', {})
-            lst = metrics.setdefault('isi_ratio_values', [])
-            lst.append(ratio)
+            if n_int > 1:
+                start = max(n_samples - n_int, 0) if tail_mode else 0
+                end = start + n_int
+                isi_mass = float(np.trapezoid(isi_da[start:end], dx=dt) + np.trapezoid(isi_sero[start:end], dx=dt))
+                sym_mass = float(np.trapezoid(sym_da[start:end], dx=dt) + np.trapezoid(sym_sero[start:end], dx=dt))
+                denom = max(sym_mass, 1e-30)
+                ratio = isi_mass / denom
+                metrics = cfg.setdefault('_metrics', {})
+                lst = metrics.setdefault('isi_ratio_values', [])
+                lst.append(ratio)
         except Exception:
             pass
     # ================================================================
@@ -739,6 +755,9 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             rx_symbols[i] = s_tx
             continue
         
+        anchor_token = str(cfg['detection'].get('decision_window_anchor', 'start')).lower()
+        tail_mode = anchor_token in ('tail', 'end')
+
         use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
         # For MoSK, do NOT subtract CTRL from the charges; for CSK/Hybrid keep the existing behavior.
         subtract_for_q = (mod != "MoSK") and use_ctrl
@@ -746,9 +765,16 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         # Calculate charges (mode-specific CTRL handling)
         sig_da = (ig - ic) if subtract_for_q else ig
         sig_sero = (ia - ic) if subtract_for_q else ia
-        q_da = float(np.trapezoid(sig_da[:n_detect_samples], dx=dt))
-        q_sero = float(np.trapezoid(sig_sero[:n_detect_samples], dx=dt))
-        window_s = n_detect_samples * dt
+        start_idx = max(n_total_samples - n_detect_samples, 0) if tail_mode else 0
+        end_idx = n_total_samples if tail_mode else n_detect_samples
+        if end_idx <= start_idx:
+            start_idx = 0
+            end_idx = min(n_detect_samples, n_total_samples)
+
+        q_da = float(np.trapezoid(sig_da[start_idx:end_idx], dx=dt))
+        q_sero = float(np.trapezoid(sig_sero[start_idx:end_idx], dx=dt))
+        window_samples = max(end_idx - start_idx, 1)
+        window_s = window_samples * dt
         mean_i_da = q_da / window_s if window_s > 0 else 0.0
         mean_i_sero = q_sero / window_s if window_s > 0 else 0.0
 
@@ -861,21 +887,25 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             use_dual = bool(cfg['pipeline'].get('csk_dual_channel', True))
             leakage = float(cfg['pipeline'].get('csk_leakage_frac', 0.0))
 
-            # Tail-gated integration
-            tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
-            tail = min(max(tail, 0.1), 1.0)  # clamp
-            i0 = int((1.0 - tail) * n_detect_samples)
-
             use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
             # CSK always uses CTRL subtraction when enabled
             sig_da = (ig - ic) if use_ctrl else ig
             sig_sero = (ia - ic) if use_ctrl else ia
 
             # Tail-gated trapezoid integration
-            q_da = float(np.trapezoid(sig_da[i0:n_detect_samples], dx=dt))
-            q_sero = float(np.trapezoid(sig_sero[i0:n_detect_samples], dx=dt))
-            tail_samples = max(n_detect_samples - i0, 0)
-            tail_window_s = tail_samples * dt
+            if tail_mode:
+                csk_start = start_idx
+                csk_end = end_idx
+            else:
+                tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
+                tail = min(max(tail, 0.1), 1.0)
+                csk_start = int((1.0 - tail) * n_detect_samples)
+                csk_start = max(csk_start, 0)
+                csk_end = n_detect_samples
+            q_da = float(np.trapezoid(sig_da[csk_start:csk_end], dx=dt))
+            q_sero = float(np.trapezoid(sig_sero[csk_start:csk_end], dx=dt))
+            tail_samples = max(csk_end - csk_start, 0)
+            tail_window_s = max(tail_samples * dt, dt)
             mean_i_da = q_da / tail_window_s if tail_window_s > 0 else 0.0
             mean_i_sero = q_sero / tail_window_s if tail_window_s > 0 else 0.0
 
@@ -961,13 +991,20 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
         elif mod == 'Hybrid':
             # Align MoSK integration window with calibration (tail-gated)
-            tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
-            tail = min(max(tail, 0.1), 1.0)
-            i0 = int((1.0 - tail) * n_detect_samples)
-            q_da_raw = float(np.trapezoid(ig[i0:n_detect_samples], dx=dt))
-            q_sero_raw = float(np.trapezoid(ia[i0:n_detect_samples], dx=dt))
-            tail_samples = max(n_detect_samples - i0, 0)
-            tail_window_s = tail_samples * dt
+            if tail_mode:
+                raw_start = start_idx
+                raw_end = end_idx
+            else:
+                tail = float(cfg['pipeline'].get('csk_tail_fraction', 1.0))
+                tail = min(max(tail, 0.1), 1.0)
+                raw_start = int((1.0 - tail) * n_detect_samples)
+                raw_start = max(raw_start, 0)
+                raw_end = n_detect_samples
+
+            q_da_raw = float(np.trapezoid(ig[raw_start:raw_end], dx=dt))
+            q_sero_raw = float(np.trapezoid(ia[raw_start:raw_end], dx=dt))
+            tail_samples = max(raw_end - raw_start, 0)
+            tail_window_s = max(tail_samples * dt, dt)
             mean_i_da_raw = q_da_raw / tail_window_s if tail_window_s > 0 else 0.0
             mean_i_sero_raw = q_sero_raw / tail_window_s if tail_window_s > 0 else 0.0
 
@@ -999,8 +1036,8 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             # Tail-gated window (same as used for MoSK statistic above)
             sig_da_amp = (ig - ic) if use_ctrl else ig
             sig_sero_amp = (ia - ic) if use_ctrl else ia
-            q_da_amp = float(np.trapezoid(sig_da_amp[i0:n_detect_samples], dx=dt))
-            q_sero_amp = float(np.trapezoid(sig_sero_amp[i0:n_detect_samples], dx=dt))
+            q_da_amp = float(np.trapezoid(sig_da_amp[raw_start:raw_end], dx=dt))
+            q_sero_amp = float(np.trapezoid(sig_sero_amp[raw_start:raw_end], dx=dt))
             mean_i_da_amp = q_da_amp / tail_window_s if tail_window_s > 0 else 0.0
             mean_i_sero_amp = q_sero_amp / tail_window_s if tail_window_s > 0 else 0.0
 

@@ -2,7 +2,7 @@
 
 # -------- Physical & biological constants --------
 alpha: 0.20                      # ECS volume fraction
-clearance_rate: 0.1             # s^-1 (k')
+clearance_rate: 0.01             # s^-1 (k')
 detection_bandwidth_Hz: 100      # Detection bandwidth (not sampling rate!)
 
 # -------- Neurotransmitter-specific parameters ----
@@ -11,7 +11,7 @@ neurotransmitters:
     name: "Dopamine (DA)"
     # Binding (Kd ~150 nM → choose kon=1e5 -> koff=1.5e-2 s^-1)
     k_on_M_s: 1e5
-    k_off_s: 0.01
+    k_off_s: 0.015
     # Transport
     D_m2_s: 4.9e-10          # aqueous; in tissue your model uses D/λ^2
     lambda: 1.6
@@ -22,7 +22,7 @@ neurotransmitters:
     name: "Serotonin (5-HT)"
     # Binding (Kd ~30 nM → choose kon=1e5 -> koff=3.0e-3 s^-1)
     k_on_M_s: 1e5
-    k_off_s: 0.01
+    k_off_s: 0.003
     # Transport (typical small aromatic amine)
     D_m2_s: 5.3e-10
     lambda: 1.6
@@ -69,7 +69,7 @@ noise:
   rho_corr: 0.9                 # Also support rho_correlated alias
   rho_correlated: 0.9           # Alias for compatibility
   alpha_H: 1.0e-3               # Reduced 1/f noise (was 3.0e-3)
-  K_d_Hz: 0                     # No drift noise (was 1.0e-4)
+  K_d_Hz: 1e-16                 # Drift noise
   N_c: 4.5e11                   # CORRECTED: Literature standard
   effective_correlation: 0.9        # Override for noise calculations
   detection_bandwidth_Hz: 100       # Override detection bandwidth
@@ -92,12 +92,15 @@ lod_distances_um:
 # Legacy grids retained for reference
 # distances_um: [15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150]
 # distances_um_high_res: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 125, 150, 175]
-Nm_range: [200,500,1000,1600,2500,4000,6300,10000,16000,25000,40000,63000] # finer resolution
+Nm_range:
+  MoSK: [200, 350, 650, 1100, 1750, 2100, 2350, 2500, 2700, 3300]
+  CSK: [1000, 1800, 3000, 5400, 8400, 10800, 12000, 13800, 15100, 16200]
+  Hybrid: [500, 950, 1600, 2800, 4400, 5600, 6500, 6800, 7000, 8400]
 
 # -------- Detection layer --------
 detection:
   modulation: "MoSK"            # MoSK | CSK | hybrid
-  decision_window_s: 20         # Use full symbol period (was 8.0)
+  decision_window_s: 20         # legacy fixed window (ignored when policy != fixed)
   # threshold_nA:                 # only used for CSK (2-level) or CTRL threshold tests
     # GLU: 0.75e-9
     # GABA: 0.60e-9
@@ -107,8 +110,9 @@ detection:
   #mu0_glu: 2.442e-05           # Mean charge for GLU class
   #mu1_gaba: -2.620e-05         # Mean charge for GABA class
   show_progress: true          # Show progress bars
-  decision_window_policy: full_ts
-  decision_window_fraction: 0.9  # integrate the last 90* of Ts
+  decision_window_policy: fraction_of_ts
+  decision_window_fraction: 0.6  # tail integration fraction (tune per study)
+  decision_window_anchor: tail   # explicit tail anchoring for downstream helpers
   # optional: min_decision_samples: 32
 
 # -------- End-to-end pipeline --------
@@ -128,7 +132,7 @@ pipeline:
   csk_target_channel: "DA"     # Defines the molecule used for the pure CSK scheme
   # level_probs: [0.25, 0.25, 0.25, 0.25]  # For energy-fairness calculations
   csk_levels: 4                 # Number of concentration levels for CSK and Hybrid modes
-  csk_tail_fraction: 0.6        # Use tail-gating for CSK everywhere
+  csk_tail_fraction: 1.0        # Fractional policy now uses entire tail slice
   non_specific_binding_factor: 0.0  # No signal leakage (was 0.05)
   # NEW: Dual-channel CSK configuration
   csk_dual_channel: true          # enable dual-channel CSK

@@ -57,24 +57,31 @@ def _load_cfg() -> Dict[str, Any]:
 
 def _resolve_detection_window(cfg: Dict[str, Any], Ts: float) -> float:
     detection = cfg.setdefault("detection", {})
+    pipeline_cfg = cfg.setdefault("pipeline", {})
     dt = float(cfg["sim"]["dt_s"])
     min_pts = int(cfg.get("_min_decision_points", 4))
-    policy = str(detection.get("decision_window_policy", "full_Ts")).lower()
+    policy = str(detection.get("decision_window_policy", "full_ts")).lower()
 
-    if policy in ("fraction_of_ts", "fraction", "tail_fraction", "tail"):
+    if policy in ("fraction_of_ts", "fraction", "tail_fraction", "tail", "frac"):
         frac = float(detection.get("decision_window_fraction", 0.9))
-        min_win = max(min_pts * dt, Ts * frac)
-    elif policy == "full_ts":
-        min_win = max(min_pts * dt, Ts)
+        frac = min(max(frac, 0.1), 1.0)
+        win_s = frac * Ts
+        anchor = "tail"
+    elif policy in ("full_ts", "full", "ts"):
+        win_s = Ts
+        anchor = detection.get("decision_window_anchor", "start")
     else:
-        explicit = float(detection.get("decision_window_s", Ts))
-        min_win = max(min_pts * dt, explicit if explicit > 0 else Ts)
+        win_s = float(detection.get("decision_window_s", Ts))
+        anchor = detection.get("decision_window_anchor", "start")
 
+    min_win = max(min_pts * dt, min(win_s, Ts))
     detection["decision_window_s"] = max(
         float(detection.get("decision_window_s", min_win)), min_win
     )
-    cfg["pipeline"]["time_window_s"] = max(
-        float(cfg["pipeline"].get("time_window_s", 0.0)),
+    detection["decision_window_anchor"] = str(anchor).lower()
+
+    pipeline_cfg["time_window_s"] = max(
+        float(pipeline_cfg.get("time_window_s", 0.0)),
         detection["decision_window_s"],
     )
     return detection["decision_window_s"]
