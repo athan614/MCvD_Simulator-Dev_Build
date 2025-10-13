@@ -5,7 +5,6 @@ This module provides physical constants and convenience functions to access
 neurotransmitter-specific parameters from the configuration.
 """
 
-"python -m pytest tests/test_oect.py -v"
 
 from typing import Dict, Any
 import numpy as np
@@ -78,7 +77,7 @@ def get_effective_diffusion_coefficient(config: Dict[str, Any], nt_type: str) ->
     Calculate effective diffusion coefficient accounting for tortuosity.
     
     The effective diffusion coefficient in brain tissue is:
-    D_eff = D / λ²
+    D_eff = D / lambda^2
     
     Parameters
     ----------
@@ -90,7 +89,7 @@ def get_effective_diffusion_coefficient(config: Dict[str, Any], nt_type: str) ->
     Returns
     -------
     float
-        Effective diffusion coefficient in m²/s
+        Effective diffusion coefficient in m^2/s
     """
     nt_params = get_nt_params(config, nt_type)
     D = nt_params['D_m2_s']

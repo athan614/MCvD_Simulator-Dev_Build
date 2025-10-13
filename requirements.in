@@ -1,11 +1,11 @@
 # Runtime dependencies (install latest compatible versions)
 numpy>=2.3.3
 scipy>=1.16.2
-pandas>=2.3.2
-matplotlib>=3.10.6
+pandas>=2.3.3
+matplotlib>=3.10.7
 PyYAML>=6.0.3
 tqdm>=4.67.1
-rich>=14.1.0
+rich>=14.2.0
 psutil>=7.1.0
 joblib>=1.5.2
 statsmodels>=0.14.5

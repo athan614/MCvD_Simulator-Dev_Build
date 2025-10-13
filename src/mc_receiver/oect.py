@@ -7,7 +7,7 @@ with batch operations and efficient FFT-based methods.
 
 from __future__ import annotations
 import numpy as np
-from typing import Dict, Optional, Tuple, Any, cast
+from typing import Dict, Optional, Tuple, Any, cast, Union
 from scipy import signal    #type: ignore
 from ..constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
 
@@ -107,7 +107,9 @@ def oect_trio(bound_sites_trio: np.ndarray,
               nts: Tuple[str, str, str],
               cfg: Dict[str, Any],
               rng: np.random.Generator,
-              rho: Optional[float] = None) -> Dict[str, np.ndarray]:
+              rho: Optional[float] = None,
+              return_components: bool = False
+              ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]]:
     """
     Return correlated drain-current traces for DA, SERO, CTRL.
     
@@ -191,6 +193,15 @@ def oect_trio(bound_sites_trio: np.ndarray,
     result = {}
     for i, nt in enumerate(nts):
         result[nt] = total[i]
+
+    if return_components:
+        components = {
+            'signal': signal,
+            'thermal': thermal,
+            'flicker': flick_corr,
+            'drift': drift_corr,
+        }
+        return result, components
     
     return result
 

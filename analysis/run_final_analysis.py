@@ -30,6 +30,18 @@ import signal
 import subprocess
 import logging
 
+_SYNTHETIC_NOISE_WARNING_SHOWN = False
+
+
+def _warn_synthetic_noise(reason: str) -> None:
+    """Emit a one-time warning that analytic (synthetic) noise is being used."""
+    global _SYNTHETIC_NOISE_WARNING_SHOWN
+    if _SYNTHETIC_NOISE_WARNING_SHOWN:
+        return
+    _SYNTHETIC_NOISE_WARNING_SHOWN = True
+    print(f"⚠️  Synthetic noise model in effect: {reason}")
+
+
 # Disable BLAS/OpenMP oversubscription for optimal process-level parallelism
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1") 
@@ -1892,6 +1904,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default=None)
     parser.add_argument("--num-seeds", type=int, default=20)
     parser.add_argument("--sequence-length", type=int, default=1000)
+    parser.add_argument("--skip-noise-sweep", action="store_true",
+                        help="Skip zero-signal noise-only sweeps (use analytic noise instead).")
+    parser.add_argument("--noise-only-seeds", type=int, default=8,
+                        help="Number of seeds for noise-only sweeps (default: 8).")
+    parser.add_argument("--noise-only-seq-len", type=int, default=200,
+                        help="Sequence length for each noise-only run (default: 200).")
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--beast-mode", action="store_true")
@@ -2235,7 +2253,7 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
                 end_noise = n_total_samples_noise if tail_mode else n_detect_samples_noise
                 if end_noise - start_noise > 1:
                     for _ in range(noise_samples):
-                        ig_n, ia_n, ic_n, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
+                        ig_n, ia_n, ic_n, _, _ = _single_symbol_currents(0, [], cal_cfg_noise, rng)
                         sig_da_n = ig_n - ic_n
                         sig_sero_n = ia_n - ic_n
                         q_da_n = float(np.trapezoid(sig_da_n[start_noise:end_noise], dx=dt))
@@ -2251,7 +2269,7 @@ def run_calibration_symbols(cfg: Dict[str, Any], symbol: int, mode: str, num_sym
                 rho_cc_measured = np.nan
 
         for s_tx in tx_symbols:
-            ig, ia, ic, Nm_actual = _single_symbol_currents(s_tx, [], cal_cfg, rng)
+            ig, ia, ic, Nm_actual, _ = _single_symbol_currents(s_tx, [], cal_cfg, rng)
             n_total_samples = len(ig)
             n_detect_samples = min(int(detection_window_s / dt), n_total_samples)
             if n_detect_samples <= 1:
@@ -2446,7 +2464,7 @@ def _measure_rho_for_seed(cfg: Dict[str, Any], mode: str) -> float:
     rng = np.random.default_rng(cal['pipeline'].get('random_seed', 0))
     
     for _ in range(20):
-        ig, ia, ic, _ = _single_symbol_currents(0, [], cal, rng)
+        ig, ia, ic, _, _ = _single_symbol_currents(0, [], cal, rng)
         sig_da = ig - ic
         sig_se = ia - ic
         n_int = min(n, sig_da.shape[0], sig_se.shape[0])
@@ -2646,6 +2664,194 @@ def _build_freeze_snapshot(cfg_base: Dict[str, Any],
     return snapshot
 
 
+def _median_nan(values: Iterable[Any]) -> float:
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0:
+        return float('nan')
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float('nan')
+    return float(np.median(finite))
+
+
+def _measure_noise_snapshot(cfg_base: Dict[str, Any],
+                            param_name: str,
+                            param_value: Union[float, int],
+                            seeds: List[int],
+                            noise_seq_len: int) -> Optional[Dict[str, Any]]:
+    cfg_noise = deepcopy(cfg_base)
+    _apply_sweep_param(cfg_noise, param_name, param_value)
+
+    pipeline_cfg = cfg_noise.setdefault('pipeline', {})
+    pipeline_cfg['Nm_per_symbol'] = 0
+    pipeline_cfg['_noise_only_run'] = True
+    pipeline_cfg['_collect_noise_components'] = True
+    pipeline_cfg['sequence_length'] = max(int(noise_seq_len), 8)
+    cfg_noise['disable_progress'] = True
+    cfg_noise['verbose'] = False
+
+    results: List[Dict[str, Any]] = []
+    for seed in seeds:
+        pipeline_cfg['random_seed'] = int(seed)
+        res = run_single_instance(cfg_noise, seed, attach_isi_meta=False)
+        if res is not None:
+            results.append(res)
+
+    if not results:
+        return None
+
+    pipeline_cfg.pop('_collect_noise_components', None)
+
+    def _collect(field: str) -> List[float]:
+        collected: List[float] = []
+        for r in results:
+            try:
+                collected.append(float(r.get(field, float('nan'))))
+            except (TypeError, ValueError):
+                collected.append(float('nan'))
+        return collected
+
+    med_sigma_da = _median_nan(_collect('noise_sigma_da'))
+    med_sigma_sero = _median_nan(_collect('noise_sigma_sero'))
+    med_sigma_diff = _median_nan(_collect('noise_sigma_I_diff'))
+    med_sigma_diff_charge = _median_nan(_collect('noise_sigma_diff_charge'))
+    med_sigma_single = _median_nan(_collect('noise_sigma_single'))
+    med_rho = _median_nan(_collect('noise_rho_measured'))
+    med_sample_size = _median_nan(_collect('noise_sigma_sample_size'))
+    med_window = _median_nan(_collect('detection_window_s'))
+    med_sigma_diff_current = _median_nan(_collect('noise_sigma_diff_current_measured'))
+    med_sigma_thermal = _median_nan(_collect('noise_sigma_thermal'))
+    med_sigma_flicker = _median_nan(_collect('noise_sigma_flicker'))
+    med_sigma_drift = _median_nan(_collect('noise_sigma_drift'))
+    med_fraction_thermal = _median_nan(_collect('noise_thermal_fraction'))
+    med_fraction_flicker = _median_nan(_collect('noise_flicker_fraction'))
+    med_fraction_drift = _median_nan(_collect('noise_drift_fraction'))
+    med_sigma_thermal_single = _median_nan(_collect('noise_sigma_thermal_single_measured'))
+    med_sigma_flicker_single = _median_nan(_collect('noise_sigma_flicker_single_measured'))
+    med_sigma_drift_single = _median_nan(_collect('noise_sigma_drift_single_measured'))
+    med_ctrl_reduction = _median_nan(_collect('noise_ctrl_reduction_fraction_mean'))
+
+    noise_payload = {
+        'sigma_da': med_sigma_da,
+        'sigma_sero': med_sigma_sero,
+        'sigma_diff': med_sigma_diff,
+        'sigma_diff_mosk': med_sigma_diff,
+        'rho_for_diff': med_rho,
+        'rho_cc': med_rho,
+        'detection_window_s': med_window,
+        'noise_components': {
+            'sigma_diff_charge': med_sigma_diff_charge,
+            'single_ended_sigma': med_sigma_single,
+            'thermal_sigma': med_sigma_thermal,
+            'flicker_sigma': med_sigma_flicker,
+            'drift_sigma': med_sigma_drift,
+            'thermal_fraction': med_fraction_thermal,
+            'flicker_fraction': med_fraction_flicker,
+            'drift_fraction': med_fraction_drift,
+            'thermal_sigma_single': med_sigma_thermal_single,
+            'flicker_sigma_single': med_sigma_flicker_single,
+            'drift_sigma_single': med_sigma_drift_single,
+            'ctrl_reduction_fraction_mean': med_ctrl_reduction,
+        },
+        'detector_mode': str(pipeline_cfg.get('detector_mode', 'zscore')).lower(),
+        'sample_size': med_sample_size,
+        'source': 'noise_only_sweep',
+        'ctrl_reduction_fraction_mean': med_ctrl_reduction,
+    }
+
+    median_map = {
+        'noise_sigma_da': med_sigma_da,
+        'noise_sigma_sero': med_sigma_sero,
+        'noise_sigma_I_diff': med_sigma_diff,
+        'noise_sigma_diff_charge': med_sigma_diff_charge,
+        'noise_sigma_single': med_sigma_single,
+        'noise_rho_measured': med_rho,
+        'noise_sigma_sample_size': med_sample_size,
+        'noise_sigma_diff_current_measured': med_sigma_diff_current,
+        'detection_window_s': med_window,
+        'noise_sigma_thermal': med_sigma_thermal,
+        'noise_sigma_flicker': med_sigma_flicker,
+        'noise_sigma_drift': med_sigma_drift,
+        'noise_thermal_fraction': med_fraction_thermal,
+        'noise_flicker_fraction': med_fraction_flicker,
+        'noise_drift_fraction': med_fraction_drift,
+        'noise_sigma_thermal_single_measured': med_sigma_thermal_single,
+        'noise_sigma_flicker_single_measured': med_sigma_flicker_single,
+        'noise_sigma_drift_single_measured': med_sigma_drift_single,
+        'noise_ctrl_reduction_fraction_mean': med_ctrl_reduction,
+    }
+
+    return {
+        'noise': noise_payload,
+        'medians': median_map,
+        'seed_count': len(results),
+    }
+
+
+def _build_noise_freeze_map(cfg_base: Dict[str, Any],
+                            param_name: str,
+                            values: Iterable[Union[float, int]],
+                            seeds: List[int],
+                            noise_seq_len: int,
+                            pm: Optional[ProgressManager] = None,
+                            progress_key: Optional[Any] = None,
+                            description: str = "Noise-only sweep") -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    values_list = list(values)
+    noise_map: Dict[str, Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+
+    if not values_list or not seeds:
+        return noise_map, rows
+
+    task = None
+    if pm is not None:
+        try:
+            task = pm.task(total=len(values_list), description=description,
+                           parent=progress_key, kind='sweep')
+        except Exception:
+            task = None
+
+    for value in values_list:
+        snapshot = _measure_noise_snapshot(cfg_base, param_name, value, seeds, noise_seq_len)
+        key = _value_key(value)
+        if snapshot:
+            noise_map[key] = snapshot['noise']
+            med = snapshot['medians']
+            row: Dict[str, Any] = {
+                'sweep_param': param_name,
+                'value': float(value),
+                'value_key': key,
+                'noise_sigma_da': med.get('noise_sigma_da', float('nan')),
+                'noise_sigma_sero': med.get('noise_sigma_sero', float('nan')),
+                'noise_sigma_I_diff': med.get('noise_sigma_I_diff', float('nan')),
+                'noise_sigma_diff_charge': med.get('noise_sigma_diff_charge', float('nan')),
+                'noise_sigma_single': med.get('noise_sigma_single', float('nan')),
+                'noise_rho_measured': med.get('noise_rho_measured', float('nan')),
+                'noise_sigma_sample_size': med.get('noise_sigma_sample_size', float('nan')),
+                'noise_sigma_diff_current_measured': med.get('noise_sigma_diff_current_measured', float('nan')),
+                'detection_window_s': med.get('detection_window_s', float('nan')),
+                'noise_sigma_thermal': med.get('noise_sigma_thermal', float('nan')),
+                'noise_sigma_flicker': med.get('noise_sigma_flicker', float('nan')),
+                'noise_sigma_drift': med.get('noise_sigma_drift', float('nan')),
+                'noise_thermal_fraction': med.get('noise_thermal_fraction', float('nan')),
+                'noise_flicker_fraction': med.get('noise_flicker_fraction', float('nan')),
+                'noise_drift_fraction': med.get('noise_drift_fraction', float('nan')),
+                'noise_sigma_thermal_single_measured': med.get('noise_sigma_thermal_single_measured', float('nan')),
+                'noise_sigma_flicker_single_measured': med.get('noise_sigma_flicker_single_measured', float('nan')),
+                'noise_sigma_drift_single_measured': med.get('noise_sigma_drift_single_measured', float('nan')),
+                'noise_ctrl_reduction_fraction_mean': med.get('noise_ctrl_reduction_fraction_mean', float('nan')),
+                'seed_count': snapshot.get('seed_count', len(seeds)),
+            }
+            rows.append(row)
+        if task:
+            task.update(1)
+
+    if task:
+        task.close()
+
+    return noise_map, rows
+
+
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False,
@@ -2661,6 +2867,14 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
 
         # Set sweep parameter (maintaining window/ISI consistency)
         _apply_sweep_param(cfg_run, param_name, param_value)
+
+        noise_freeze_map = cfg_run.get('_noise_freeze_map')
+        if isinstance(noise_freeze_map, dict):
+            param_noise_map = noise_freeze_map.get(param_name)
+            if param_noise_map:
+                payload = param_noise_map.get(_value_key(param_value))
+                if payload and isinstance(payload, dict):
+                    cfg_run['pipeline']['_frozen_noise'] = deepcopy(payload)
 
         freeze_payload: Optional[Dict[str, Any]] = None
         if freeze_snapshot:
@@ -2696,6 +2910,11 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 key = f'csk_thresholds_{target_ch}'
                 if key in cfg_run['pipeline']:
                     print(f"[DEBUG] CSK Thresholds @ {param_value}: {cfg_run['pipeline'][key]}")
+
+        if not isinstance(cfg_run['pipeline'].get('_frozen_noise'), dict):
+            _warn_synthetic_noise(
+                f"no measured noise payload for {param_name}={param_value}; falling back to analytic sigmas."
+            )
 
         # Run the instance and attach per-run ISI metrics
         result = run_single_instance(cfg_run, seed, attach_isi_meta=True)
@@ -3088,20 +3307,44 @@ def run_sweep(cfg: Dict[str, Any],
             isi_overlap_mean = float(np.nanmean([float(r.get('isi_overlap_ratio', 0.0)) for r in results]))
     
             # Stage 14: aggregate noise sigmas across seeds
-            ns_da = [float(r.get('noise_sigma_da', float('nan'))) for r in results]
-            ns_sero = [float(r.get('noise_sigma_sero', float('nan'))) for r in results]
-            ns_diff = [float(r.get('noise_sigma_I_diff', float('nan'))) for r in results]
-            ns_diff_charge = [float(r.get('noise_sigma_diff_charge', float('nan'))) for r in results]
-            ns_thermal = [float(r.get('noise_sigma_thermal', float('nan'))) for r in results]
-            ns_flicker = [float(r.get('noise_sigma_flicker', float('nan'))) for r in results]
-            ns_drift = [float(r.get('noise_sigma_drift', float('nan'))) for r in results]
-            ns_single = [float(r.get('noise_sigma_single', float('nan'))) for r in results]
-            thermal_fracs = [float(r.get('noise_thermal_fraction', float('nan'))) for r in results]
+            def _to_float(value: Any) -> float:
+                if value is None:
+                    return float('nan')
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return float('nan')
+
+            def _prefer_measured(record: Dict[str, Any], base_key: str) -> float:
+                measured_key = f"{base_key}_measured"
+                val_f = _to_float(record.get(measured_key))
+                if math.isfinite(val_f):
+                    return val_f
+                return _to_float(record.get(base_key))
+
+            ns_da = [_prefer_measured(r, 'noise_sigma_da') for r in results]
+            ns_sero = [_prefer_measured(r, 'noise_sigma_sero') for r in results]
+            ns_diff = [_prefer_measured(r, 'noise_sigma_I_diff') for r in results]
+            ns_diff_charge = [_prefer_measured(r, 'noise_sigma_diff_charge') for r in results]
+            ns_thermal = [_prefer_measured(r, 'noise_sigma_thermal') for r in results]
+            ns_flicker = [_prefer_measured(r, 'noise_sigma_flicker') for r in results]
+            ns_drift = [_prefer_measured(r, 'noise_sigma_drift') for r in results]
+            ns_single = [_prefer_measured(r, 'noise_sigma_single') for r in results]
+            thermal_fracs = [_prefer_measured(r, 'noise_thermal_fraction') for r in results]
+            flicker_fracs = [_prefer_measured(r, 'noise_flicker_fraction') for r in results]
+            drift_fracs = [_prefer_measured(r, 'noise_drift_fraction') for r in results]
+            ns_thermal_single = [_to_float(r.get('noise_sigma_thermal_single_measured')) for r in results]
+            ns_flicker_single = [_to_float(r.get('noise_sigma_flicker_single_measured')) for r in results]
+            ns_drift_single = [_to_float(r.get('noise_sigma_drift_single_measured')) for r in results]
+            ctrl_reduction_vals = [_to_float(r.get('noise_ctrl_reduction_fraction_mean')) for r in results]
             rho_pre_vals = [float(r.get('rho_pre_ctrl', float('nan'))) for r in results]
+            rho_noise_vals = [float(r.get('noise_rho_measured', float('nan'))) for r in results]
+            sigma_sample_sizes = [_to_float(r.get('noise_sigma_sample_size')) for r in results]
             burst_shapes = [str(r.get('burst_shape', '')) for r in results if r.get('burst_shape') not in (None, '')]
             trelease_vals = [float(r.get('T_release_ms', float('nan'))) for r in results]
             arr_da = np.asarray(ns_da, dtype=float)
             arr_rho_pre = np.asarray(rho_pre_vals, dtype=float)
+            arr_rho_noise = np.asarray(rho_noise_vals, dtype=float)
             arr_sero = np.asarray(ns_sero, dtype=float)
             arr_diff = np.asarray(ns_diff, dtype=float)
             arr_diff_charge = np.asarray(ns_diff_charge, dtype=float)
@@ -3110,6 +3353,13 @@ def run_sweep(cfg: Dict[str, Any],
             arr_drift = np.asarray(ns_drift, dtype=float)
             arr_single = np.asarray(ns_single, dtype=float)
             arr_thermal_frac = np.asarray(thermal_fracs, dtype=float)
+            arr_flicker_frac = np.asarray(flicker_fracs, dtype=float)
+            arr_drift_frac = np.asarray(drift_fracs, dtype=float)
+            arr_thermal_single = np.asarray(ns_thermal_single, dtype=float)
+            arr_flicker_single = np.asarray(ns_flicker_single, dtype=float)
+            arr_drift_single = np.asarray(ns_drift_single, dtype=float)
+            arr_ctrl_reduction = np.asarray(ctrl_reduction_vals, dtype=float)
+            arr_sigma_samples = np.asarray(sigma_sample_sizes, dtype=float)
             med_sigma_da = float(np.nanmedian(arr_da)) if np.isfinite(arr_da).any() else float('nan')
             med_sigma_sero = float(np.nanmedian(arr_sero)) if np.isfinite(arr_sero).any() else float('nan')
             med_sigma_diff = float(np.nanmedian(arr_diff)) if np.isfinite(arr_diff).any() else float('nan')
@@ -3119,7 +3369,15 @@ def run_sweep(cfg: Dict[str, Any],
             med_sigma_flicker = float(np.nanmedian(arr_flicker)) if np.isfinite(arr_flicker).any() else float('nan')
             med_sigma_drift = float(np.nanmedian(arr_drift)) if np.isfinite(arr_drift).any() else float('nan')
             med_thermal_frac = float(np.nanmedian(arr_thermal_frac)) if np.isfinite(arr_thermal_frac).any() else float('nan')
+            med_flicker_frac = float(np.nanmedian(arr_flicker_frac)) if np.isfinite(arr_flicker_frac).any() else float('nan')
+            med_drift_frac = float(np.nanmedian(arr_drift_frac)) if np.isfinite(arr_drift_frac).any() else float('nan')
+            med_sigma_thermal_single = float(np.nanmedian(arr_thermal_single)) if np.isfinite(arr_thermal_single).any() else float('nan')
+            med_sigma_flicker_single = float(np.nanmedian(arr_flicker_single)) if np.isfinite(arr_flicker_single).any() else float('nan')
+            med_sigma_drift_single = float(np.nanmedian(arr_drift_single)) if np.isfinite(arr_drift_single).any() else float('nan')
+            med_ctrl_reduction = float(np.nanmedian(arr_ctrl_reduction)) if np.isfinite(arr_ctrl_reduction).any() else float('nan')
             med_rho_pre = float(np.nanmedian(arr_rho_pre)) if np.isfinite(arr_rho_pre).any() else float('nan')
+            med_rho_noise = float(np.nanmedian(arr_rho_noise)) if np.isfinite(arr_rho_noise).any() else float('nan')
+            med_sigma_sample_size = float(np.nanmedian(arr_sigma_samples)) if np.isfinite(arr_sigma_samples).any() else float('nan')
 
             sigma_diff_current_vals: List[float] = []
             for sigma_charge_val, res in zip(ns_diff_charge, results):
@@ -3212,6 +3470,14 @@ def run_sweep(cfg: Dict[str, Any],
                 'noise_sigma_flicker': med_sigma_flicker,
                 'noise_sigma_drift': med_sigma_drift,
                 'noise_thermal_fraction': med_thermal_frac,
+                'noise_flicker_fraction': med_flicker_frac,
+                'noise_drift_fraction': med_drift_frac,
+                'noise_sigma_thermal_single_measured': med_sigma_thermal_single,
+                'noise_sigma_flicker_single_measured': med_sigma_flicker_single,
+                'noise_sigma_drift_single_measured': med_sigma_drift_single,
+                'noise_ctrl_reduction_fraction_mean': med_ctrl_reduction,
+                'noise_rho_measured': med_rho_noise,
+                'noise_sigma_sample_size': med_sigma_sample_size,
                 'rho_pre_ctrl': med_rho_pre,
                 'I_dc_used_A': med_I_dc,
                 'V_g_bias_V_used': med_V_g_bias,
@@ -3984,6 +4250,12 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
     cfg.setdefault('detection', {})
     cfg['detection']['decision_window_s'] = min_win
 
+    noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
+    if isinstance(noise_distance_map, dict):
+        noise_payload = noise_distance_map.get(_value_key(float(cfg['pipeline']['distance_um'])))
+        if isinstance(noise_payload, dict):
+            cfg['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+
     cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
 
     # NEW: Apply LoD validation sequence length override if specified
@@ -4096,6 +4368,12 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     cfg['pipeline']['time_window_s'] = max(cfg['pipeline'].get('time_window_s', 0.0), min_win)
     cfg.setdefault('detection', {})
     cfg['detection']['decision_window_s'] = min_win
+
+    noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
+    if isinstance(noise_distance_map, dict):
+        noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
+        if isinstance(noise_payload, dict):
+            cfg['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
 
     isi_overlap_ratio_initial = estimate_isi_overlap_ratio(cfg)
     _maybe_warn_isi_overlap(cfg, isi_overlap_ratio_initial, context=f"LoD distance {dist_um:.0f} um")
@@ -4316,6 +4594,12 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         cfg_lod.setdefault('detection', {})
         cfg_lod['detection']['decision_window_s'] = min_win       # <- align
 
+        noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
+        if isinstance(noise_distance_map, dict):
+            noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
+            if isinstance(noise_payload, dict):
+                cfg_lod['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+
         cfg_lod['pipeline']['Nm_per_symbol'] = lod_nm
 
         # Apply thresholds at this exact (distance, Ts, Nm)
@@ -4332,21 +4616,27 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         v_g_bias_values = []
         gm_values = []
         c_tot_values = []
+        def _as_float(val: Any) -> float:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float('nan')
+
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
                                         debug_calibration=debug_calibration, 
                                         sweep_name="lod_validation", cache_tag="lod_sigma")
             if result:
-                if 'noise_sigma_I_diff' in result:
-                    sigma_values.append(result['noise_sigma_I_diff'])
-                if 'noise_sigma_thermal' in result:
-                    sigma_thermal_values.append(result['noise_sigma_thermal'])
-                if 'noise_sigma_flicker' in result:
-                    sigma_flicker_values.append(result['noise_sigma_flicker'])
-                if 'noise_sigma_drift' in result:
-                    sigma_drift_values.append(result['noise_sigma_drift'])
-                if 'noise_thermal_fraction' in result:
-                    thermal_fraction_values.append(result['noise_thermal_fraction'])
+                sigma_val = result.get('noise_sigma_I_diff_measured', result.get('noise_sigma_I_diff', float('nan')))
+                sigma_values.append(_as_float(sigma_val))
+                sigma_thermal_val = result.get('noise_sigma_thermal_measured', result.get('noise_sigma_thermal', float('nan')))
+                sigma_thermal_values.append(_as_float(sigma_thermal_val))
+                sigma_flicker_val = result.get('noise_sigma_flicker_measured', result.get('noise_sigma_flicker', float('nan')))
+                sigma_flicker_values.append(_as_float(sigma_flicker_val))
+                sigma_drift_val = result.get('noise_sigma_drift_measured', result.get('noise_sigma_drift', float('nan')))
+                sigma_drift_values.append(_as_float(sigma_drift_val))
+                thermal_fraction_val = result.get('noise_thermal_fraction_measured', result.get('noise_thermal_fraction', float('nan')))
+                thermal_fraction_values.append(_as_float(thermal_fraction_val))
                 if 'I_dc_used_A' in result:
                     i_dc_values.append(result['I_dc_used_A'])
                 if 'V_g_bias_V_used' in result:
@@ -4431,6 +4721,11 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'noise_sigma_flicker': lod_sigma_flicker,
         'noise_sigma_drift': lod_sigma_drift,
         'noise_thermal_fraction': lod_thermal_fraction,
+        'noise_sigma_I_diff_measured': lod_sigma_median,
+        'noise_sigma_thermal_measured': lod_sigma_thermal,
+        'noise_sigma_flicker_measured': lod_sigma_flicker,
+        'noise_sigma_drift_measured': lod_sigma_drift,
+        'noise_thermal_fraction_measured': lod_thermal_fraction,
         'I_dc_used_A': float(lod_I_dc),
         'V_g_bias_V_used': float(lod_V_g_bias),
         'gm_S': float(lod_gm),
@@ -5417,6 +5712,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         print(f"?? Using CLI distance grid for {mode} (source={override_label}): {lod_distance_grid}")
     else:
         print(f"?? Using distance grid for {mode}: {lod_distance_grid}")
+
     profile = str(getattr(args, 'channel_profile', 'tri')).lower()
     cfg['pipeline']['channel_profile'] = profile
     if profile == 'single':
@@ -5507,6 +5803,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             raw_nm_values = DEFAULT_NM_RANGES.get(canonical_mode, DEFAULT_NM_RANGES['MoSK'])
             print(f"CFG default Nm_range[{canonical_mode}]: {raw_nm_values}")
     nm_values: List[Union[float, int]] = [cast(Union[float, int], int(v)) for v in raw_nm_values]
+
     guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
     ser_jobs = len(nm_values) * args.num_seeds
     lod_seed_cap = 10
@@ -5546,11 +5843,70 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         isi_key = ("sweep", mode, "ISI_vs_guard")
 
     # Always create the ser_bar with appropriate parent
+
     if hierarchy_supported:
         ser_bar = pm.task(total=ser_jobs, description="SER vs Nm",
                           parent=mode_key, key=("sweep", mode, "SER_vs_Nm"), kind="sweep")
     else:
         ser_bar = None
+
+    noise_rows: List[Dict[str, Any]] = []
+    if not getattr(args, "skip_noise_sweep", False):
+        noise_seed_count = min(int(max(args.noise_only_seeds, 1)), len(seeds))
+        noise_seeds = seeds[:noise_seed_count]
+        if noise_seeds:
+            print("? Measuring zero-signal noise floor...")
+            cfg.setdefault('_noise_freeze_map', {})
+
+            noise_map_nm, rows_nm = _build_noise_freeze_map(
+                cfg, "pipeline.Nm_per_symbol", nm_values, noise_seeds,
+                noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+                pm=pm if hierarchy_supported else None,
+                progress_key=mode_key if hierarchy_supported else None,
+                description="Noise-only (Nm)"
+            )
+            if noise_map_nm:
+                cfg['_noise_freeze_map'].setdefault("pipeline.Nm_per_symbol", {}).update(noise_map_nm)
+                noise_rows.extend([{**row, 'mode': mode, 'stage': 'Nm'} for row in rows_nm])
+            else:
+                _warn_synthetic_noise("noise-only sweep for Nm failed to produce measurements.")
+
+            noise_map_dist, rows_dist = _build_noise_freeze_map(
+                cfg, "pipeline.distance_um", lod_distance_grid, noise_seeds,
+                noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+                pm=pm if hierarchy_supported else None,
+                progress_key=mode_key if hierarchy_supported else None,
+                description="Noise-only (distance)"
+            )
+            if noise_map_dist:
+                cfg['_noise_freeze_map'].setdefault("pipeline.distance_um", {}).update(noise_map_dist)
+                cfg['_noise_freeze_distance_map'] = noise_map_dist
+                noise_rows.extend([{**row, 'mode': mode, 'stage': 'distance'} for row in rows_dist])
+            else:
+                _warn_synthetic_noise("noise-only sweep for distance failed to produce measurements.")
+        else:
+            print("??  Skipping zero-signal noise sweep (no seeds available).")
+            _warn_synthetic_noise("zero-signal noise sweep could not run (no seeds available).")
+    else:
+        _warn_synthetic_noise("zero-signal noise sweep was skipped (--skip-noise-sweep).")
+
+    if noise_rows:
+        noise_csv = data_dir / f"noise_only_{mode.lower()}{suffix}.csv"
+        noise_df = pd.DataFrame(noise_rows)
+        if noise_csv.exists():
+            try:
+                existing_noise = pd.read_csv(noise_csv)
+                combined_noise = pd.concat([existing_noise, noise_df], ignore_index=True)
+            except Exception as e:
+                print(f"??  Could not read existing noise CSV ({e}); overwriting.")
+                combined_noise = noise_df
+        else:
+            combined_noise = noise_df
+        noise_subset_cols = [col for col in ['mode', 'stage', 'sweep_param', 'value_key'] if col in combined_noise.columns]
+        if noise_subset_cols:
+            combined_noise = combined_noise.drop_duplicates(subset=noise_subset_cols, keep='last')
+        _atomic_write_csv(noise_csv, combined_noise)
+        print(f"? Noise-only sweep results saved to {noise_csv}")
 
     # CSV file paths
     ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}{suffix}.csv"

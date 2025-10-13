@@ -1,41 +1,40 @@
 # Setup Guide
 
-Use this guide when provisioning a fresh environment for the Tri-Channel OECT molecular communication simulator.
+Use this checklist when provisioning an environment for the Tri-Channel OECT molecular communication simulator.
 
-## Prerequisites
+## Requirements
 - Python 3.11 or newer
-- pip, wheel, and setuptools (latest versions recommended)
+- Recent `pip`, `wheel`, and `setuptools`
+- C/C++ build tools supplied by your OS package manager (SciPy wheels cover common platforms, but keeping compilers available helps with niche dependencies)
 
-## Fast path (editable install)
+## Standard Installation
 ```bash
-pip install -U pip wheel setuptools
-pip install -e .[dev]
+python -m venv .venv
+source .venv/bin/activate              # Windows PowerShell: .\.venv\Scripts\Activate.ps1
+python -m pip install -U pip wheel setuptools
+pip install -e ".[dev]"
 python setup_project.py
 ```
+`setup_project.py` validates the core Python packages and creates the expected `results/` subdirectories. Re-run it anytime; use `--reset cache` or `--reset all` to clear cached data.
 
-## Managed virtual environment
-`setup_env.py` can create an isolated virtual environment, install dependencies, and optionally add extras.
+## Guided Environment Creation
+`setup_env.py` bootstraps a dedicated virtual environment and installs the manifests shipped with the repository:
 ```bash
-# Latest package set (requirements.in) + dev extras + editable install
+# Latest versions from requirements.in + optional extras + editable install
 python setup_env.py --extras dev --editable
 
-# Reproduce the frozen snapshot in requirements.latest.txt
+# Frozen snapshot defined in requirements.latest.txt
 python setup_env.py --use-freeze --editable
 ```
+Supply `--env <path>` to customize the virtual environment location.
 
-Activate the environment before running simulations:
-- Linux/macOS: `source .venv/bin/activate`
-- Windows PowerShell: `.venv\Scripts\Activate.ps1`
-
-## Project bootstrap
-After installing the dependencies, run:
+## Post-Install Smoke Test
 ```bash
-python setup_project.py
+python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm
 ```
-This verifies core packages, creates the `results/` directory structure, and offers reset options via `--reset cache` or `--reset all`.
+Expect the run to create `results/cache/`, emit progress via `tqdm`, and write a log file under `results/logs/`.
 
-## Handy commands
-- `python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm`
-- `python analysis/run_master.py --modes all --resume --progress rich --parallel-modes 3`
-
-Logging is mirrored to `results/logs/`, and cached jobs allow safe interruption and resumption with `--resume`.
+## Troubleshooting
+- Confirm `python --version` reports 3.11.x. Earlier interpreters lack ABI support for SciPy 1.16 and NumPy 2.x.
+- On macOS and Linux, ensure `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and related environment variables are set to one when running large Monte Carlo batches (the analysis scripts enforce this by default).
+- If `pip` cannot fetch wheels for SciPy or NumPy, upgrade `pip` first; fall back to conda (`environment.yml`) if your platform is exotic.

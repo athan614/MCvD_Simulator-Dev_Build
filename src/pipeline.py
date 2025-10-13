@@ -8,7 +8,7 @@ COMPLETE FIX VERSION:
 3. (New) ISI metric collection hook (no physics changes)
 """
 
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, cast
 import numpy as np
 from numpy.random import default_rng
 import math
@@ -271,6 +271,7 @@ def calculate_proper_noise_sigma(
 
     return sigma, sigma
 
+
 def _calculate_isi_vectorized(
     tx_history: List[Tuple[int, float]], 
     t_vec: np.ndarray,
@@ -373,7 +374,12 @@ def _calculate_isi_vectorized(
     return conc_at_da_ch, conc_at_sero_ch, conc_at_ctrl_ch
 
 
-def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg: Dict[str, Any], rng) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def _single_symbol_currents(
+    s_tx: int,
+    tx_history: List[Tuple[int, float]],
+    cfg: Dict[str, Any],
+    rng
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, Optional[Dict[str, np.ndarray]]]:
     """
     Generate DA, SERO, CTRL drain-current traces for one symbol interval.
     COMPLETE FIX: 
@@ -569,12 +575,22 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
 
     # OECT current generation
     bound_sites_trio = np.vstack([bound_da_ch, bound_sero_ch, bound_ctrl_ch])
-    currents = oect_trio(
+    collect_components = bool(cfg.get('pipeline', {}).get('_collect_noise_components', False))
+    oect_result = oect_trio(
         bound_sites_trio,
         nts=("DA", "SERO", "CTRL"),
         cfg=cfg,
-        rng=rng
+        rng=rng,
+        return_components=collect_components
     )
+
+    if collect_components:
+        currents_dict_raw, component_traces = cast(Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]], oect_result)
+    else:
+        currents_dict_raw = cast(Dict[str, np.ndarray], oect_result)
+        component_traces = None
+
+    currents_dict = currents_dict_raw
 
     # === ISI METRIC (proxy) ==========================================
     # If requested, push an ISI-to-signal "energy" ratio proxy into cfg['_metrics'].
@@ -601,7 +617,7 @@ def _single_symbol_currents(s_tx: int, tx_history: List[Tuple[int, float]], cfg:
             pass
     # ================================================================
 
-    return currents["DA"], currents["SERO"], currents["CTRL"], Nm_actual
+    return currents_dict["DA"], currents_dict["SERO"], currents_dict["CTRL"], Nm_actual, component_traces
 
 
 def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -616,7 +632,14 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Guard against missing detection config
     cfg.setdefault('detection', {})
-        
+
+    pipeline_flags = cfg.get('pipeline', {})
+    noise_only_mode = bool(pipeline_flags.get('_noise_only_run', False))
+    if noise_only_mode:
+        cfg['disable_progress'] = True
+
+    collect_psd = bool(pipeline_flags.get('_collect_psd', False))
+    
     mod = cfg['pipeline']['modulation']
     L = cfg['pipeline']['sequence_length']
     rng = default_rng(cfg['pipeline'].get('random_seed'))
@@ -653,6 +676,19 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     mosk_stats_raw: List[float] = []
     mosk_stats_z: List[float] = []
     mosk_stats_whitened: List[float] = []
+    noise_charge_da_samples: List[float] = []
+    noise_charge_sero_samples: List[float] = []
+    noise_charge_diff_samples: List[float] = []
+    noise_window_samples: List[float] = []
+
+    component_names = ('thermal', 'flicker', 'drift')
+    component_diff_samples: Dict[str, List[float]] = {}
+    component_single_da_samples: Dict[str, List[float]] = {}
+    component_single_sero_samples: Dict[str, List[float]] = {}
+    if noise_only_mode:
+        component_diff_samples = {name: [] for name in component_names}
+        component_single_da_samples = {name: [] for name in component_names}
+        component_single_sero_samples = {name: [] for name in component_names}
 
     # enable metric collection for this run
     cfg['collect_isi_metrics'] = True
@@ -734,9 +770,21 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         rho_cc = rho_post if use_ctrl else rho_pre
     rho_cc = max(-1.0, min(1.0, rho_cc))
 
+    anchor_token_initial = str(cfg['detection'].get('decision_window_anchor', 'start')).lower()
+    tail_mode_initial = anchor_token_initial in ('tail', 'end')
+    subtract_ctrl_initial = (mod != "MoSK") and bool(cfg['pipeline'].get('use_control_channel', True))
+
+    sigma_da_measured = float('nan')
+    sigma_sero_measured = float('nan')
+    sigma_diff_charge_measured = float('nan')
+    sigma_single_measured = float('nan')
+    rho_measured = float('nan')
+    noise_sample_size = float('nan')
+    psd_payload: Optional[Dict[str, Any]] = None
+
     # Process symbols
     for i, s_tx in enumerate(tqdm(tx_symbols, desc=f"Simulating {mod}", disable=cfg.get('disable_progress', False))):
-        ig, ia, ic, Nm_realised = _single_symbol_currents(s_tx, tx_history, cfg, rng)
+        ig, ia, ic, Nm_realised, component_traces = _single_symbol_currents(s_tx, tx_history, cfg, rng)
         tx_history.append((s_tx, Nm_realised))
         
         # Detection and decision statistics
@@ -771,12 +819,76 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             start_idx = 0
             end_idx = min(n_detect_samples, n_total_samples)
 
+        if collect_psd and psd_payload is None and n_total_samples >= 2:
+            freq = np.fft.rfftfreq(n_total_samples, d=dt)
+
+            def _series_to_psd(series: np.ndarray) -> np.ndarray:
+                series = np.asarray(series, dtype=float)
+                if series.size < 2:
+                    return np.zeros(freq.shape, dtype=float)
+                series = series - np.mean(series)
+                spectrum = np.fft.rfft(series)
+                # Power spectral density (A^2/Hz) via periodogram
+                psd = (np.abs(spectrum) ** 2) * dt / float(series.size)
+                return psd
+
+            psd_payload = {
+                "frequency_hz": freq.tolist(),
+                "total_diff": _series_to_psd(sig_da - sig_sero).tolist(),
+                "total_da": _series_to_psd(sig_da).tolist(),
+                "total_sero": _series_to_psd(sig_sero).tolist(),
+            }
+
+            if component_traces:
+                for name, comp in component_traces.items():
+                    if comp is None:
+                        continue
+                    comp_arr = np.asarray(comp)
+                    if comp_arr.ndim != 2 or comp_arr.shape[0] < 2:
+                        continue
+                    comp_da = comp_arr[0]
+                    comp_sero = comp_arr[1]
+                    comp_ctrl = comp_arr[2] if comp_arr.shape[0] >= 3 else 0.0
+                    comp_da_sig = comp_da - comp_ctrl if subtract_for_q else comp_da
+                    comp_sero_sig = comp_sero - comp_ctrl if subtract_for_q else comp_sero
+                    psd_payload[f"{name}_da"] = _series_to_psd(comp_da_sig).tolist()
+                    psd_payload[f"{name}_sero"] = _series_to_psd(comp_sero_sig).tolist()
+                    psd_payload[f"{name}_diff"] = _series_to_psd(comp_da_sig - comp_sero_sig).tolist()
+
         q_da = float(np.trapezoid(sig_da[start_idx:end_idx], dx=dt))
         q_sero = float(np.trapezoid(sig_sero[start_idx:end_idx], dx=dt))
         window_samples = max(end_idx - start_idx, 1)
         window_s = window_samples * dt
         mean_i_da = q_da / window_s if window_s > 0 else 0.0
         mean_i_sero = q_sero / window_s if window_s > 0 else 0.0
+
+        if noise_only_mode:
+            noise_charge_da_samples.append(q_da)
+            noise_charge_sero_samples.append(q_sero)
+            noise_charge_diff_samples.append(q_da - q_sero)
+            noise_window_samples.append(window_s)
+
+            if component_traces is not None:
+                for name in component_names:
+                    comp_opt = component_traces.get(name)
+                    if comp_opt is None or len(comp_opt) < 3:
+                        continue
+                    comp = comp_opt
+                    comp_da = comp[0]
+                    comp_sero = comp[1]
+                    comp_ctrl = comp[2]
+                    comp_da_signal = comp_da - comp_ctrl if subtract_for_q else comp_da
+                    comp_sero_signal = comp_sero - comp_ctrl if subtract_for_q else comp_sero
+                    try:
+                        comp_charge_da = float(np.trapezoid(comp_da_signal[start_idx:end_idx], dx=dt))
+                        comp_charge_sero = float(np.trapezoid(comp_sero_signal[start_idx:end_idx], dx=dt))
+                        comp_charge_da_single = float(np.trapezoid(comp_da[start_idx:end_idx], dx=dt))
+                        comp_charge_sero_single = float(np.trapezoid(comp_sero[start_idx:end_idx], dx=dt))
+                    except Exception:
+                        continue
+                    component_diff_samples.setdefault(name, []).append(comp_charge_da - comp_charge_sero)
+                    component_single_da_samples.setdefault(name, []).append(comp_charge_da_single)
+                    component_single_sero_samples.setdefault(name, []).append(comp_charge_sero_single)
 
         constellation_points.append({
             "symbol_index": float(i),
@@ -1102,6 +1214,62 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 if l_hat != true_amp_bit:
                     subsymbol_errors['csk'] += 1
 
+    if noise_only_mode:
+        arr_da = np.asarray(noise_charge_da_samples, dtype=float)
+        arr_sero = np.asarray(noise_charge_sero_samples, dtype=float)
+        arr_diff = np.asarray(noise_charge_diff_samples, dtype=float)
+        arr_win = np.asarray(noise_window_samples, dtype=float)
+
+        def _finite_std_local(values: np.ndarray) -> float:
+            finite = values[np.isfinite(values)]
+            if finite.size >= 2:
+                return float(np.std(finite, ddof=1))
+            return float('nan')
+
+        sigma_da_measured = _finite_std_local(arr_da)
+        sigma_sero_measured = _finite_std_local(arr_sero)
+        sigma_diff_charge_measured = _finite_std_local(arr_diff)
+        if np.isfinite(sigma_da_measured) and np.isfinite(sigma_sero_measured):
+            sigma_single_measured = float(math.sqrt(max((sigma_da_measured ** 2 + sigma_sero_measured ** 2) / 2.0, 0.0)))
+        else:
+            sigma_single_measured = float('nan')
+        finite_mask = np.isfinite(arr_da) & np.isfinite(arr_sero)
+        if finite_mask.sum() >= 2:
+            try:
+                rho_measured = float(np.corrcoef(arr_da[finite_mask], arr_sero[finite_mask])[0, 1])
+            except (FloatingPointError, ValueError):
+                rho_measured = float('nan')
+        else:
+            rho_measured = float('nan')
+        noise_sample_size = float(finite_mask.sum())
+        mean_window = float(np.nanmedian(arr_win)) if arr_win.size else float('nan')
+        if np.isfinite(mean_window) and mean_window > 0.0 and np.isfinite(sigma_diff_charge_measured):
+            sigma_diff_current_measured = sigma_diff_charge_measured / mean_window
+        else:
+            sigma_diff_current_measured = float('nan')
+
+        component_sigma_diff: Dict[str, float] = {}
+        component_sigma_single: Dict[str, float] = {}
+        for name in component_names:
+            diff_list = component_diff_samples.get(name, [])
+            da_list = component_single_da_samples.get(name, [])
+            sero_list = component_single_sero_samples.get(name, [])
+            diff_arr = np.asarray(diff_list, dtype=float)
+            da_arr = np.asarray(da_list, dtype=float)
+            sero_arr = np.asarray(sero_list, dtype=float)
+            component_sigma_diff[name] = _finite_std_local(diff_arr)
+            std_da = _finite_std_local(da_arr)
+            std_sero = _finite_std_local(sero_arr)
+            if np.isfinite(std_da) and np.isfinite(std_sero):
+                component_sigma_single[name] = float(math.sqrt(max((std_da ** 2 + std_sero ** 2) / 2.0, 0.0)))
+            else:
+                component_sigma_single[name] = float('nan')
+
+    else:
+        sigma_diff_current_measured = float('nan')
+        component_sigma_diff = {}
+        component_sigma_single = {}
+
     # Calculate errors
     errors = np.sum(tx_symbols != rx_symbols)
 
@@ -1149,7 +1317,151 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         'detection_window_s': float(detection_window_s),
         'burst_shape': str(cfg.get('burst_shape', 'rect')),
         'T_release_ms': float(cfg.get('T_release_ms', 0.0)),
+        'noise_sigma_da_measured': float('nan'),
+        'noise_sigma_sero_measured': float('nan'),
+        'noise_sigma_I_diff_measured': float('nan'),
+        'noise_sigma_diff_charge_measured': float('nan'),
+        'noise_sigma_single_measured': float('nan'),
+        'noise_sigma_thermal_measured': float('nan'),
+        'noise_sigma_flicker_measured': float('nan'),
+        'noise_sigma_drift_measured': float('nan'),
+        'noise_thermal_fraction_measured': float('nan'),
+        'noise_flicker_fraction_measured': float('nan'),
+        'noise_drift_fraction_measured': float('nan'),
+        'noise_sigma_thermal_single_measured': float('nan'),
+        'noise_sigma_flicker_single_measured': float('nan'),
+        'noise_sigma_drift_single_measured': float('nan'),
+        'noise_ctrl_reduction_fraction_thermal': float('nan'),
+        'noise_ctrl_reduction_fraction_flicker': float('nan'),
+        'noise_ctrl_reduction_fraction_drift': float('nan'),
+        'noise_ctrl_reduction_fraction_mean': float('nan'),
+        'noise_rho_measured': float('nan'),
+        'noise_sigma_sample_size': float('nan'),
     }
+
+    # Populate component defaults from noise_components if available (e.g., frozen noise payloads)
+    if isinstance(noise_components, dict):
+        val = noise_components.get('thermal_sigma_single')
+        if val is not None:
+            result['noise_sigma_thermal_single_measured'] = float(val)
+        val = noise_components.get('flicker_sigma_single')
+        if val is not None:
+            result['noise_sigma_flicker_single_measured'] = float(val)
+        val = noise_components.get('drift_sigma_single')
+        if val is not None:
+            result['noise_sigma_drift_single_measured'] = float(val)
+        val = noise_components.get('ctrl_reduction_fraction_mean')
+        if val is not None:
+            result['noise_ctrl_reduction_fraction_mean'] = float(val)
+        val = noise_components.get('ctrl_reduction_fraction_thermal')
+        if val is not None:
+            result['noise_ctrl_reduction_fraction_thermal'] = float(val)
+        val = noise_components.get('ctrl_reduction_fraction_flicker')
+        if val is not None:
+            result['noise_ctrl_reduction_fraction_flicker'] = float(val)
+        val = noise_components.get('ctrl_reduction_fraction_drift')
+        if val is not None:
+            result['noise_ctrl_reduction_fraction_drift'] = float(val)
+
+    if psd_payload is not None:
+        result['psd_payload'] = psd_payload
+
+    if noise_only_mode:
+        result['SER'] = float('nan')
+        result['ser'] = float('nan')
+        result['errors'] = 0
+        result['noise_only'] = True
+        if np.isfinite(sigma_da_measured):
+            result['noise_sigma_da'] = float(sigma_da_measured)
+            result['noise_sigma_da_measured'] = float(sigma_da_measured)
+        if np.isfinite(sigma_sero_measured):
+            result['noise_sigma_sero'] = float(sigma_sero_measured)
+            result['noise_sigma_sero_measured'] = float(sigma_sero_measured)
+        if np.isfinite(sigma_diff_charge_measured):
+            result['noise_sigma_I_diff'] = float(sigma_diff_charge_measured)
+            result['noise_sigma_diff_charge'] = float(sigma_diff_charge_measured)
+            result['noise_sigma_I_diff_measured'] = float(sigma_diff_charge_measured)
+            result['noise_sigma_diff_charge_measured'] = float(sigma_diff_charge_measured)
+        if np.isfinite(sigma_single_measured):
+            result['noise_sigma_single'] = float(sigma_single_measured)
+            result['noise_sigma_single_measured'] = float(sigma_single_measured)
+        sigma_thermal_diff = component_sigma_diff.get('thermal', float('nan'))
+        sigma_flicker_diff = component_sigma_diff.get('flicker', float('nan'))
+        sigma_drift_diff = component_sigma_diff.get('drift', float('nan'))
+
+        result['noise_sigma_thermal'] = float(sigma_thermal_diff)
+        result['noise_sigma_flicker'] = float(sigma_flicker_diff)
+        result['noise_sigma_drift'] = float(sigma_drift_diff)
+        result['noise_sigma_thermal_measured'] = float(sigma_thermal_diff)
+        result['noise_sigma_flicker_measured'] = float(sigma_flicker_diff)
+        result['noise_sigma_drift_measured'] = float(sigma_drift_diff)
+
+        total_var_diff = (sigma_diff_charge_measured ** 2) if np.isfinite(sigma_diff_charge_measured) else float('nan')
+        thermal_var = (sigma_thermal_diff ** 2) if np.isfinite(sigma_thermal_diff) else float('nan')
+        flicker_var = (sigma_flicker_diff ** 2) if np.isfinite(sigma_flicker_diff) else float('nan')
+        drift_var = (sigma_drift_diff ** 2) if np.isfinite(sigma_drift_diff) else float('nan')
+
+        def _fraction(component_var: float) -> float:
+            if not np.isfinite(component_var) or not np.isfinite(total_var_diff) or total_var_diff <= 0.0:
+                return float('nan')
+            return float(component_var / total_var_diff)
+
+        result['noise_thermal_fraction'] = _fraction(thermal_var)
+        result['noise_flicker_fraction'] = _fraction(flicker_var)
+        result['noise_drift_fraction'] = _fraction(drift_var)
+        result['noise_thermal_fraction_measured'] = result['noise_thermal_fraction']
+        result['noise_flicker_fraction_measured'] = result['noise_flicker_fraction']
+        result['noise_drift_fraction_measured'] = result['noise_drift_fraction']
+
+        # Capture single-ended component sigmas and CTRL reduction where applicable
+        single_thermal = component_sigma_single.get('thermal', float('nan'))
+        single_flicker = component_sigma_single.get('flicker', float('nan'))
+        single_drift = component_sigma_single.get('drift', float('nan'))
+
+        result['noise_sigma_thermal_single_measured'] = float(single_thermal)
+        result['noise_sigma_flicker_single_measured'] = float(single_flicker)
+        result['noise_sigma_drift_single_measured'] = float(single_drift)
+
+        def _ctrl_reduction(single_sigma: float, diff_sigma: float) -> float:
+            if not np.isfinite(single_sigma) or single_sigma <= 0.0 or not np.isfinite(diff_sigma):
+                return float('nan')
+            return float(1.0 - (diff_sigma / single_sigma))
+
+        thermal_reduction = _ctrl_reduction(single_thermal, sigma_thermal_diff)
+        flicker_reduction = _ctrl_reduction(single_flicker, sigma_flicker_diff)
+        drift_reduction = _ctrl_reduction(single_drift, sigma_drift_diff)
+
+        result['noise_ctrl_reduction_fraction_thermal'] = thermal_reduction
+        result['noise_ctrl_reduction_fraction_flicker'] = flicker_reduction
+        result['noise_ctrl_reduction_fraction_drift'] = drift_reduction
+        if np.isfinite(thermal_reduction) or np.isfinite(flicker_reduction) or np.isfinite(drift_reduction):
+            reductions = [r for r in (thermal_reduction, flicker_reduction, drift_reduction) if np.isfinite(r)]
+            if reductions:
+                result['noise_ctrl_reduction_fraction_mean'] = float(np.mean(reductions))
+            else:
+                result['noise_ctrl_reduction_fraction_mean'] = float('nan')
+        else:
+            result['noise_ctrl_reduction_fraction_mean'] = float('nan')
+        result['noise_rho_measured'] = float(rho_measured)
+        result['noise_sigma_sample_size'] = float(noise_sample_size)
+        result['noise_sigma_diff_current_measured'] = float(sigma_diff_current_measured)
+        components_dict = result.get('noise_components')
+        if isinstance(components_dict, dict):
+            components_dict.update({
+                'sigma_diff_charge': float(sigma_diff_charge_measured),
+                'thermal_sigma': float(sigma_thermal_diff),
+                'flicker_sigma': float(sigma_flicker_diff),
+                'drift_sigma': float(sigma_drift_diff),
+                'thermal_fraction': float(result['noise_thermal_fraction']),
+                'flicker_fraction': float(result['noise_flicker_fraction']),
+                'drift_fraction': float(result['noise_drift_fraction']),
+                'thermal_sigma_single': float(single_thermal),
+                'flicker_sigma_single': float(single_flicker),
+                'drift_sigma_single': float(single_drift),
+                'ctrl_reduction_fraction_thermal': float(thermal_reduction),
+                'ctrl_reduction_fraction_flicker': float(flicker_reduction),
+                'ctrl_reduction_fraction_drift': float(drift_reduction),
+            })
 
     freeze_active = bool(cfg['pipeline'].get('_freeze_calibration_active', False))
     if freeze_active:

@@ -723,6 +723,8 @@ def main() -> None:
                    help="Run analytic BER/SEP and diffusion validation figure scripts.")
     p.add_argument("--gain-step", action=BooleanOptionalAction, default=True,
                    help="Run the ΔI/ΔQ gain plot step (use --no-gain-step to skip).")
+    p.add_argument("--organoid-study", action=BooleanOptionalAction, default=True,
+                   help="Run organoid sensitivity sweeps (alpha_H, bias, ionic strength).")
     p.add_argument("--nm-grid", type=str, default="",
                    help="Global Nm values for SER sweeps (pass-through to run_final_analysis).")
     p.add_argument("--nm-grid-mosk", type=str, default="",
@@ -959,6 +961,7 @@ def main() -> None:
             if getattr(args, "guard_samples_cap", None) is None:
                 args.guard_samples_cap = 0.0
             args.store_calibration_stats = True
+            args.organoid_study = True
 
             search_len = getattr(args, "lod_seq_len", 250)
             validate_len = getattr(args, "lod_validate_seq_len", None)
@@ -1090,6 +1093,7 @@ def main() -> None:
     if args.studies:
         flag_list.append(f"--studies={args.studies}")
     flag_list.append("--gain-step" if args.gain_step else "--no-gain-step")
+    flag_list.append("--organoid-study" if args.organoid_study else "--no-organoid-study")
     flag_list.append("oect_psd")
 
     session_meta = {
@@ -1113,13 +1117,15 @@ def main() -> None:
     steps.append("plots")
     if args.gain_step:
         steps.append("gain")
-    steps += ["snr_ts", "snr_panels", "oect_psd", "guard_frontier", "isi", "hybrid", "nb_replicas", "tables"]
+    steps += ["snr_ts", "snr_panels", "device_fom", "oect_psd", "guard_frontier", "isi", "hybrid", "onsi_vs_rho", "nb_replicas", "tables"]
     if "sensitivity" in studies_set:
         steps.append("study_sensitivity")
     if "capacity" in studies_set:
         steps.append("study_capacity")
     if "isi-analytic" in studies_set:
         steps.append("study_isi_analytic")
+    if args.organoid_study:
+        steps.append("organoid_sensitivity")
     if args.supplementary:
         steps.extend(["supplementary", "appendix"])
 
@@ -1708,6 +1714,23 @@ def main() -> None:
             _mark_done(state, "snr_panels")
         sub["snr_panels"].update(1); sub["snr_panels"].close(); overall.update(1)
 
+        if "device_fom" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("\U0001f6d1 Master pipeline stopped by user")
+                sys.exit(130)
+            if not (args.resume and state.get("device_fom", {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/plot_device_fom.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "device_fom")
+                    print("\U0001f6d1 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "device_fom")
+                    sys.exit(rc)
+                _mark_done(state, "device_fom")
+            sub["device_fom"].update(1); sub["device_fom"].close(); overall.update(1)
+
         # --- OECT PSD & notebook replica figures ---
         if master_cancelled.is_set():
             _safe_close_progress(pm, overall, sub)
@@ -1801,6 +1824,24 @@ def main() -> None:
                 sys.exit(rc)
             _mark_done(state, "hybrid")
         sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
+
+        if "onsi_vs_rho" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("🛑 Master pipeline stopped by user")
+                sys.exit(130)
+            key = "onsi_vs_rho"
+            if not (args.resume and state.get(key, {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/fig_onsi_vs_rho_cc.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, key)
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, key)
+                    sys.exit(rc)
+                _mark_done(state, key)
+            sub[key].update(1); sub[key].close(); overall.update(1)
 
         # Check cancellation before nb_replicas step
         if master_cancelled.is_set():
@@ -1904,6 +1945,27 @@ def main() -> None:
                 print()
                 print("[study] Building analytic ISI overlay...")
                 rc = _run_tracked([sys.executable, "-u", "analysis/isi_analytic_model.py", "--progress", args.progress])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, key)
+                    print("[stop] Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, key)
+                    sys.exit(rc)
+                _mark_done(state, key)
+            sub[key].update(1); sub[key].close(); overall.update(1)
+
+        if "organoid_sensitivity" in sub:
+            if master_cancelled.is_set():
+                _safe_close_progress(pm, overall, sub)
+                print("[stop] Master pipeline stopped by user")
+                sys.exit(130)
+            key = "organoid_sensitivity"
+            if not (args.resume and state.get(key, {}).get("done")):
+                print()
+                print("[study] Running organoid sensitivity sweeps...")
+                organoid_cmd = [sys.executable, "-u", "analysis/organoid_sensitivity.py"]
+                rc = _run_tracked(organoid_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)
                     print("[stop] Master pipeline stopped by user")
