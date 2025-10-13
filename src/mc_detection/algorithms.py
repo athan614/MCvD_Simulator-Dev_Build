@@ -108,7 +108,7 @@ def detect_mosk(
     q_da = float(np.trapezoid(slice_da, dx=dt))
     q_sero = float(np.trapezoid(slice_sero, dx=dt))
 
-    from ..constants import get_nt_params
+    from src.constants import get_nt_params
 
     q_eff_da = get_nt_params(cfg, 'DA')['q_eff_e']
     q_eff_sero = get_nt_params(cfg, 'SERO')['q_eff_e']
@@ -399,7 +399,7 @@ def calculate_snr(mu_signal: float,
     float
         Signal-to-noise ratio (linear scale)
     """
-    from ..constants import ELEMENTARY_CHARGE # type: ignore[import]
+    from src.constants import ELEMENTARY_CHARGE # type: ignore[import]
     
     # Signal amplitude
     delta_I = gm * (mu_signal - mu_reference) * q_eff * ELEMENTARY_CHARGE * N_e / C_tot

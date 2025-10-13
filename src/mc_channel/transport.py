@@ -11,7 +11,7 @@ from scipy import integrate #type: ignore
 from scipy.stats import gamma as gamma_dist #type: ignore
 from scipy.special import erfc  #type: ignore
 
-from ..constants import get_nt_params, MS_TO_S, AVOGADRO
+from src.constants import get_nt_params, MS_TO_S, AVOGADRO
 
 
 def greens_function_3d(r: float, t: float, D: float, lam: float, 

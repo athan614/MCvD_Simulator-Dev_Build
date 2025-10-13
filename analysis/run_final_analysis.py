@@ -17,7 +17,7 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError, Future
 import multiprocessing as mp
 import psutil
-from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable
+from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable, Sequence
 import gc
 import os
 import platform
@@ -2852,6 +2852,106 @@ def _build_noise_freeze_map(cfg_base: Dict[str, Any],
     return noise_map, rows
 
 
+def run_zero_signal_noise_analysis(
+    cfg: Dict[str, Any],
+    mode: str,
+    args: argparse.Namespace,
+    nm_values: Sequence[Union[int, float]],
+    lod_distance_grid: Sequence[Union[int, float]],
+    seeds: Sequence[int],
+    data_dir: Path,
+    suffix: str,
+    pm: ProgressManager,
+    hierarchy_supported: bool,
+    mode_key: Optional[Any],
+) -> None:
+    """Execute zero-signal noise sweeps as a standalone stage (optional)."""
+    if getattr(args, "skip_noise_sweep", False):
+        _warn_synthetic_noise("zero-signal noise sweep was skipped (--skip-noise-sweep).")
+        return
+
+    noise_seed_count = min(int(max(args.noise_only_seeds, 1)), len(seeds))
+    if noise_seed_count <= 0:
+        print("??  Skipping zero-signal noise sweep (no seeds available).")
+        _warn_synthetic_noise("zero-signal noise sweep could not run (no seeds available).")
+        return
+
+    noise_seeds = list(seeds[:noise_seed_count])
+    print("? Measuring zero-signal noise floor...")
+
+    cfg_noise_ready = deepcopy(cfg)
+    cfg_noise_ready.setdefault('pipeline', {})['_suppress_threshold_warnings'] = True
+    try:
+        warm_seeds = list(range(max(1, min(len(noise_seeds), 6))))
+        warm_thresholds = calibrate_thresholds(
+            cfg_noise_ready,
+            warm_seeds,
+            recalibrate=args.recalibrate,
+            save_to_file=False,
+            verbose=False,
+        )
+        for key, value in warm_thresholds.items():
+            if isinstance(key, str) and key.startswith("noise."):
+                cfg_noise_ready.setdefault("noise", {})[key.split(".", 1)[1]] = value
+            elif _should_apply_threshold_key(key):
+                cfg_noise_ready.setdefault('pipeline', {})[key] = value
+    except Exception as exc:
+        print(f"??  Pre-noise calibration skipped: {exc}")
+
+    cfg.setdefault('_noise_freeze_map', {})
+    noise_rows: List[Dict[str, Any]] = []
+
+    noise_map_nm, rows_nm = _build_noise_freeze_map(
+        cfg_noise_ready,
+        "pipeline.Nm_per_symbol",
+        nm_values,
+        noise_seeds,
+        noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+        pm=pm if hierarchy_supported else None,
+        progress_key=mode_key if hierarchy_supported else None,
+        description="Noise-only (Nm)"
+    )
+    if noise_map_nm:
+        cfg['_noise_freeze_map'].setdefault("pipeline.Nm_per_symbol", {}).update(noise_map_nm)
+        noise_rows.extend([{**row, 'mode': mode, 'stage': 'Nm'} for row in rows_nm])
+    else:
+        _warn_synthetic_noise("noise-only sweep for Nm failed to produce measurements.")
+
+    noise_map_dist, rows_dist = _build_noise_freeze_map(
+        cfg_noise_ready,
+        "pipeline.distance_um",
+        lod_distance_grid,
+        noise_seeds,
+        noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+        pm=pm if hierarchy_supported else None,
+        progress_key=mode_key if hierarchy_supported else None,
+        description="Noise-only (distance)"
+    )
+    if noise_map_dist:
+        cfg['_noise_freeze_map'].setdefault("pipeline.distance_um", {}).update(noise_map_dist)
+        cfg['_noise_freeze_distance_map'] = noise_map_dist
+        noise_rows.extend([{**row, 'mode': mode, 'stage': 'distance'} for row in rows_dist])
+    else:
+        _warn_synthetic_noise("noise-only sweep for distance failed to produce measurements.")
+
+    if noise_rows:
+        noise_csv = data_dir / f"noise_only_{mode.lower()}{suffix}.csv"
+        noise_df = pd.DataFrame(noise_rows)
+        if noise_csv.exists():
+            try:
+                existing_noise = pd.read_csv(noise_csv)
+                combined_noise = pd.concat([existing_noise, noise_df], ignore_index=True)
+            except Exception as e:
+                print(f"??  Could not read existing noise CSV ({e}); overwriting.")
+                combined_noise = noise_df
+        else:
+            combined_noise = noise_df
+        noise_subset_cols = [col for col in ['mode', 'stage', 'sweep_param', 'value_key'] if col in combined_noise.columns]
+        if noise_subset_cols:
+            combined_noise = combined_noise.drop_duplicates(subset=noise_subset_cols, keep='last')
+        _atomic_write_csv(noise_csv, combined_noise)
+        print(f"? Noise-only sweep results saved to {noise_csv}")
+
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
                          debug_calibration: bool = False,
@@ -2869,12 +2969,18 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         _apply_sweep_param(cfg_run, param_name, param_value)
 
         noise_freeze_map = cfg_run.get('_noise_freeze_map')
+        expect_frozen_noise = False
         if isinstance(noise_freeze_map, dict):
+            expect_frozen_noise = True
             param_noise_map = noise_freeze_map.get(param_name)
             if param_noise_map:
                 payload = param_noise_map.get(_value_key(param_value))
                 if payload and isinstance(payload, dict):
                     cfg_run['pipeline']['_frozen_noise'] = deepcopy(payload)
+                    expect_frozen_noise = True
+
+        if cfg_run['pipeline'].get('_freeze_calibration_active'):
+            expect_frozen_noise = True
 
         freeze_payload: Optional[Dict[str, Any]] = None
         if freeze_snapshot:
@@ -2911,7 +3017,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                 if key in cfg_run['pipeline']:
                     print(f"[DEBUG] CSK Thresholds @ {param_value}: {cfg_run['pipeline'][key]}")
 
-        if not isinstance(cfg_run['pipeline'].get('_frozen_noise'), dict):
+        if expect_frozen_noise and not isinstance(cfg_run['pipeline'].get('_frozen_noise'), dict):
             _warn_synthetic_noise(
                 f"no measured noise payload for {param_name}={param_value}; falling back to analytic sigmas."
             )
@@ -5850,64 +5956,6 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     else:
         ser_bar = None
 
-    noise_rows: List[Dict[str, Any]] = []
-    if not getattr(args, "skip_noise_sweep", False):
-        noise_seed_count = min(int(max(args.noise_only_seeds, 1)), len(seeds))
-        noise_seeds = seeds[:noise_seed_count]
-        if noise_seeds:
-            print("? Measuring zero-signal noise floor...")
-            cfg.setdefault('_noise_freeze_map', {})
-
-            noise_map_nm, rows_nm = _build_noise_freeze_map(
-                cfg, "pipeline.Nm_per_symbol", nm_values, noise_seeds,
-                noise_seq_len=int(max(args.noise_only_seq_len, 8)),
-                pm=pm if hierarchy_supported else None,
-                progress_key=mode_key if hierarchy_supported else None,
-                description="Noise-only (Nm)"
-            )
-            if noise_map_nm:
-                cfg['_noise_freeze_map'].setdefault("pipeline.Nm_per_symbol", {}).update(noise_map_nm)
-                noise_rows.extend([{**row, 'mode': mode, 'stage': 'Nm'} for row in rows_nm])
-            else:
-                _warn_synthetic_noise("noise-only sweep for Nm failed to produce measurements.")
-
-            noise_map_dist, rows_dist = _build_noise_freeze_map(
-                cfg, "pipeline.distance_um", lod_distance_grid, noise_seeds,
-                noise_seq_len=int(max(args.noise_only_seq_len, 8)),
-                pm=pm if hierarchy_supported else None,
-                progress_key=mode_key if hierarchy_supported else None,
-                description="Noise-only (distance)"
-            )
-            if noise_map_dist:
-                cfg['_noise_freeze_map'].setdefault("pipeline.distance_um", {}).update(noise_map_dist)
-                cfg['_noise_freeze_distance_map'] = noise_map_dist
-                noise_rows.extend([{**row, 'mode': mode, 'stage': 'distance'} for row in rows_dist])
-            else:
-                _warn_synthetic_noise("noise-only sweep for distance failed to produce measurements.")
-        else:
-            print("??  Skipping zero-signal noise sweep (no seeds available).")
-            _warn_synthetic_noise("zero-signal noise sweep could not run (no seeds available).")
-    else:
-        _warn_synthetic_noise("zero-signal noise sweep was skipped (--skip-noise-sweep).")
-
-    if noise_rows:
-        noise_csv = data_dir / f"noise_only_{mode.lower()}{suffix}.csv"
-        noise_df = pd.DataFrame(noise_rows)
-        if noise_csv.exists():
-            try:
-                existing_noise = pd.read_csv(noise_csv)
-                combined_noise = pd.concat([existing_noise, noise_df], ignore_index=True)
-            except Exception as e:
-                print(f"??  Could not read existing noise CSV ({e}); overwriting.")
-                combined_noise = noise_df
-        else:
-            combined_noise = noise_df
-        noise_subset_cols = [col for col in ['mode', 'stage', 'sweep_param', 'value_key'] if col in combined_noise.columns]
-        if noise_subset_cols:
-            combined_noise = combined_noise.drop_duplicates(subset=noise_subset_cols, keep='last')
-        _atomic_write_csv(noise_csv, combined_noise)
-        print(f"? Noise-only sweep results saved to {noise_csv}")
-
     # CSV file paths
     ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}{suffix}.csv"
 
@@ -6093,6 +6141,21 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # After the standard CSK SER vs Nm sweep finishes and nm_values are known:
     if mode == "CSK" and (args.nt_pairs or ""):
         run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
+
+    # Standalone zero-signal noise characterization (optional stage)
+    run_zero_signal_noise_analysis(
+        cfg=cfg,
+        mode=mode,
+        args=args,
+        nm_values=nm_values,
+        lod_distance_grid=lod_distance_grid,
+        seeds=seeds,
+        data_dir=data_dir,
+        suffix=suffix,
+        pm=pm,
+        hierarchy_supported=hierarchy_supported,
+        mode_key=mode_key,
+    )
 
     # ---------- 2) LoD vs Distance ----------
     print("\n2. Building LoD vs distance curve…")

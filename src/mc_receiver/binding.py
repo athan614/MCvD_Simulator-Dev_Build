@@ -8,7 +8,7 @@ while maintaining exact stochastic behavior and reasonable memory usage.
 import numpy as np
 from typing import Dict, Any, Tuple
 from scipy.integrate import odeint  #type: ignore
-from ..constants import get_nt_params, ELEMENTARY_CHARGE
+from src.constants import get_nt_params, ELEMENTARY_CHARGE
 
 
 def calculate_effective_on_rate(k_on: float, damkohler: float) -> float:

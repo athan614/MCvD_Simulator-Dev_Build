@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, Optional, Tuple, Any, cast, Union
 from scipy import signal    #type: ignore
-from ..constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
+from src.constants import get_nt_params, ELEMENTARY_CHARGE, BOLTZMANN
 
 
 def _cholesky_matrix(rho: float) -> np.ndarray:

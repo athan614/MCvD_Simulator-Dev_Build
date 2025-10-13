@@ -634,6 +634,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault('detection', {})
 
     pipeline_flags = cfg.get('pipeline', {})
+    suppress_threshold_warnings = bool(pipeline_flags.get('_suppress_threshold_warnings', False))
     noise_only_mode = bool(pipeline_flags.get('_noise_only_run', False))
     if noise_only_mode:
         cfg['disable_progress'] = True
@@ -952,7 +953,7 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             rx_symbols[i] = s_rx
             
             # Guardrails to catch future regressions (log once per sequence)
-            if i == 0:
+            if i == 0 and not suppress_threshold_warnings:
                 stat_magnitude = abs(decision_stat)
                 charge_magnitude = max(abs(q_da), abs(q_sero))
 
