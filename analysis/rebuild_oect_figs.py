@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import welch  #type: ignore
-from typing import Any
+from typing import Any, Dict, cast
 import yaml
 import os
 
@@ -85,7 +85,7 @@ def fig_differential_psd(cfg: dict):
     bound_sites = np.vstack([zeros, zeros, zeros])  # DA, SERO, CTRL
     nts = ("DA", "SERO", "CTRL")
 
-    trio = oect_mod.oect_trio(bound_sites, nts, cfg, rng, rho=cfg["noise"]["rho_correlated"])
+    trio = cast(Dict[str, np.ndarray], oect_mod.oect_trio(bound_sites, nts, cfg, rng, rho=cfg["noise"]["rho_correlated"]))
     i_da, i_ctrl = trio["DA"], trio["CTRL"]
 
     # PSD before subtraction (DA alone) vs after subtraction (DA-CTRL)

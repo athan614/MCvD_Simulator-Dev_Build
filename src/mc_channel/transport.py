@@ -92,10 +92,10 @@ def gamma_release_rate(t: float, Nm: float, k: float, theta: float) -> float:
     if t < 0:
         return 0.0
     # Safeguard against YAML/string propagation by forcing numeric types
-    tau = np.asarray(t, dtype=float)
+    tau = float(t)
     shape = float(k)
     scale = float(theta)
-    pdf = gamma_dist.pdf(tau, a=shape, scale=scale)
+    pdf = float(gamma_dist.pdf(tau, a=shape, scale=scale))
     Nm_val = float(Nm)
     return Nm_val * pdf
 
