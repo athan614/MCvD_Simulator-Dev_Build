@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, no_type_check
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Disable BLAS/OpenMP oversubscription for optimal process-level parallelism
@@ -62,6 +62,20 @@ sys.path.append(str(project_root))
 
 from analysis.ui_progress import ProgressManager
 from analysis.log_utils import setup_tee_logging
+from analysis.maintenance_suite import (
+    AVAILABLE_LIST_CATEGORIES,
+    STAGE_REGISTRY,
+    execute_maintenance_flags,
+)
+
+# Maintenance stage numbering shared with run_final_analysis:
+#   Stage 1 - SER vs Nm sweeps
+#   Stage 2 - LoD vs distance search
+#   Stage 3 - Device FoM parameter sweeps
+#   Stage 4 - Guard-frontier / ISI trade-off
+#   Stage 5 - Main figures
+#   Stage 6 - Supplementary figures
+#   Stage 7 - Tables & summaries
 
 try:
     from argparse import BooleanOptionalAction  # type: ignore[attr-defined]
@@ -106,6 +120,52 @@ def _extend_nm_grid_flags(cmd: List[str], args: argparse.Namespace) -> None:
         value = getattr(args, attr, "")
         if value:
             cmd.extend([flag, value])
+
+
+_STAGE_ALIAS_MAP = {
+    "ser": 1,
+    "ser_vs_nm": 1,
+    "nm": 1,
+    "lod": 2,
+    "lod_vs_distance": 2,
+    "distance": 2,
+    "device": 3,
+    "device_fom": 3,
+    "devicefom": 3,
+    "guard": 4,
+    "isi": 4,
+    "guard_frontier": 4,
+    "isi_tradeoff": 4,
+    "fig": 5,
+    "figure": 5,
+    "figures": 5,
+    "main": 5,
+    "plots": 5,
+    "supp": 6,
+    "supplementary": 6,
+    "appendix": 6,
+    "table": 7,
+    "tables": 7,
+}
+
+
+def _parse_stage_selection(spec: str) -> Set[int]:
+    tokens = [token.strip() for token in str(spec or "").replace(";", ",").split(",") if token.strip()]
+    if not tokens:
+        return {1, 2, 3, 4, 5, 6, 7}
+    stages: Set[int] = set()
+    for token in tokens:
+        lower = token.lower()
+        if lower in ("all", "*"):
+            return {1, 2, 3, 4, 5, 6, 7}
+        if lower in _STAGE_ALIAS_MAP:
+            stages.add(_STAGE_ALIAS_MAP[lower])
+            continue
+        try:
+            stages.add(int(float(token)))
+        except ValueError as exc:
+            raise ValueError(f"Unrecognized stage token '{token}'") from exc
+    return stages
 
 STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +423,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
     if getattr(args, 'channel_profile', 'tri') != 'tri':
         cmd.extend(['--channel-profile', args.channel_profile])
+    if getattr(args, 'ablation_parallel', False):
+        cmd.append("--ablation-parallel")
     if args.resume and not args.reset:
         cmd.append("--resume")
     if args.recalibrate:
@@ -382,6 +444,9 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--nt-pairs", args.nt_pairs])
     # Nm grid override (forward sweep parameters)
     _extend_nm_grid_flags(cmd, args)
+    stage_spec = getattr(args, "_run_stage_spec_data", "")
+    if stage_spec:
+        cmd.extend(["--run-stages", stage_spec])
     # Forward new optimization flags
     if args.distances:
         for dist_spec in args.distances:
@@ -396,6 +461,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--lod-skip-retry")
     if getattr(args, 'guard_samples_cap', None) is not None:
         cmd.extend(["--guard-samples-cap", str(args.guard_samples_cap)])
+    if getattr(args, 'force_noise_resample', False):
+        cmd.append("--force-noise-resample")
     if getattr(args, 'lod_validate_seq_len', None) is not None:
         cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
@@ -448,6 +515,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-max-nm", str(args.lod_max_nm)])
     if getattr(args, 'lod_distance_concurrency', None) is not None:
         cmd.extend(["--lod-distance-concurrency", str(args.lod_distance_concurrency)])
+    if getattr(args, 'force_noise_resample', False):
+        cmd.append("--force-noise-resample")
     if getattr(args, 'lod_skip_retry', False):
         cmd.append("--lod-skip-retry")
 
@@ -523,6 +592,9 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--nt-pairs", args.nt_pairs])
     # Nm grid override (forward sweep parameters)
     _extend_nm_grid_flags(cmd, args)
+    stage_spec = getattr(args, "_run_stage_spec_data", "")
+    if stage_spec:
+        cmd.extend(["--run-stages", stage_spec])
     # Forward new optimization flags
     if args.distances:
         for dist_spec in args.distances:
@@ -650,6 +722,8 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    if getattr(args, 'force_noise_resample', False):
+        cmd.append("--force-noise-resample")
     
     # Forward adaptive CTRL arguments
     if getattr(args, 'ctrl_auto', False):
@@ -684,7 +758,8 @@ def _child_max_workers(args: argparse.Namespace, num_modes: int = 1) -> Optional
     
     return workers_per_mode
 
-def main() -> None:
+@no_type_check
+def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     p = argparse.ArgumentParser(description="Master pipeline for tri-channel OECT paper")
     p.add_argument("--progress", choices=["gui", "rich", "tqdm", "none"], default="rich")
     p.add_argument("--resume", action="store_true", help="Resume completed steps")
@@ -705,6 +780,20 @@ def main() -> None:
     p.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default="all")
     p.add_argument("--parallel-modes", type=int, default=1,
                    help="Run modes concurrently within each ablation run (e.g., 3 for all three)")
+    # Quick-stage execution (Stage references mirror run_final_analysis)
+    #   Stage 1 - SER vs Nm
+    #   Stage 2 - LoD vs distance
+    #   Stage 3 - Device FoM sweeps
+    #   Stage 4 - Guard frontier / ISI trade-off
+    #   Stage 5 - Main figures
+    #   Stage 6 - Supplementary figures
+    #   Stage 7 - Tables & summaries
+    p.add_argument(
+        "--run-stages",
+        type=str,
+        default="all",
+        help="Comma-separated stage list (or 'all') to execute via run_final_analysis stages (default: all stages).",
+    )
     # CTRL ablation controller
     p.add_argument("--ablation", choices=["both", "on", "off"], default="both",
                    help="Run with CTRL (on), without CTRL (off), or both (default)")
@@ -756,6 +845,8 @@ def main() -> None:
                    help="Per-seed sample cap for guard sweeps (0 disables cap)")
     p.add_argument("--lod-skip-retry", action="store_true",
                    help="On resume, do not retry LoD distances that previously failed (keep NaN).")
+    p.add_argument("--force-noise-resample", action="store_true",
+                   help="Force rerunning zero-signal noise sweeps even if resume cache exists.")
     
     # ------ SER auto-refine near target SER ------
     p.add_argument("--ser-refine", action="store_true",
@@ -767,7 +858,7 @@ def main() -> None:
     
     # Stage-13 tuning pass-through
     p.add_argument("--target-ci", type=float, default=0.0,
-                   help="Stop adding seeds once Wilson 95% CI half-width <= target; 0 disables (pass-through)")
+                   help="Stop adding seeds once Wilson 95%% CI half-width <= target; 0 disables (pass-through)")
     p.add_argument("--min-ci-seeds", type=int, default=6,
                    help="Minimum seeds before CI stopping can trigger (pass-through)")
     p.add_argument("--lod-screen-delta", type=float, default=1e-4,
@@ -838,6 +929,84 @@ def main() -> None:
                    help="Force fsync on each write")
     p.add_argument("--inhibit-sleep", action="store_true",
                    help="Prevent the OS from sleeping while the pipeline runs")
+
+    # Maintenance & cache management
+    p.add_argument(
+        "--maintenance-dry-run",
+        action="store_true",
+        help="Preview maintenance actions without deleting files.",
+    )
+    p.add_argument(
+        "--maintenance-log",
+        type=str,
+        default=None,
+        help="Path for maintenance log output (default: results/logs/maintenance.log). Use 'none' or '-' to disable logging.",
+    )
+    stage_help = ", ".join(f"{sid}:{info.name}" for sid, info in STAGE_REGISTRY.items())
+    list_help = ", ".join(AVAILABLE_LIST_CATEGORIES)
+    p.add_argument(
+        "--list-maintenance",
+        nargs="+",
+        choices=AVAILABLE_LIST_CATEGORIES,
+        metavar="CATEGORY",
+        help=f"List maintenance resources (choices: {list_help}).",
+    )
+    p.add_argument(
+        "--list-stages",
+        action="store_true",
+        help="Show maintenance stage numbering and descriptions.",
+    )
+    p.add_argument(
+        "--maintenance-only",
+        action="store_true",
+        help="Run maintenance actions then exit without executing the master workflow.",
+    )
+    p.add_argument(
+        "--clear-threshold-cache",
+        nargs="*",
+        metavar="MODE",
+        default=None,
+        help="Clear cached threshold JSON files (optionally filtered by MODE).",
+    )
+    p.add_argument(
+        "--clear-lod-state",
+        nargs="*",
+        metavar="SPEC",
+        default=None,
+        help="Clear LoD caches/state. SPEC formats: 'all', 'mode', 'mode:distance', 'distance'.",
+    )
+    p.add_argument(
+        "--clear-seed-cache",
+        nargs="*",
+        metavar="SWEEP",
+        default=None,
+        help="Clear cached seed payloads (e.g., 'lod_search', 'ser_vs_nm'). Use without values to clear all sweeps.",
+    )
+    p.add_argument(
+        "--clear-distance",
+        nargs="+",
+        type=float,
+        metavar="DIST",
+        help="Remove LoD results for the given distance(s) in micrometres.",
+    )
+    p.add_argument(
+        "--clear-nm",
+        nargs="+",
+        type=float,
+        metavar="NM",
+        help="Remove SER vs Nm data for the specified molecule counts.",
+    )
+    p.add_argument(
+        "--reset-stage",
+        nargs="+",
+        metavar="STAGE",
+        help=f"Reset entire stages/sweeps by number or alias ({stage_help}).",
+    )
+    p.add_argument(
+        "--nuke-results",
+        action="store_true",
+        help="Delete the entire results/ directory before running the master workflow.",
+    )
     
     # Adaptive CTRL control (pass-through)
     p.add_argument("--ctrl-auto", action="store_true",
@@ -851,6 +1020,51 @@ def main() -> None:
                    help="Also keep the display awake (Windows/macOS)")
 
     args = p.parse_args()
+
+    if getattr(args, "reset", None):
+        if args.reset == "all":
+            args.nuke_results = True
+        elif args.reset == "cache":
+            if args.clear_seed_cache is None:
+                args.clear_seed_cache = []
+            if args.clear_lod_state is None:
+                args.clear_lod_state = []
+            if args.clear_threshold_cache is None:
+                args.clear_threshold_cache = []
+            args.clear_seed_cache.append("all")
+            args.clear_lod_state.append("all")
+            args.clear_threshold_cache.append("all")
+        args.reset = None
+
+    maintenance_performed = execute_maintenance_flags(args, project_root)
+    if getattr(args, "maintenance_only", False):
+        if not maintenance_performed:
+            print("Maintenance-only flag provided but no maintenance actions were executed.")
+        return
+
+    try:
+        stage_selection = _parse_stage_selection(getattr(args, "run_stages", "all"))
+    except ValueError as exc:
+        print(f"[error] {exc}")
+        sys.exit(2)
+    supported_stages = {stage for stage in stage_selection if 1 <= stage <= 7}
+    ignored_stages = sorted(stage_selection - supported_stages)
+    if ignored_stages:
+        ignored_str = ", ".join(str(stage) for stage in ignored_stages)
+        print(f"⚠️  Ignoring unsupported stage(s) {ignored_str} in run_master.")
+    if not supported_stages:
+        print("⚠️  No stages selected (--run-stages). Nothing to do.")
+        return
+
+    args._run_stage_set = supported_stages
+    args.run_stages = ",".join(str(stage) for stage in sorted(stage_selection))
+    data_stage_tokens = [str(stage) for stage in (1, 2, 3, 4) if stage in supported_stages]
+    args._run_stage_spec_data = ",".join(data_stage_tokens)
+
+    if 6 in supported_stages:
+        args.supplementary = True
+    elif args.supplementary and 6 not in supported_stages:
+        args.supplementary = False
 
     if args.distances is None:
         args.distances = []
@@ -1050,6 +1264,13 @@ def main() -> None:
     else:
         ablation_runs = [True, False]  # BOTH (default)
 
+    if args.modes:
+        mode_list = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+    elif args.mode:
+        mode_list = ["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode]
+    else:
+        mode_list = ["MoSK", "CSK", "Hybrid"]
+
     # Enhanced session metadata for GUI header
     flag_list: List[str] = [
         f"--num-seeds={args.num_seeds}",
@@ -1106,28 +1327,47 @@ def main() -> None:
     }
 
     # Dynamic step plan: split simulate into per-ablation steps
+    stage_set_active = getattr(args, '_run_stage_set', {1, 2, 3, 4, 5, 6, 7})
+    run_data_stages = bool(stage_set_active & {1, 2, 3, 4})
+    run_stage5 = 5 in stage_set_active
+    run_stage6 = 6 in stage_set_active
+    run_stage7 = 7 in stage_set_active
+
+    if not run_data_stages:
+        print("[stage] Stage 1-4 disabled via --run-stages; skipping simulation/data sweeps.")
+    if not run_stage5:
+        print("[stage] Stage 5 disabled via --run-stages; skipping main-figure rebuilds.")
+    if not run_stage6:
+        print("[stage] Stage 6 disabled via --run-stages; supplementary figures suppressed.")
+    if not run_stage7:
+        print("[stage] Stage 7 disabled via --run-stages; tables will not be regenerated.")
+
     steps: List[str] = []
-    steps.extend(["simulate_ctrl_on" if use else "simulate_ctrl_off" for use in ablation_runs])
-    if args.csk_baselines:
-        steps.append("csk_baselines")
-    if args.channel_suite:
-        steps.append("channel_suite")
-    if args.validate_theory:
-        steps.append("validate_theory")
-    steps.append("plots")
-    if args.gain_step:
-        steps.append("gain")
-    steps += ["snr_ts", "snr_panels", "device_fom", "oect_psd", "guard_frontier", "isi", "hybrid", "onsi_vs_rho", "nb_replicas", "tables"]
-    if "sensitivity" in studies_set:
-        steps.append("study_sensitivity")
-    if "capacity" in studies_set:
-        steps.append("study_capacity")
-    if "isi-analytic" in studies_set:
-        steps.append("study_isi_analytic")
-    if args.organoid_study:
-        steps.append("organoid_sensitivity")
-    if args.supplementary:
-        steps.extend(["supplementary", "appendix"])
+    if run_data_stages:
+        steps.extend(['simulate_ctrl_on' if use else 'simulate_ctrl_off' for use in ablation_runs])
+        if args.csk_baselines:
+            steps.append('csk_baselines')
+        if args.channel_suite:
+            steps.append('channel_suite')
+        if args.validate_theory:
+            steps.append('validate_theory')
+    if run_stage5:
+        steps.append('plots')
+        if args.gain_step:
+            steps.append('gain')
+        steps += ['snr_ts', 'snr_panels', 'device_fom', 'oect_psd', 'guard_frontier', 'isi', 'hybrid', 'onsi_vs_rho', 'nb_replicas']
+        if 'sensitivity' in studies_set:
+            steps.append('study_sensitivity')
+        if 'capacity' in studies_set:
+            steps.append('study_capacity')
+        if 'isi-analytic' in studies_set:
+            steps.append('study_isi_analytic')
+        if args.organoid_study:
+            steps.append('organoid_sensitivity')
+    if run_stage7:
+        steps.append('tables')
+    if run_stage6 and args.supplementary:
+        steps.extend(['supplementary', 'appendix'])
 
     pm = ProgressManager(mode=args.progress, gui_session_meta=session_meta)
     
@@ -1344,6 +1584,9 @@ def main() -> None:
                                 'target_ci': getattr(args, 'target_ci', 0.004),
                                 'min_ci_seeds': getattr(args, 'min_ci_seeds', 8),
                                 'lod_screen_delta': getattr(args, 'lod_screen_delta', 1e-4),
+                                'run_stages': getattr(args, 'run_stages', 'all'),
+                                '_run_stage_set': getattr(args, '_run_stage_set', {1, 2, 3, 4}),
+                                '_run_stage_spec_data': getattr(args, '_run_stage_spec_data', ''),
                                 
                                 # run_final_analysis-only args (use hardcoded defaults)
                                 'verbose': False,
@@ -1383,6 +1626,7 @@ def main() -> None:
                                 'decision_window_frac': getattr(args, 'decision_window_frac', None),
                                 'allow_ts_exceed': getattr(args, 'allow_ts_exceed', False),
                                 'ts_cap_s': getattr(args, 'ts_cap_s', None),
+                                'force_noise_resample': getattr(args, 'force_noise_resample', False),
                                 'isi_memory_cap': getattr(args, 'isi_memory_cap', None),
                                 'guard_factor': getattr(args, 'guard_factor', None),
                                 'lod_distance_timeout_s': getattr(args, 'lod_distance_timeout_s', 7200.0),
@@ -1463,19 +1707,34 @@ def main() -> None:
             else:
                 return 130 if any(rc == 130 for rc in rcs) else 1
 
-        # Run ablations (check cancellation between each)
-        if args.ablation_parallel and len(ablation_runs) == 2:
-            # Run CTRL ON/OFF concurrently and still honor stop
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futs = {pool.submit(_do_one_ablation, use): use for use in ablation_runs}
-                for fut in as_completed(futs):
+        if run_data_stages:
+            # Run ablations (check cancellation between each)
+            if args.ablation_parallel and len(ablation_runs) == 2:
+                # Run CTRL ON/OFF concurrently and still honor stop
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futs = {pool.submit(_do_one_ablation, use): use for use in ablation_runs}
+                    for fut in as_completed(futs):
+                        if master_cancelled.is_set():
+                            # Cancel remaining futures
+                            for f in futs:
+                                f.cancel()
+                            break
+                        use = futs[fut]
+                        rc = fut.result()
+                        key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
+                        if rc == 130:  # Cancellation
+                            _safe_close_progress(pm, overall, sub, key)
+                            print("🛑 Master pipeline stopped by user")
+                            sys.exit(130)
+                        elif rc != 0:
+                            _safe_close_progress(pm, overall, sub, key)
+                            sys.exit(rc)
+                        sub[key].update(1); sub[key].close(); overall.update(1)
+            else:
+                for use in ablation_runs:
                     if master_cancelled.is_set():
-                        # Cancel remaining futures
-                        for f in futs:
-                            f.cancel()
                         break
-                    use = futs[fut]
-                    rc = fut.result()
+                    rc = _do_one_ablation(use)
                     key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
                     if rc == 130:  # Cancellation
                         _safe_close_progress(pm, overall, sub, key)
@@ -1485,151 +1744,152 @@ def main() -> None:
                         _safe_close_progress(pm, overall, sub, key)
                         sys.exit(rc)
                     sub[key].update(1); sub[key].close(); overall.update(1)
-        else:
-            for use in ablation_runs:
+
+            if len(ablation_runs) == 2 and not master_cancelled.is_set():
+                print("\n🔗 Finalizing per-ablation CSV merges…")
+                for mode in mode_list:
+                    if master_cancelled.is_set():
+                        break
+                    merge_cmd = [sys.executable, "-u", "analysis/run_final_analysis.py",
+                                 "--merge-ablation-csvs", "--mode", mode]
+                    print(f"  $ {' '.join(merge_cmd)}")
+                    rc = _run_tracked(merge_cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub)
+                        print("🛑 Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub)
+                        sys.exit(rc)
+
+            if args.csk_baselines:
                 if master_cancelled.is_set():
-                    break
-                rc = _do_one_ablation(use)
-                key = "simulate_ctrl_on" if use else "simulate_ctrl_off"
-                if rc == 130:  # Cancellation
-                    _safe_close_progress(pm, overall, sub, key)
-                    print("🛑 Master pipeline stopped by user")
+                    _safe_close_progress(pm, overall, sub)
+                    print("?? Master pipeline stopped by user")
                     sys.exit(130)
-                elif rc != 0:
-                    _safe_close_progress(pm, overall, sub, key)
-                    sys.exit(rc)
+
+                if not (args.resume and state.get("csk_baselines", {}).get("done")):
+                    print("\n?? Running CSK baseline sweeps (single vs dual)...")
+
+                    def _exec_baseline(cmd: List[str]) -> None:
+                        print(f"  $ {' '.join(cmd)}")
+                        rc = _run_tracked(cmd)
+                        if rc == 130:
+                            _safe_close_progress(pm, overall, sub, "csk_baselines")
+                            print("?? Master pipeline stopped by user")
+                            sys.exit(130)
+                        elif rc != 0:
+                            _safe_close_progress(pm, overall, sub, "csk_baselines")
+                            sys.exit(rc)
+
+                    ser_baselines = [
+                        (False, ["--variant", "single_DA_noctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                        (False, ["--variant", "single_SERO_noctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                        (False, ["--variant", "dual_noctrl", "--csk-dual", "on"]),
+                    ]
+                    for use_ctrl, extra in ser_baselines:
+                        cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                        cmd.extend(extra)
+                        _exec_baseline(cmd)
+
+                    lod_baselines = [
+                        (True, ["--variant", "single_DA_ctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                        (True, ["--variant", "single_SERO_ctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                        (True, ["--variant", "dual_ctrl", "--csk-dual", "on"]),
+                    ]
+                    for use_ctrl, extra in lod_baselines:
+                        cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                        cmd.extend(extra)
+                        _exec_baseline(cmd)
+
+                    plot_script = project_root / "analysis" / "plot_csk_single_dual.py"
+                    if plot_script.exists():
+                        _exec_baseline([sys.executable, "-u", str(plot_script)])
+                    else:
+                        print("??  CSK baseline plot script not found; skipping plot step")
+
+                    _mark_done(state, "csk_baselines")
+
+                sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
+
+            if args.channel_suite:
+                if master_cancelled.is_set():
+                    _safe_close_progress(pm, overall, sub)
+                    print("?? Master pipeline stopped by user")
+                    sys.exit(130)
+
+                key = "channel_suite"
+                if not (args.resume and state.get(key, {}).get('done')):
+                    print("\n?? Running physical channel suite (single & dual channels)...")
+
+                    def _exec_suite(cmd: List[str]) -> None:
+                        print(f"  $ {' '.join(cmd)}")
+                        rc = _run_tracked(cmd)
+                        if rc == 130:
+                            _safe_close_progress(pm, overall, sub, key)
+                            print("?? Master pipeline stopped by user")
+                            sys.exit(130)
+                        elif rc != 0:
+                            _safe_close_progress(pm, overall, sub, key)
+                            sys.exit(rc)
+
+                    modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+                    profiles = [("single", "single_physical", False), ("dual", "dual_physical", False)]
+                    for profile, variant, use_ctrl in profiles:
+                        print(f"   -> {profile.title()} profile")
+                        for mode in modes:
+                            cmd = _build_run_final_cmd_for_mode(args, mode, use_ctrl, concurrent_modes=1)
+                            cmd.extend(["--channel-profile", profile, "--variant", variant])
+                            if profile == 'single':
+                                if mode.startswith('CSK'):
+                                    cmd.extend(["--csk-target", "DA", "--csk-dual", "off"])
+                                elif mode == 'Hybrid':
+                                    cmd.extend(["--csk-dual", "off"])
+                            elif profile == 'dual' and mode.startswith('CSK'):
+                                cmd.extend(["--csk-dual", "on"])
+
+                    plot_script = project_root / "analysis" / "plot_channel_profiles.py"
+                    if plot_script.exists():
+                        _exec_suite([sys.executable, "-u", str(plot_script)])
+                    else:
+                        print("??  Channel profile plot script not found; skipping plot step")
+
+                    _mark_done(state, key)
+
+                sub["channel_suite"].update(1); sub["channel_suite"].close(); overall.update(1)
+
+            if args.validate_theory:
+                if master_cancelled.is_set():
+                    _safe_close_progress(pm, overall, sub)
+                    print("?? Master pipeline stopped by user")
+                    sys.exit(130)
+
+                key = "validate_theory"
+                if not (args.resume and state.get(key, {}).get("done")):
+                    scripts: List[Path] = [
+                        project_root / "analysis" / "validate_analytics.py",
+                        project_root / "analysis" / "validate_transport_against_fick.py",
+                        project_root / "analysis" / "rebuild_oect_figs.py",
+                        project_root / "analysis" / "rebuild_binding_figs.py",
+                        project_root / "analysis" / "rebuild_transport_figs.py",
+                        project_root / "analysis" / "rebuild_pipeline_figs.py",
+                    ]
+                    for script in scripts:
+                        if not script.exists():
+                            print(f"??  Script not found: {script.name}")
+                            continue
+                        cmd = [sys.executable, "-u", str(script)]
+                        rc = _run_tracked(cmd)
+                        if rc == 130:
+                            _safe_close_progress(pm, overall, sub, key)
+                            print("?? Master pipeline stopped by user")
+                            sys.exit(130)
+                        elif rc != 0:
+                            _safe_close_progress(pm, overall, sub, key)
+                            sys.exit(rc)
+                    _mark_done(state, key)
+
                 sub[key].update(1); sub[key].close(); overall.update(1)
-
-        if args.csk_baselines:
-            if master_cancelled.is_set():
-                _safe_close_progress(pm, overall, sub)
-                print("?? Master pipeline stopped by user")
-                sys.exit(130)
-
-            if not (args.resume and state.get("csk_baselines", {}).get("done")):
-                print("\n?? Running CSK baseline sweeps (single vs dual)...")
-
-                def _exec_baseline(cmd: List[str]) -> None:
-                    print(f"  $ {' '.join(cmd)}")
-                    rc = _run_tracked(cmd)
-                    if rc == 130:
-                        _safe_close_progress(pm, overall, sub, "csk_baselines")
-                        print("?? Master pipeline stopped by user")
-                        sys.exit(130)
-                    elif rc != 0:
-                        _safe_close_progress(pm, overall, sub, "csk_baselines")
-                        sys.exit(rc)
-
-                ser_baselines = [
-                    (False, ["--variant", "single_DA_noctrl", "--csk-target", "DA", "--csk-dual", "off"]),
-                    (False, ["--variant", "single_SERO_noctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
-                    (False, ["--variant", "dual_noctrl", "--csk-dual", "on"]),
-                ]
-                for use_ctrl, extra in ser_baselines:
-                    cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
-                    cmd.extend(extra)
-                    _exec_baseline(cmd)
-
-                lod_baselines = [
-                    (True, ["--variant", "single_DA_ctrl", "--csk-target", "DA", "--csk-dual", "off"]),
-                    (True, ["--variant", "single_SERO_ctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
-                    (True, ["--variant", "dual_ctrl", "--csk-dual", "on"]),
-                ]
-                for use_ctrl, extra in lod_baselines:
-                    cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
-                    cmd.extend(extra)
-                    _exec_baseline(cmd)
-
-                plot_script = project_root / "analysis" / "plot_csk_single_dual.py"
-                if plot_script.exists():
-                    _exec_baseline([sys.executable, "-u", str(plot_script)])
-                else:
-                    print("??  CSK baseline plot script not found; skipping plot step")
-
-                _mark_done(state, "csk_baselines")
-
-            sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
-
-        if args.channel_suite:
-            if master_cancelled.is_set():
-                _safe_close_progress(pm, overall, sub)
-                print("?? Master pipeline stopped by user")
-                sys.exit(130)
-
-            key = "channel_suite"
-            if not (args.resume and state.get(key, {}).get('done')):
-                print("\n?? Running physical channel suite (single & dual channels)...")
-
-                def _exec_suite(cmd: List[str]) -> None:
-                    print(f"  $ {' '.join(cmd)}")
-                    rc = _run_tracked(cmd)
-                    if rc == 130:
-                        _safe_close_progress(pm, overall, sub, key)
-                        print("?? Master pipeline stopped by user")
-                        sys.exit(130)
-                    elif rc != 0:
-                        _safe_close_progress(pm, overall, sub, key)
-                        sys.exit(rc)
-
-                modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
-                profiles = [("single", "single_physical", False), ("dual", "dual_physical", False)]
-                for profile, variant, use_ctrl in profiles:
-                    print(f"   -> {profile.title()} profile")
-                    for mode in modes:
-                        cmd = _build_run_final_cmd_for_mode(args, mode, use_ctrl, concurrent_modes=1)
-                        cmd.extend(["--channel-profile", profile, "--variant", variant])
-                        if profile == 'single':
-                            if mode.startswith('CSK'):
-                                cmd.extend(["--csk-target", "DA", "--csk-dual", "off"])
-                            elif mode == 'Hybrid':
-                                cmd.extend(["--csk-dual", "off"])
-                        elif profile == 'dual' and mode.startswith('CSK'):
-                            cmd.extend(["--csk-dual", "on"])
-
-                plot_script = project_root / "analysis" / "plot_channel_profiles.py"
-                if plot_script.exists():
-                    _exec_suite([sys.executable, "-u", str(plot_script)])
-                else:
-                    print("??  Channel profile plot script not found; skipping plot step")
-
-                _mark_done(state, key)
-
-            sub["channel_suite"].update(1); sub["channel_suite"].close(); overall.update(1)
-
-        if args.validate_theory:
-            if master_cancelled.is_set():
-                _safe_close_progress(pm, overall, sub)
-                print("?? Master pipeline stopped by user")
-                sys.exit(130)
-
-
-            key = "validate_theory"
-            if not (args.resume and state.get(key, {}).get("done")):
-                scripts: List[Path] = [
-                    project_root / "analysis" / "validate_analytics.py",
-                    project_root / "analysis" / "validate_transport_against_fick.py",
-                    project_root / "analysis" / "rebuild_oect_figs.py",
-                    project_root / "analysis" / "rebuild_binding_figs.py",
-                    project_root / "analysis" / "rebuild_transport_figs.py",
-                    project_root / "analysis" / "rebuild_pipeline_figs.py",
-                ]
-                for script in scripts:
-                    if not script.exists():
-                        print(f"??  Script not found: {script.name}")
-                        continue
-                    cmd = [sys.executable, "-u", str(script)]
-                    rc = _run_tracked(cmd)
-                    if rc == 130:
-                        _safe_close_progress(pm, overall, sub, key)
-                        print("?? Master pipeline stopped by user")
-                        sys.exit(130)
-                    elif rc != 0:
-                        _safe_close_progress(pm, overall, sub, key)
-                        sys.exit(rc)
-                _mark_done(state, key)
-
-
-            sub[key].update(1); sub[key].close(); overall.update(1)
 
 
         # Check cancellation before each major step
@@ -1638,18 +1898,19 @@ def main() -> None:
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
-        # --- Comparative plots (Fig.7/10/11) ---
-        if not (args.resume and state.get("plots", {}).get("done")):
-            rc = _run_tracked([sys.executable, "-u", "analysis/generate_comparative_plots.py"])
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "plots")
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "plots")
-                sys.exit(rc)
-            _mark_done(state, "plots")
-        sub["plots"].update(1); sub["plots"].close(); overall.update(1)
+        if "plots" in sub:
+            # --- Comparative plots (Fig.7/10/11) ---
+            if not (args.resume and state.get("plots", {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/generate_comparative_plots.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "plots")
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "plots")
+                    sys.exit(rc)
+                _mark_done(state, "plots")
+            sub["plots"].update(1); sub["plots"].close(); overall.update(1)
 
         if "gain" in sub:
             # --- Input-output gain plots ---
@@ -1677,20 +1938,21 @@ def main() -> None:
             print("\U0001f6d1 Master pipeline stopped by user")
             sys.exit(130)
 
-        if not (args.resume and state.get("snr_ts", {}).get("done")):
-            snr_modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
-            for mode in snr_modes:
-                ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
-                rc = _run_tracked(ts_cmd)
-                if rc == 130:
-                    _safe_close_progress(pm, overall, sub, "snr_ts")
-                    print("\U0001f6d1 Master pipeline stopped by user")
-                    sys.exit(130)
-                elif rc != 0:
-                    _safe_close_progress(pm, overall, sub, "snr_ts")
-                    sys.exit(rc)
-            _mark_done(state, "snr_ts")
-        sub["snr_ts"].update(1); sub["snr_ts"].close(); overall.update(1)
+        if "snr_ts" in sub:
+            if not (args.resume and state.get("snr_ts", {}).get("done")):
+                snr_modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+                for mode in snr_modes:
+                    ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
+                    rc = _run_tracked(ts_cmd)
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, "snr_ts")
+                        print("\U0001f6d1 Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, "snr_ts")
+                        sys.exit(rc)
+                _mark_done(state, "snr_ts")
+            sub["snr_ts"].update(1); sub["snr_ts"].close(); overall.update(1)
 
         # --- SNR summary panels ---
         if master_cancelled.is_set():
@@ -1698,21 +1960,22 @@ def main() -> None:
             print("\U0001f6d1 Master pipeline stopped by user")
             sys.exit(130)
 
-        if not (args.resume and state.get("snr_panels", {}).get("done")):
-            panel_cmd = [sys.executable, "-u", "analysis/plot_snr_panels.py"]
-            modes_arg = args.modes if hasattr(args, "modes") else getattr(args, "mode", "MoSK")
-            if modes_arg:
-                panel_cmd.extend(["--modes", modes_arg])
-            rc = _run_tracked(panel_cmd)
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "snr_panels")
-                print("\U0001f6d1 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "snr_panels")
-                sys.exit(rc)
-            _mark_done(state, "snr_panels")
-        sub["snr_panels"].update(1); sub["snr_panels"].close(); overall.update(1)
+        if "snr_panels" in sub:
+            if not (args.resume and state.get("snr_panels", {}).get("done")):
+                panel_cmd = [sys.executable, "-u", "analysis/plot_snr_panels.py"]
+                modes_arg = args.modes if hasattr(args, "modes") else getattr(args, "mode", "MoSK")
+                if modes_arg:
+                    panel_cmd.extend(["--modes", modes_arg])
+                rc = _run_tracked(panel_cmd)
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "snr_panels")
+                    print("\U0001f6d1 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "snr_panels")
+                    sys.exit(rc)
+                _mark_done(state, "snr_panels")
+            sub["snr_panels"].update(1); sub["snr_panels"].close(); overall.update(1)
 
         if "device_fom" in sub:
             if master_cancelled.is_set():
@@ -1737,20 +2000,21 @@ def main() -> None:
             print("\U0001f6d1 Master pipeline stopped by user")
             sys.exit(130)
 
-        if not (args.resume and state.get("oect_psd", {}).get("done")):
-            rc = _run_tracked([sys.executable, "-u", "analysis/rebuild_oect_figs.py"])
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "oect_psd")
-                print("\U0001f6d1 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "oect_psd")
-                sys.exit(rc)
-            _mark_done(state, "oect_psd")
-            _log_oect_figures()
-        else:
-            _log_oect_figures(prefix="[oect-cached]")
-        sub["oect_psd"].update(1); sub["oect_psd"].close(); overall.update(1)
+        if "oect_psd" in sub:
+            if not (args.resume and state.get("oect_psd", {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/rebuild_oect_figs.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "oect_psd")
+                    print("\U0001f6d1 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "oect_psd")
+                    sys.exit(rc)
+                _mark_done(state, "oect_psd")
+                _log_oect_figures()
+            else:
+                _log_oect_figures(prefix="[oect-cached]")
+            sub["oect_psd"].update(1); sub["oect_psd"].close(); overall.update(1)
 
         # Check cancellation before ISI step
         if master_cancelled.is_set():
@@ -1765,36 +2029,38 @@ def main() -> None:
             sys.exit(130)
 
         # --- Guard frontier plots ---
-        if not (args.resume and state.get("guard_frontier", {}).get("done")):
-            guard_script = project_root / "analysis" / "plot_guard_frontier.py"
-            guard_commands = _build_guard_frontier_commands(guard_script)
-            if guard_commands:
-                for cmd in guard_commands:
-                    rc = _run_tracked(cmd)
-                    if rc == 130:
-                        _safe_close_progress(pm, overall, sub, "guard_frontier")
-                        print("?? Master pipeline stopped by user")
-                        sys.exit(130)
-                    elif rc != 0:
-                        _safe_close_progress(pm, overall, sub, "guard_frontier")
-                        sys.exit(rc)
-            else:
-                print("?? Guard frontier plot skipped: no guard_frontier CSVs detected.")
-            _mark_done(state, "guard_frontier")
-        sub["guard_frontier"].update(1); sub["guard_frontier"].close(); overall.update(1)
+        if "guard_frontier" in sub:
+            if not (args.resume and state.get("guard_frontier", {}).get("done")):
+                guard_script = project_root / "analysis" / "plot_guard_frontier.py"
+                guard_commands = _build_guard_frontier_commands(guard_script)
+                if guard_commands:
+                    for cmd in guard_commands:
+                        rc = _run_tracked(cmd)
+                        if rc == 130:
+                            _safe_close_progress(pm, overall, sub, "guard_frontier")
+                            print("?? Master pipeline stopped by user")
+                            sys.exit(130)
+                        elif rc != 0:
+                            _safe_close_progress(pm, overall, sub, "guard_frontier")
+                            sys.exit(rc)
+                else:
+                    print("?? Guard frontier plot skipped: no guard_frontier CSVs detected.")
+                _mark_done(state, "guard_frontier")
+            sub["guard_frontier"].update(1); sub["guard_frontier"].close(); overall.update(1)
 
-        # --- ISI trade-off ---
-        if not (args.resume and state.get("isi", {}).get("done")):
-            rc = _run_tracked([sys.executable, "-u", "analysis/plot_isi_tradeoff.py"])
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "isi")
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "isi")
-                sys.exit(rc)
-            _mark_done(state, "isi")
-        sub["isi"].update(1); sub["isi"].close(); overall.update(1)
+        if "isi" in sub:
+            # --- ISI trade-off ---
+            if not (args.resume and state.get("isi", {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/plot_isi_tradeoff.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "isi")
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "isi")
+                    sys.exit(rc)
+                _mark_done(state, "isi")
+            sub["isi"].update(1); sub["isi"].close(); overall.update(1)
 
         # Check cancellation before hybrid step
         if master_cancelled.is_set():
@@ -1802,28 +2068,29 @@ def main() -> None:
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
-        # --- Hybrid multidimensional benchmarks (Stage 10) ---
-        if not (args.resume and state.get("hybrid", {}).get("done")):
-            hybrid_script = None
-            for cand in ["analysis/plot_hybrid_multidim_benchmarks.py",
-                         "analysis/generate_hybrid_multidim_benchmarks.py"]:
-                if (project_root / cand).exists():
-                    hybrid_script = cand; break
-            if hybrid_script is None:
-                print("✗ Hybrid benchmark script not found"); sys.exit(2)
-            hybrid_cmd = [sys.executable, "-u", hybrid_script]
-            if args.realistic_onsi:
-                hybrid_cmd.append("--realistic-onsi")
-            rc = _run_tracked(hybrid_cmd)
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "hybrid")
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "hybrid")
-                sys.exit(rc)
-            _mark_done(state, "hybrid")
-        sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
+        if "hybrid" in sub:
+            # --- Hybrid multidimensional benchmarks (Stage 10) ---
+            if not (args.resume and state.get("hybrid", {}).get("done")):
+                hybrid_script = None
+                for cand in ["analysis/plot_hybrid_multidim_benchmarks.py",
+                             "analysis/generate_hybrid_multidim_benchmarks.py"]:
+                    if (project_root / cand).exists():
+                        hybrid_script = cand; break
+                if hybrid_script is None:
+                    print("✗ Hybrid benchmark script not found"); sys.exit(2)
+                hybrid_cmd = [sys.executable, "-u", hybrid_script]
+                if args.realistic_onsi:
+                    hybrid_cmd.append("--realistic-onsi")
+                rc = _run_tracked(hybrid_cmd)
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "hybrid")
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "hybrid")
+                    sys.exit(rc)
+                _mark_done(state, "hybrid")
+            sub["hybrid"].update(1); sub["hybrid"].close(); overall.update(1)
 
         if "onsi_vs_rho" in sub:
             if master_cancelled.is_set():
@@ -1849,51 +2116,55 @@ def main() -> None:
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
-        # --- Optional notebook-replica panels (if present) ---
-        if not (args.resume and state.get("nb_replicas", {}).get("done")):
-            scripts = [
-                project_root / "analysis" / "rebuild_oect_figs.py",
-                project_root / "analysis" / "rebuild_binding_figs.py",
-                project_root / "analysis" / "rebuild_transport_figs.py",
-                project_root / "analysis" / "rebuild_pipeline_figs.py",
-            ]
-            for script_path in scripts:
-                if not script_path.exists():
-                    print(f"??  Script not found: {script_path.name}"); continue
-                rc = _run_tracked([sys.executable, "-u", str(script_path)])
-                if rc == 130:
-                    _safe_close_progress(pm, overall, sub, "nb_replicas")
-                    print("?? Master pipeline stopped by user")
-                    sys.exit(130)
-                elif rc != 0:
-                    _safe_close_progress(pm, overall, sub, "nb_replicas")
-                    sys.exit(rc)
+        if "nb_replicas" in sub:
+            # --- Optional notebook-replica panels (if present) ---
+            if not (args.resume and state.get("nb_replicas", {}).get("done")):
+                scripts = [
+                    project_root / "analysis" / "rebuild_oect_figs.py",
+                    project_root / "analysis" / "rebuild_binding_figs.py",
+                    project_root / "analysis" / "rebuild_transport_figs.py",
+                    project_root / "analysis" / "rebuild_pipeline_figs.py",
+                ]
+                for script_path in scripts:
+                    if not script_path.exists():
+                        print(f"??  Script not found: {script_path.name}"); continue
+                    rc = _run_tracked([sys.executable, "-u", str(script_path)])
+                    if rc == 130:
+                        _safe_close_progress(pm, overall, sub, "nb_replicas")
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
+                    elif rc != 0:
+                        _safe_close_progress(pm, overall, sub, "nb_replicas")
+                        sys.exit(rc)
+            sub["nb_replicas"].update(1); sub["nb_replicas"].close(); overall.update(1)
+
         # Check cancellation before tables step
         if master_cancelled.is_set():
             _safe_close_progress(pm, overall, sub)
             print("🛑 Master pipeline stopped by user")
             sys.exit(130)
 
-        # --- Tables (Table I & II) ---
-        if not (args.resume and state.get("tables", {}).get("done")):
-            rc = _run_tracked([sys.executable, "-u", "analysis/param_table.py"])
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "tables")
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "tables")
-                sys.exit(rc)
-            rc = _run_tracked([sys.executable, "-u", "analysis/table_maker.py"])
-            if rc == 130:
-                _safe_close_progress(pm, overall, sub, "tables")
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            elif rc != 0:
-                _safe_close_progress(pm, overall, sub, "tables")
-                sys.exit(rc)
-            _mark_done(state, "tables")
-        sub["tables"].update(1); sub["tables"].close(); overall.update(1)
+        if "tables" in sub:
+            # --- Tables (Table I & II) ---
+            if not (args.resume and state.get("tables", {}).get("done")):
+                rc = _run_tracked([sys.executable, "-u", "analysis/param_table.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "tables")
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "tables")
+                    sys.exit(rc)
+                rc = _run_tracked([sys.executable, "-u", "analysis/table_maker.py"])
+                if rc == 130:
+                    _safe_close_progress(pm, overall, sub, "tables")
+                    print("🛑 Master pipeline stopped by user")
+                    sys.exit(130)
+                elif rc != 0:
+                    _safe_close_progress(pm, overall, sub, "tables")
+                    sys.exit(rc)
+                _mark_done(state, "tables")
+            sub["tables"].update(1); sub["tables"].close(); overall.update(1)
 
         if "study_sensitivity" in sub:
             if master_cancelled.is_set():

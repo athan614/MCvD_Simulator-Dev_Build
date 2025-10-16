@@ -15,7 +15,6 @@ python -m pip install -U pip wheel setuptools
 
 # 2) install runtime + developer extras
 pip install -e ".[dev]"
-
 # 3) provision results/ tree and verify core packages
 python setup_project.py
 
@@ -23,6 +22,48 @@ python setup_project.py
 python analysis/run_final_analysis.py --mode CSK --num-seeds 4 --sequence-length 200 --recalibrate --resume --progress tqdm
 ```
 Use `python setup_env.py --extras dev --editable` for a guided installation and `python setup_env.py --use-freeze --editable` to replay the pinned snapshot in `requirements.latest.txt`.
+
+## Maintenance Suite
+Both `analysis/run_final_analysis.py` and `analysis/run_master.py` ship with a shared maintenance suite (`analysis/maintenance_suite.py`) so you can inspect, prune, or rebuild parts of the results tree without hand-editing files.
+
+**Stage map** (used by `--reset-stage`):
+1. SER vs Nm sweeps (`results/data/ser_vs_nm*.csv`, `results/cache/*/ser_vs_nm_*`)
+2. LoD vs distance search/state (`lod_vs_distance`, `lod_* caches`, `dXXum` folders)
+3. Device FoM sweeps (`device_fom` CSV + caches)
+4. Guard-frontier & ISI trade-off (`guard_tradeoff/frontier` CSV + caches)
+5. Main figures (publication outputs under `results/figures/`, `results/figures/notebook_replicas/`, `results/figures/publication/`)
+6. Supplementary figures (`results/figures/supplementary/`, `results/figures/appendix/`)
+7. Tables & summaries (`results/tables/`, `results/data/table_*`, `results/data/summary_*`)
+
+**Listing resources**
+- `--list-maintenance cache data` prints a short tree under `results/cache/` and `results/data/`.
+- Additional categories: `thresholds`, `lod`, `ser`, `device`, `guard`, `figures`, `cache-summary`, `stages`.
+- Combine with `--maintenance-only` to inspect the filesystem without kicking off simulations.
+
+**Targeted cleanup flags**
+- `--clear-threshold-cache [MODE ...]` remove cached detector thresholds (omit MODE to clear everything).
+- `--clear-lod-state [SPEC ...]` prune LoD state/caches. `SPEC` accepts `all`, `mode`, `distance`, or `mode:distance[:wctrl|noctrl]`.
+- `--clear-seed-cache [SWEEP ...]` drop cached seed payloads (e.g., `lod_search`, `ser_vs_nm`). With no values it clears every sweep.
+- `--clear-distance DIST [DIST ...]` purge LoD rows/caches for specific distances (micrometres).
+- `--clear-nm NM [NM ...]` purge SER vs Nm rows/caches for specific molecule counts.
+
+**Operational helpers**
+- `--maintenance-dry-run` preview maintenance actions without deleting files.
+- `--maintenance-log PATH` write maintenance audit entries to the chosen file (default: `results/logs/maintenance.log`, use `none` or `-` to disable).
+- `--maintenance-only` run maintenance commands and exit before any simulations.
+
+**Stage resets & destructive options**
+- `--reset-stage 2 4` wipes the listed stages (see map above) including CSVs and caches.
+- `--nuke-results` removes *everything* under `results/` (the directory is recreated automatically).
+- Legacy `run_master.py --reset cache/all` now forwards to the same helpers; you can mix old and new flags.
+
+Pass `--maintenance-only` alongside any cleanup command to perform the action(s) and exit immediately.
+**Quick stage runs**
+- Stage map shared by `run_master.py` and `run_final_analysis.py`: `1=SER vs Nm`, `2=LoD vs distance`, `3=Device FoM`, `4=Guard/ISI trade-off`, `5=Main figures`, `6=Supplementary`, `7=Tables/Summaries`.
+- `analysis/run_final_analysis.py --run-stages 2` runs only the LoD sweep (Stage 2) for the selected mode(s).
+- `analysis/run_master.py --run-stages 1` replays just the SER vs Nm sweeps (Stage 1) and skips downstream plotting.
+- `analysis/run_master.py --run-stages 5,7` rebuilds main figures (Stage 5) and tables (Stage 7) without rerunning simulations.
+
 
 ## Repository Layout
 - `src/` core simulator modules (imported via `src.pipeline.run_sequence`).
@@ -60,7 +101,7 @@ Use `python setup_env.py --extras dev --editable` for a guided installation and 
 - **LoD search**: automated Nm bracket refinement per distance with configurable validation seeds (`--lod-*` flags).
 - **SER sweeps**: configurable Nm grids (`--nm-grid`, config-driven lists) and target refinement runs (`--ser-refine`).
 - **ISI/guard studies**: toggle and bound guard factor, ISI memory, and decision-window settings (`--guard-factor`, `--guard-samples-cap`, `--disable-isi`, `--decision-window-policy`, `--decision-window-frac`).
-- **Noise experiments**: isolate noise-only seeds (`--noise-only-seeds`, `--skip-noise-sweep`), switch detector statistics, and inspect correlated control subtraction (`--with-ctrl`, `--no-ctrl`, `--detector-mode`).
+- **Noise experiments**: isolate noise-only seeds (`--noise-only-seeds`, `--skip-noise-sweep`), force fresh noise characterization when needed (`--force-noise-resample`), switch detector statistics, and inspect correlated control subtraction (`--with-ctrl`, `--no-ctrl`, `--detector-mode`).
 - **Hybrid modulation analysis**: vary CSK level mapping (`--csk-level-scheme`), tail integration fraction, and dual-channel combiners.
 - **Parallel calibration stress tests**: `--beast-mode`, `--extreme-mode`, and watchdog settings vet long-running workloads, while `run_master.py` can drive cross-mode or guard-frontier matrices in parallel.
 - **Specialized diagnostics**: scripts under `analysis/` provide capacity estimation, sensitivity sweeps to temperature/diffusion/binding, noise correlation heatmaps, and analytic-versus-simulation validation.

@@ -945,7 +945,19 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
             # Honor comparator direction saved by calibration (default to '>')
             threshold = float(cfg['pipeline'].get('mosk_threshold', 0.0))
-            comparator = str(cfg['pipeline'].get('mosk_comparator', '>'))
+            if 'mosk_comparator' in cfg['pipeline']:
+                comparator = str(cfg['pipeline']['mosk_comparator'])
+            else:
+                comparator = '>'
+                if i == 0 and not suppress_threshold_warnings:
+                    logger.warning(
+                        "MoSK comparator flag missing; falling back to default ('>'). "
+                        "Recalibrate thresholds to persist mosk_comparator."
+                    )
+            if comparator not in ('<', '>'):
+                if i == 0 and not suppress_threshold_warnings:
+                    logger.warning(f"MoSK comparator '{comparator}' unsupported; defaulting to '>'.")
+                comparator = '>'
             if comparator == '>':
                 s_rx = 0 if decision_stat > threshold else 1  # DA when stat exceeds threshold
             else:
@@ -1062,10 +1074,17 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if not thresholds:
                 logger.warning(f"CSK thresholds missing for {threshold_key}. Symbol detection will default to level 0.")
 
-            # Use data-driven orientation (not q_eff)
+            # Use orientation measured during calibration; warn if missing and fallback to q_eff
             q_eff_target = get_nt_params(cfg, target_channel)['q_eff_e']
-            increasing = bool(cfg['pipeline'].get('csk_thresholds_increasing',
-                                                True if q_eff_target > 0 else False))
+            if 'csk_thresholds_increasing' in cfg['pipeline']:
+                increasing = bool(cfg['pipeline']['csk_thresholds_increasing'])
+            else:
+                increasing = True if q_eff_target > 0 else False
+                if i == 0 and not suppress_threshold_warnings:
+                    logger.warning(
+                        "CSK orientation flag missing; falling back to q_eff sign. "
+                        "Recalibrate thresholds to persist csk_thresholds_increasing."
+                    )
 
             # CSK symbol detection
             s_rx = 0
@@ -1184,10 +1203,20 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
             # Use calibrated thresholds on the amplitude statistic with data-driven orientation
             if b_hat == 0:
                 tau = float(cfg['pipeline'].get('hybrid_threshold_da', 0.0))
-                inc = bool(cfg['pipeline'].get('hybrid_threshold_da_increasing', True))
+                inc_key = 'hybrid_threshold_da_increasing'
             else:
                 tau = float(cfg['pipeline'].get('hybrid_threshold_sero', 0.0))
-                inc = bool(cfg['pipeline'].get('hybrid_threshold_sero_increasing', True))
+                inc_key = 'hybrid_threshold_sero_increasing'
+
+            if inc_key in cfg['pipeline']:
+                inc = bool(cfg['pipeline'][inc_key])
+            else:
+                inc = True
+                if i == 0 and not suppress_threshold_warnings:
+                    logger.warning(
+                        "Hybrid amplitude orientation flag missing; falling back to default (increasing). "
+                        "Recalibrate thresholds to persist hybrid_threshold_*_increasing."
+                    )
             l_hat = 1 if ((decision_stat_amp > tau) if inc else (decision_stat_amp < tau)) else 0
 
             # Construct final symbol

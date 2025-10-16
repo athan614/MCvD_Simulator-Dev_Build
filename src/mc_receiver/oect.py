@@ -128,16 +128,22 @@ def oect_trio(bound_sites_trio: np.ndarray,
     freqs[0] = freqs[1]  # avoid zero
     
     # Get parameters from nested config
-    alpha_H = cfg["noise"]["alpha_H"]
-    K_d = cfg["noise"]["K_d_Hz"]
-    N_c = cfg["noise"]["N_c"]
+    alpha_H_raw = cfg["noise"]["alpha_H"]
+    K_d_raw = cfg["noise"]["K_d_Hz"]
+    N_c_raw = cfg["noise"]["N_c"]
+    alpha_H = float(alpha_H_raw) if isinstance(alpha_H_raw, str) else float(alpha_H_raw)
+    K_d = float(K_d_raw) if isinstance(K_d_raw, str) else float(K_d_raw)
+    N_c = float(N_c_raw) if isinstance(N_c_raw, str) else N_c_raw
     T = cfg["sim"]["temperature_K"]
     R_ch = cfg["oect"]["R_ch_Ohm"]
     gm = cfg["oect"]["gm_S"]
     C_tot = cfg["oect"]["C_tot_F"]
-
     o = cfg.get('oect', {})
-    I_DC_cfg = float(o.get('I_dc_A', 0.0) or 0.0)
+    I_DC_cfg_raw = o.get('I_dc_A', 0.0) or 0.0
+    try:
+        I_DC_cfg = float(I_DC_cfg_raw)
+    except (TypeError, ValueError):
+        I_DC_cfg = 0.0
     if not np.isfinite(I_DC_cfg) or I_DC_cfg <= 0:
         V_g_bias = float(o.get('V_g_bias_V', -0.2))
         I_DC = gm * abs(V_g_bias)

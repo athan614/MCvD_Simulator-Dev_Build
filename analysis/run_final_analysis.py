@@ -20,6 +20,7 @@ import psutil
 from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable, Sequence
 import gc
 import os
+import stat
 import platform
 import time
 import typing
@@ -155,6 +156,23 @@ def _should_apply_threshold_key(key: Any) -> bool:
     if key.startswith("__"):
         return False
     return key not in DIAGNOSTIC_THRESHOLD_KEYS
+
+
+def _infer_csk_threshold_orientation(thresholds: Iterable[Any], default_qeff: float) -> bool:
+    """
+    Infer the monotonic orientation of CSK decision thresholds.
+    Falls back to the effective charge sign when thresholds are unavailable.
+    """
+    seq: List[float] = []
+    for val in thresholds or []:
+        try:
+            seq.append(float(val))
+        except (TypeError, ValueError):
+            continue
+    if len(seq) >= 2:
+        return bool(seq[-1] >= seq[0])
+    return bool(default_qeff >= 0.0)
+
 
 def _canonical_mode_name(mode: str) -> str:
     if not mode:
@@ -651,6 +669,8 @@ def run_sequence_wrapper(cfg: Dict[str, Any], seed: int, attach_isi_meta: bool =
                 if key in cfg['pipeline']:
                     del cfg['pipeline'][key]
                     print(f"🧹 Cleared stale threshold key: {key}")
+            if 'csk_thresholds_increasing' in cfg['pipeline']:
+                del cfg['pipeline']['csk_thresholds_increasing']
             if '_threshold_cache_meta' in cfg:
                 del cfg['_threshold_cache_meta']
 
@@ -772,6 +792,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 raise RuntimeError("cache: q_eff_signs mismatch")
 
             # Mode-specific checks
+            tgt: str = ""
             if mode.startswith("CSK"):
                 M = int(cfg['pipeline'].get('csk_levels', 4))
                 tgt = str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper()
@@ -803,7 +824,15 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                     if k == "__meta__": 
                         continue
                     print(f"   {k}: {v if not isinstance(v, list) else f'list[{len(v)}]'}")
-            return {k: v for k, v in cached.items() if k not in ("_metadata", "__meta__")}
+            result = {k: v for k, v in cached.items() if k not in ("_metadata", "__meta__")}
+            if mode.startswith("CSK") and tgt:
+                key = f"csk_thresholds_{tgt.lower()}"
+                thresh_vals = result.get(key)
+                if isinstance(thresh_vals, list) and 'csk_thresholds_increasing' not in result:
+                    nt_cfg = cfg.get('neurotransmitters', {})
+                    qeff = float((nt_cfg.get(tgt, {}) or {}).get('q_eff_e', 0.0))
+                    result['csk_thresholds_increasing'] = _infer_csk_threshold_orientation(thresh_vals, qeff)
+            return result
         except Exception:
             # fall through to re-calculate
             if verbose:
@@ -1026,6 +1055,9 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                     print("⚠️  CSK calibration incomplete; using 0.0 thresholds")
 
         thresholds[f'csk_thresholds_{target_channel.lower()}'] = final_tau
+        nt_cfg = cfg.get('neurotransmitters', {})
+        qeff_target = float((nt_cfg.get(target_channel, {}) or {}).get('q_eff_e', 0.0))
+        thresholds['csk_thresholds_increasing'] = _infer_csk_threshold_orientation(final_tau or [], qeff_target)
 
         # provenance for resume
         cfg['_threshold_cache_meta'] = {
@@ -1238,7 +1270,24 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     
     # Check memory cache first
     if cache_key in calibration_cache:
-        return calibration_cache[cache_key]
+        cached_result = calibration_cache[cache_key]
+        if cfg['pipeline']['modulation'].startswith('CSK') and \
+           'csk_thresholds_increasing' not in cached_result:
+            cached_copy = dict(cached_result)
+            target_channel = str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper()
+            key = f'csk_thresholds_{target_channel.lower()}'
+            nt_cfg = cfg.get('neurotransmitters', {})
+            qeff_target = float((nt_cfg.get(target_channel, {}) or {}).get('q_eff_e', 0.0))
+            thresh_vals = cached_copy.get(key)
+            if not isinstance(thresh_vals, list):
+                thresh_vals = []
+            cached_copy['csk_thresholds_increasing'] = _infer_csk_threshold_orientation(
+                thresh_vals,
+                qeff_target,
+            )
+            calibration_cache[cache_key] = cached_copy
+            cached_result = cached_copy
+        return cached_result
     
     # Compute thresholds (respecting the recalibrate flag)
     result = calibrate_thresholds(cfg, seeds, recalibrate=recalibrate, save_to_file=True, verbose=False)
@@ -1541,9 +1590,423 @@ def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
     """
     tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
     df.to_csv(tmp, index=False)
-    os.replace(tmp, csv_path)
-    metadata = _extract_csv_metadata(df)
-    _write_csv_metadata(csv_path, metadata)
+
+    def _replace() -> None:
+        try:
+            os.replace(tmp, csv_path)
+            metadata = _extract_csv_metadata(df)
+            _write_csv_metadata(csv_path, metadata)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+
+    _with_file_lock(csv_path, _replace)
+
+
+_STAGE_CSV_BASENAMES = {
+    "ser": "ser_vs_nm_{mode}",
+    "lod": "lod_vs_distance_{mode}",
+    "isi": "isi_tradeoff_{mode}",
+}
+
+
+def _ablation_token(use_ctrl: bool) -> str:
+    return "ctrl" if use_ctrl else "noctrl"
+
+
+def _stage_csv_paths(stage: str,
+                     data_dir: Path,
+                     mode: str,
+                     suffix: str,
+                     use_ctrl: bool) -> Tuple[Path, Path, Path]:
+    template = _STAGE_CSV_BASENAMES[stage]
+    base = template.format(mode=mode.lower())
+    canonical = data_dir / f"{base}{suffix}.csv"
+    token = _ablation_token(use_ctrl)
+    branch = data_dir / f"{base}__{token}{suffix}.csv"
+    other_token = "noctrl" if token == "ctrl" else "ctrl"
+    other_branch = data_dir / f"{base}__{other_token}{suffix}.csv"
+    return canonical, branch, other_branch
+
+
+def _dedupe_ser_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    nm_key = None
+    for cand in ("pipeline_Nm_per_symbol", "pipeline.Nm_per_symbol"):
+        if cand in df.columns:
+            nm_key = cand
+            break
+    if nm_key is None:
+        return df
+    subset = [nm_key]
+    if 'use_ctrl' in df.columns:
+        subset.append('use_ctrl')
+    return df.drop_duplicates(subset=subset, keep='last').sort_values(subset)
+
+
+def _dedupe_lod_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or 'distance_um' not in df.columns:
+        return df
+    df = df.copy()
+    keys = ['distance_um']
+    if 'use_ctrl' in df.columns:
+        keys.append('use_ctrl')
+    if 'lod_nm' in df.columns:
+        df['__is_valid__'] = pd.to_numeric(df['lod_nm'], errors='coerce').gt(0) & np.isfinite(pd.to_numeric(df['lod_nm'], errors='coerce'))
+        ordered = df.sort_index()
+        latest = ordered.groupby(keys, as_index=False, group_keys=False).tail(1)
+        valid = ordered[ordered['__is_valid__']].groupby(keys, as_index=False, group_keys=False).tail(1)
+        result = pd.concat([latest, valid]).drop_duplicates(subset=keys, keep='last').drop(columns=['__is_valid__'])
+    else:
+        result = df.drop_duplicates(subset=keys, keep='last')
+    return result.sort_values(keys)
+
+
+def _dedupe_isi_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keys: List[str] = []
+    if 'distance_um' in df.columns:
+        keys.append('distance_um')
+    if 'pipeline.guard_factor' in df.columns:
+        keys.append('pipeline.guard_factor')
+    elif 'guard_factor' in df.columns:
+        keys.append('guard_factor')
+    if 'use_ctrl' in df.columns:
+        keys.append('use_ctrl')
+    if not keys:
+        return df
+    return df.drop_duplicates(subset=keys, keep='last').sort_values(keys)
+
+
+def _row_use_ctrl(row: Dict[str, Any], default: Optional[bool] = None) -> Optional[bool]:
+    if 'use_ctrl' in row:
+        val = row['use_ctrl']
+        if pd.isna(val):
+            return default
+        if isinstance(val, bool):
+            return val
+        txt = str(val).strip().lower()
+        if txt in {"true", "1", "t", "yes"}:
+            return True
+        if txt in {"false", "0", "f", "no"}:
+            return False
+        try:
+            return bool(int(float(txt)))
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _lod_row_is_valid(row: Dict[str, Any]) -> bool:
+    value = row.get('lod_nm')
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(val) and val > 0.0
+
+
+def _extract_numeric(row: Dict[str, Any], *candidates: str) -> Optional[float]:
+    for key in candidates:
+        if key in row:
+            val = row[key]
+            if pd.isna(val):
+                continue
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+class _StageBranchAccumulator:
+    """Streaming accumulator for per-ablation branch CSV updates."""
+
+    def __init__(self,
+                 stage: str,
+                 default_use_ctrl: Optional[bool] = None,
+                 filter_use_ctrl: Optional[bool] = None) -> None:
+        self.stage = stage
+        self.default_use_ctrl = default_use_ctrl
+        self.filter_use_ctrl = filter_use_ctrl
+        self._records: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._seq = 0
+
+    def add_dataframe(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        for row in df.to_dict(orient="records"):
+            row_dict = {str(k): v for k, v in row.items()}
+            self.add_row(row_dict)
+
+    def add_row(self, row: Dict[str, Any]) -> None:
+        local = dict(row)
+        use_ctrl = _row_use_ctrl(local, self.default_use_ctrl)
+        if self.filter_use_ctrl is not None and use_ctrl is not None and use_ctrl != self.filter_use_ctrl:
+            return
+        if use_ctrl is None and self.default_use_ctrl is not None:
+            use_ctrl = self.default_use_ctrl
+        if use_ctrl is not None:
+            local['use_ctrl'] = bool(use_ctrl)
+        key = self._make_key(local, use_ctrl)
+        if key is None:
+            self._seq += 1
+            return
+        status = self._status(local)
+        existing = self._records.get(key)
+        if existing is None or self._should_replace(existing['__status__'], status):
+            local['__status__'] = status
+            self._records[key] = local
+        self._seq += 1
+
+    def finalize(self, dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+        if not self._records:
+            return pd.DataFrame()
+        rows = []
+        for record in self._records.values():
+            rec = dict(record)
+            rec.pop('__status__', None)
+            rows.append(rec)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        return dedupe_fn(df)
+
+    def _make_key(self, row: Dict[str, Any], use_ctrl: Optional[bool]) -> Optional[Tuple[Any, ...]]:
+        if self.stage == "ser":
+            nm_val = _extract_numeric(row, "pipeline_Nm_per_symbol", "pipeline.Nm_per_symbol")
+            if nm_val is None:
+                return None
+            return (canonical_value_key(nm_val), use_ctrl)
+        if self.stage == "lod":
+            dist_val = _extract_numeric(row, "distance_um")
+            if dist_val is None:
+                return None
+            return (int(round(dist_val)), use_ctrl)
+        if self.stage == "isi":
+            gf_val = _extract_numeric(row, "pipeline.guard_factor", "guard_factor")
+            if gf_val is None:
+                return None
+            dist_val = _extract_numeric(row, "distance_um")
+            dist_key = canonical_value_key(dist_val) if dist_val is not None else None
+            return (dist_key, canonical_value_key(gf_val), use_ctrl)
+        return None
+
+    def _status(self, row: Dict[str, Any]) -> Tuple[int, int]:
+        if self.stage == "lod":
+            priority = 1 if _lod_row_is_valid(row) else 0
+        else:
+            priority = 0
+        return (priority, self._seq)
+
+    @staticmethod
+    def _should_replace(existing: Tuple[int, int], new: Tuple[int, int]) -> bool:
+        if new[0] > existing[0]:
+            return True
+        if new[0] == existing[0] and new[1] >= existing[1]:
+            return True
+        return False
+
+
+def _load_stage_csv(stage: str,
+                    csv_path: Path,
+                    dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame],
+                    use_ctrl: Optional[bool] = None,
+                    filter_use_ctrl: Optional[bool] = None) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame()
+    acc = _StageBranchAccumulator(stage, default_use_ctrl=use_ctrl, filter_use_ctrl=filter_use_ctrl)
+    try:
+        for chunk in pd.read_csv(csv_path, chunksize=50_000):
+            acc.add_dataframe(chunk)
+    except Exception:
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            return pd.DataFrame()
+        acc.add_dataframe(df)
+    return acc.finalize(dedupe_fn)
+
+
+def _update_branch_csv(stage: str,
+                       branch_csv: Path,
+                       new_frames: Iterable[pd.DataFrame],
+                       use_ctrl: bool,
+                       dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame],
+                       existing_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    acc = _StageBranchAccumulator(stage, default_use_ctrl=use_ctrl)
+    if existing_df is not None and not existing_df.empty:
+        acc.add_dataframe(existing_df)
+    elif branch_csv.exists():
+        existing_df = _load_stage_csv(stage, branch_csv, dedupe_fn, use_ctrl=use_ctrl)
+        if not existing_df.empty:
+            acc.add_dataframe(existing_df)
+    for frame in new_frames:
+        if frame is not None and not frame.empty:
+            acc.add_dataframe(frame)
+    combined = acc.finalize(dedupe_fn)
+    if not combined.empty:
+        _atomic_write_csv(branch_csv, combined)
+    return combined
+
+
+def _discover_stage_suffixes(stage: str, mode: str, data_dir: Path) -> Set[str]:
+    template = _STAGE_CSV_BASENAMES.get(stage)
+    if template is None:
+        return {""}
+    stem = template.format(mode=mode.lower())
+    suffixes: Set[str] = set()
+    for path in data_dir.glob(f"{stem}*.csv"):
+        if not path.is_file():
+            continue
+        stem_full = path.stem
+        base_stem = stem_full.split("__", 1)[0]
+        if not base_stem.startswith(stem):
+            continue
+        suffix = base_stem[len(stem):]
+        suffixes.add(suffix)
+    return suffixes or {""}
+
+
+def merge_ablation_csvs_for_modes(modes: Sequence[str],
+                                  stages: Optional[Sequence[str]] = None,
+                                  data_dir: Optional[Path] = None) -> None:
+    target_dir = data_dir or (project_root / "results" / "data")
+    if not target_dir.exists():
+        print(f"⚠️  Results data directory missing: {target_dir}")
+        return
+    dedupe_map: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
+        "ser": _dedupe_ser_dataframe,
+        "lod": _dedupe_lod_dataframe,
+        "isi": _dedupe_isi_dataframe,
+    }
+    selected_stages = list(stages) if stages else list(dedupe_map.keys())
+    for stage in selected_stages:
+        if stage not in dedupe_map:
+            print(f"⚠️  Unknown stage '{stage}' requested; skipping.")
+            continue
+        dedupe_fn = dedupe_map[stage]
+        for mode in modes:
+            if not mode:
+                continue
+            suffixes = _discover_stage_suffixes(stage, mode, target_dir)
+            for suffix in sorted(suffixes):
+                canonical, branch_ctrl, branch_other = _stage_csv_paths(stage, target_dir, mode, suffix, True)
+                _, branch_noctrl, _ = _stage_csv_paths(stage, target_dir, mode, suffix, False)
+                _ensure_ablation_branch(stage, canonical, branch_ctrl, True, True, dedupe_fn)
+                _ensure_ablation_branch(stage, canonical, branch_noctrl, False, True, dedupe_fn)
+                _merge_branch_csv(canonical, [branch_ctrl, branch_noctrl], dedupe_fn)
+                merged = _load_stage_csv(stage, canonical, dedupe_fn) if canonical.exists() else pd.DataFrame()
+                suffix_label = suffix if suffix else ""
+                if not merged.empty:
+                    print(f"   ↪︎ Merged {stage.upper()} ({mode}{suffix_label}) — {len(merged)} rows")
+                else:
+                    print(f"   ↪︎ No rows to merge for {stage.upper()} ({mode}{suffix_label})")
+
+
+def _ensure_ablation_branch(stage: str,
+                            canonical_csv: Path,
+                            branch_csv: Path,
+                            use_ctrl: bool,
+                            resume: bool,
+                            dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+    """
+    Guarantee the per-ablation branch file exists when resuming, seeding it from the
+    canonical CSV if necessary. Returns the current branch dataframe (deduped).
+    """
+    if branch_csv.exists():
+        branch_df = _load_stage_csv(stage, branch_csv, dedupe_fn, use_ctrl=use_ctrl)
+        if not branch_df.empty:
+            return branch_df
+    if resume and canonical_csv.exists():
+        branch_df = _load_stage_csv(stage, canonical_csv, dedupe_fn,
+                                    use_ctrl=use_ctrl, filter_use_ctrl=use_ctrl)
+        if not branch_df.empty:
+            _atomic_write_csv(branch_csv, branch_df)
+            return branch_df
+    return pd.DataFrame()
+
+
+def _merge_branch_csv(canonical_csv: Path,
+                      branch_paths: List[Path],
+                      dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> None:
+    frames: List[pd.DataFrame] = []
+    for path in branch_paths + [canonical_csv]:
+        if path.exists():
+            try:
+                frames.append(pd.read_csv(path))
+            except Exception as exc:
+                print(f"⚠️  Warning: could not read {path.name} during merge ({exc})")
+    if not frames:
+        return
+    combined = pd.concat(frames, ignore_index=True)
+    combined = dedupe_fn(combined)
+    _atomic_write_csv(canonical_csv, combined)
+
+
+def _atomic_write_json(json_path: Path, payload: Dict[str, Any]) -> None:
+    tmp = json_path.with_suffix(json_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    for attempt in range(1, 4):
+        try:
+            os.replace(tmp, json_path)
+            break
+        except PermissionError:
+            if attempt == 3:
+                try:
+                    tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                raise
+            try:
+                if json_path.exists():
+                    os.chmod(json_path, stat.S_IWRITE | stat.S_IREAD)
+            except Exception:
+                pass
+            time.sleep(0.1 * attempt)
+
+
+def _noise_fingerprint(mode: str,
+                       suffix: str,
+                       nm_values: Sequence[Union[int, float]],
+                       lod_distance_grid: Sequence[Union[int, float]],
+                       noise_seeds: Sequence[int],
+                       noise_seq_len: int,
+                       cfg: Dict[str, Any]) -> str:
+    pipeline_cfg = cfg.get('pipeline', {})
+    payload = {
+        "version": "v1",
+        "mode": mode,
+        "suffix": suffix,
+        "modulation": pipeline_cfg.get('modulation', mode),
+        "detector_mode": pipeline_cfg.get('detector_mode', 'zscore'),
+        "enable_isi": bool(pipeline_cfg.get('enable_isi', True)),
+        "nm_values": [float(v) for v in nm_values],
+        "distance_grid": [float(v) for v in lod_distance_grid],
+        "noise_seq_len": int(noise_seq_len),
+        "noise_seed_count": len(noise_seeds),
+        "noise_seed_hash": hashlib.sha256(
+            ",".join(str(int(s)) for s in noise_seeds).encode('utf-8')
+        ).hexdigest(),
+        "dt_s": float(cfg.get("sim", {}).get("dt_s", 0.01)),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _load_noise_meta(meta_path: Path) -> Optional[Dict[str, Any]]:
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def _extract_csv_metadata(df: pd.DataFrame) -> Dict[str, Any]:
@@ -1904,12 +2367,40 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default=None)
     parser.add_argument("--num-seeds", type=int, default=20)
     parser.add_argument("--sequence-length", type=int, default=1000)
+    parser.add_argument(
+        "--run-stages",
+        type=str,
+        default="all",
+        help="Compatibility shim for legacy orchestrators; stage gating is handled upstream.",
+    )
+    parser.add_argument(
+        "--merge-ablation-csvs",
+        action="store_true",
+        help="Merge per-ablation CSV branches into canonical outputs and exit.")
+    parser.add_argument(
+        "--merge-stages",
+        nargs="+",
+        choices=list(_STAGE_CSV_BASENAMES.keys()),
+        default=None,
+        help="Limit --merge-ablation-csvs to specific stages (ser,lod,isi).")
+    parser.add_argument(
+        "--merge-data-dir",
+        type=str,
+        default=None,
+        help="Override the data directory for --merge-ablation-csvs (expects results/data path).")
+    parser.add_argument(
+        "--ablation-parallel",
+        action="store_true",
+        help="Hint from orchestrator: defer canonical CSV merges while both ablations run in parallel.",
+    )
     parser.add_argument("--skip-noise-sweep", action="store_true",
                         help="Skip zero-signal noise-only sweeps (use analytic noise instead).")
     parser.add_argument("--noise-only-seeds", type=int, default=8,
                         help="Number of seeds for noise-only sweeps (default: 8).")
     parser.add_argument("--noise-only-seq-len", type=int, default=200,
                         help="Sequence length for each noise-only run (default: 200).")
+    parser.add_argument("--force-noise-resample", action="store_true",
+                        help="Force rerunning zero-signal noise sweeps even if resume cache matches.")
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--beast-mode", action="store_true")
@@ -2865,7 +3356,6 @@ def run_zero_signal_noise_analysis(
     hierarchy_supported: bool,
     mode_key: Optional[Any],
 ) -> None:
-    """Execute zero-signal noise sweeps as a standalone stage (optional)."""
     if getattr(args, "skip_noise_sweep", False):
         _warn_synthetic_noise("zero-signal noise sweep was skipped (--skip-noise-sweep).")
         return
@@ -2876,7 +3366,36 @@ def run_zero_signal_noise_analysis(
         _warn_synthetic_noise("zero-signal noise sweep could not run (no seeds available).")
         return
 
-    noise_seeds = list(seeds[:noise_seed_count])
+    noise_seeds = [int(s) for s in seeds[:noise_seed_count]]
+    noise_seq_len = int(max(args.noise_only_seq_len, 8))
+    cfg.setdefault('_noise_freeze_map', {})
+
+    noise_csv = data_dir / f"noise_only_{mode.lower()}{suffix}.csv"
+    noise_meta_path = data_dir / f"noise_only_{mode.lower()}{suffix}.meta.json"
+    fingerprint = _noise_fingerprint(
+        mode=mode,
+        suffix=suffix,
+        nm_values=nm_values,
+        lod_distance_grid=lod_distance_grid,
+        noise_seeds=noise_seeds,
+        noise_seq_len=noise_seq_len,
+        cfg=cfg,
+    )
+
+    if (getattr(args, "resume", False)
+            and not getattr(args, "recalibrate", False)
+            and not getattr(args, "force_noise_resample", False)):
+        cached_meta = _load_noise_meta(noise_meta_path)
+        if cached_meta and cached_meta.get("fingerprint") == fingerprint:
+            saved_map = cached_meta.get("freeze_map")
+            if isinstance(saved_map, dict) and saved_map:
+                cfg['_noise_freeze_map'].update(deepcopy(saved_map))
+                saved_dist_map = cached_meta.get("freeze_distance_map")
+                if isinstance(saved_dist_map, dict) and saved_dist_map:
+                    cfg['_noise_freeze_distance_map'] = deepcopy(saved_dist_map)
+                print(f"↩️  Resume: zero-signal noise sweep already complete ({mode}).")
+                return
+
     print("? Measuring zero-signal noise floor...")
 
     cfg_noise_ready = deepcopy(cfg)
@@ -2898,7 +3417,6 @@ def run_zero_signal_noise_analysis(
     except Exception as exc:
         print(f"??  Pre-noise calibration skipped: {exc}")
 
-    cfg.setdefault('_noise_freeze_map', {})
     noise_rows: List[Dict[str, Any]] = []
 
     noise_map_nm, rows_nm = _build_noise_freeze_map(
@@ -2906,7 +3424,7 @@ def run_zero_signal_noise_analysis(
         "pipeline.Nm_per_symbol",
         nm_values,
         noise_seeds,
-        noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+        noise_seq_len=noise_seq_len,
         pm=pm if hierarchy_supported else None,
         progress_key=mode_key if hierarchy_supported else None,
         description="Noise-only (Nm)"
@@ -2922,7 +3440,7 @@ def run_zero_signal_noise_analysis(
         "pipeline.distance_um",
         lod_distance_grid,
         noise_seeds,
-        noise_seq_len=int(max(args.noise_only_seq_len, 8)),
+        noise_seq_len=noise_seq_len,
         pm=pm if hierarchy_supported else None,
         progress_key=mode_key if hierarchy_supported else None,
         description="Noise-only (distance)"
@@ -2934,23 +3452,36 @@ def run_zero_signal_noise_analysis(
     else:
         _warn_synthetic_noise("noise-only sweep for distance failed to produce measurements.")
 
-    if noise_rows:
-        noise_csv = data_dir / f"noise_only_{mode.lower()}{suffix}.csv"
-        noise_df = pd.DataFrame(noise_rows)
-        if noise_csv.exists():
-            try:
-                existing_noise = pd.read_csv(noise_csv)
-                combined_noise = pd.concat([existing_noise, noise_df], ignore_index=True)
-            except Exception as e:
-                print(f"??  Could not read existing noise CSV ({e}); overwriting.")
-                combined_noise = noise_df
-        else:
+    if not noise_rows:
+        return
+
+    noise_df = pd.DataFrame(noise_rows)
+    if noise_csv.exists():
+        try:
+            existing_noise = pd.read_csv(noise_csv)
+            combined_noise = pd.concat([existing_noise, noise_df], ignore_index=True)
+        except Exception as exc:
+            print(f"??  Could not read existing noise CSV ({exc}); overwriting.")
             combined_noise = noise_df
-        noise_subset_cols = [col for col in ['mode', 'stage', 'sweep_param', 'value_key'] if col in combined_noise.columns]
-        if noise_subset_cols:
-            combined_noise = combined_noise.drop_duplicates(subset=noise_subset_cols, keep='last')
-        _atomic_write_csv(noise_csv, combined_noise)
-        print(f"? Noise-only sweep results saved to {noise_csv}")
+    else:
+        combined_noise = noise_df
+    noise_subset_cols = [col for col in ['mode', 'stage', 'sweep_param', 'value_key'] if col in combined_noise.columns]
+    if noise_subset_cols:
+        combined_noise = combined_noise.drop_duplicates(subset=noise_subset_cols, keep='last')
+    _atomic_write_csv(noise_csv, combined_noise)
+    print(f"? Noise-only sweep results saved to {noise_csv}")
+
+    meta_payload = {
+        "version": "v1",
+        "fingerprint": fingerprint,
+        "noise_seed_count": len(noise_seeds),
+        "noise_seq_len": noise_seq_len,
+        "noise_seeds": noise_seeds,
+        "freeze_map": deepcopy(cfg.get('_noise_freeze_map', {})),
+        "freeze_distance_map": deepcopy(cfg.get('_noise_freeze_distance_map', {})),
+        "timestamp": time.time(),
+    }
+    _atomic_write_json(noise_meta_path, meta_payload)
 
 def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
                          param_value: Union[float, int], seed: int,
@@ -5956,8 +6487,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     else:
         ser_bar = None
 
-    # CSV file paths
-    ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}{suffix}.csv"
+    use_ctrl_flag = bool(cfg['pipeline'].get('use_control_channel', True))
+    ser_csv, ser_csv_branch, ser_csv_other = _stage_csv_paths("ser", data_dir, mode, suffix, use_ctrl_flag)
+    ser_results_path = ser_csv if not args.ablation_parallel else ser_csv_branch
+    existing_ser_branch = _ensure_ablation_branch(
+        "ser", ser_csv, ser_csv_branch, use_ctrl_flag, bool(args.resume), _dedupe_ser_dataframe
+    )
 
     # ---------- 1) SER vs Nm ----------
     print("\n1. Running SER vs. Nm sweep...")
@@ -5977,7 +6512,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         'pipeline.Nm_per_symbol', nm_values,
         f"SER vs Nm ({mode})",
         progress_mode=args.progress,
-        persist_csv=ser_csv,
+        persist_csv=ser_csv_branch,
         resume=args.resume,
         debug_calibration=args.debug_calibration,
         pm=pm,                                # always share one PM
@@ -5989,26 +6524,22 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     if ser_bar: ser_bar.close()
 
     # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
-    if ser_csv.exists():
-        existing = pd.read_csv(ser_csv)
-        nm_key: Optional[str] = None
-        if 'pipeline_Nm_per_symbol' in existing.columns:
-            nm_key = 'pipeline_Nm_per_symbol'
-        elif 'pipeline.Nm_per_symbol' in existing.columns:
-            nm_key = 'pipeline.Nm_per_symbol'
-        if nm_key is not None:
-            # Combine prior rows with new rows from this run (if any)
-            combined = existing if df_ser_nm.empty else pd.concat([existing, df_ser_nm], ignore_index=True)
-            # Keep both CTRL states; last write wins per pair
-            if 'use_ctrl' in combined.columns:
-                combined = combined.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values(by=[nm_key, 'use_ctrl'])
-            else:
-                combined = combined.drop_duplicates(subset=[nm_key], keep='last').sort_values(by=[nm_key])
-            _atomic_write_csv(ser_csv, combined)
-    elif not df_ser_nm.empty:
-        _atomic_write_csv(ser_csv, df_ser_nm)
+    ser_branch_frames = [df_ser_nm] if not df_ser_nm.empty else []
+    branch_combined = _update_branch_csv(
+        "ser",
+        ser_csv_branch,
+        ser_branch_frames,
+        use_ctrl_flag,
+        _dedupe_ser_dataframe,
+        existing_ser_branch
+    )
+    if not args.ablation_parallel:
+        _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
 
-    print(f"✅ SER vs Nm results saved to {ser_csv}")
+    if args.ablation_parallel:
+        print(f"✅ SER vs Nm results saved to {ser_results_path} (branch; canonical merge deferred)")
+    else:
+        print(f"✅ SER vs Nm results saved to {ser_results_path}")
     
     # Manual parent update for non-GUI backends  
     if not hierarchy_supported:
@@ -6021,7 +6552,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     if args.ser_refine:
         try:
             # Always read the latest CSV on disk so resume/de-dupe is consistent
-            df_ser_all = pd.read_csv(ser_csv) if ser_csv.exists() else df_ser_nm
+            df_ser_all = pd.read_csv(ser_results_path) if ser_results_path.exists() else df_ser_nm
 
             # Propose midpoints between the first bracket that crosses the target
             refine_candidates = _auto_refine_nm_points_from_df(
@@ -6033,7 +6564,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             # Filter out any Nm that are already present for THIS CTRL state
             if refine_candidates:
                 desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-                done = load_completed_values(ser_csv, 'pipeline_Nm_per_symbol', desired_ctrl)
+                done = load_completed_values(ser_results_path, 'pipeline_Nm_per_symbol', desired_ctrl)
                 refine_candidates = [n for n in refine_candidates if canonical_value_key(n) not in done]
 
             if refine_candidates:
@@ -6047,7 +6578,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                     [float(n) for n in refine_candidates],
                     f"SER refine near {args.ser_target:.2%} ({mode})",
                     progress_mode=args.progress,
-                    persist_csv=ser_csv,
+                    persist_csv=ser_csv_branch,
                     resume=args.resume,
                     debug_calibration=args.debug_calibration,
                     pm=pm,
@@ -6056,17 +6587,19 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                     recalibrate=args.recalibrate
                 )
 
-                # Re‑de‑dupe the CSV so plots read a clean file
-                if ser_csv.exists():
-                    existing = pd.read_csv(ser_csv)
-                    nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in existing.columns else 'pipeline.Nm_per_symbol'
-                    combined = existing if df_refined.empty else pd.concat([existing, df_refined], ignore_index=True)
-                    if 'use_ctrl' in combined.columns:
-                        combined = combined.drop_duplicates(subset=[nm_key, 'use_ctrl'], keep='last').sort_values([nm_key, 'use_ctrl'])
-                    else:
-                        combined = combined.drop_duplicates(subset=[nm_key], keep='last').sort_values([nm_key])
-                    _atomic_write_csv(ser_csv, combined)
+                # Re-de-dupe the CSV so plots read a clean file
+                _update_branch_csv(
+                    "ser",
+                    ser_csv_branch,
+                    [df_refined],
+                    use_ctrl_flag,
+                    _dedupe_ser_dataframe
+                )
+                if not args.ablation_parallel:
+                    _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
                     print(f"✅ SER auto-refine appended; CSV updated: {ser_csv}")
+                else:
+                    print(f"✅ SER auto-refine appended; branch updated: {ser_csv_branch.name}")
             else:
                 print(f"ℹ️  SER auto-refine: no bracket found or all refine Nm already present.")
         except Exception as e:
@@ -6160,11 +6693,15 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # ---------- 2) LoD vs Distance ----------
     print("\n2. Building LoD vs distance curve…")
     d_run = [int(x) for x in lod_distance_grid]
-    lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
+    lod_csv, lod_csv_branch, lod_csv_other = _stage_csv_paths("lod", data_dir, mode, suffix, use_ctrl)
+    lod_results_path = lod_csv if not args.ablation_parallel else lod_csv_branch
     pm.set_status(mode=mode, sweep="LoD vs distance")
     # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
     pool = global_pool.get_pool(max_workers=maxw)
     use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+    existing_lod_branch = _ensure_ablation_branch(
+        "lod", lod_csv, lod_csv_branch, use_ctrl, bool(args.resume), _dedupe_lod_dataframe
+    )
 
     estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5
 
@@ -6172,54 +6709,55 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     done_distances: set[int] = set()
     failed_distances: set[int] = set()
 
-    if args.resume and lod_csv.exists():
-        df_prev = None
-        try:
-            df_prev = pd.read_csv(lod_csv)
-        except Exception as e:
-            print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
-            df_prev = None
+    if args.resume:
+        df_prev = existing_lod_branch.copy()
+        if df_prev.empty and lod_csv_branch.exists():
+            try:
+                df_prev = pd.read_csv(lod_csv_branch)
+            except Exception as e:
+                print(f"⚠️  Could not read per-ablation LoD CSV ({e}); will fall back to canonical if available.")
+                df_prev = pd.DataFrame()
+        if df_prev.empty and lod_csv.exists():
+            try:
+                df_prev = pd.read_csv(lod_csv)
+                if 'use_ctrl' in df_prev.columns:
+                    df_prev = df_prev[df_prev['use_ctrl'] == use_ctrl]
+                df_prev = _dedupe_lod_dataframe(df_prev)
+            except Exception as e:
+                print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
+                df_prev = pd.DataFrame()
 
-        if df_prev is not None:
-            # Respect CTRL state if present
-            if 'use_ctrl' in df_prev.columns:
-                df_prev = df_prev[df_prev['use_ctrl'] == bool(cfg['pipeline'].get('use_control_channel', True))]
+        if not df_prev.empty and {'lod_nm', 'distance_um'}.issubset(df_prev.columns):
+            for _, row in df_prev.iterrows():
+                dist = int(row['distance_um'])
+                lod_nm = row.get('lod_nm', np.nan)
 
-            if 'lod_nm' in df_prev.columns and 'distance_um' in df_prev.columns:
-                for _, row in df_prev.iterrows():
-                    dist = int(row['distance_um'])
-                    lod_nm = row.get('lod_nm', np.nan)
-                    
-                    # Check if this distance succeeded or failed
-                    if pd.notna(lod_nm) and float(lod_nm) > 0:
-                        # Also check SER if available
-                        ser_ok = True
-                        if 'ser_at_lod' in df_prev.columns:
-                            ser = row.get('ser_at_lod', np.nan)
-                            if pd.notna(ser):
-                                ser_ok = float(ser) <= 0.01  # or your target
-                        
-                        if ser_ok:
-                            done_distances.add(dist)
-                        else:
-                            failed_distances.add(dist)
+                # Check if this distance succeeded or failed
+                if pd.notna(lod_nm) and float(lod_nm) > 0:
+                    ser_ok = True
+                    if 'ser_at_lod' in df_prev.columns:
+                        ser = row.get('ser_at_lod', np.nan)
+                        if pd.notna(ser):
+                            ser_ok = float(ser) <= 0.01
+                    if ser_ok:
+                        done_distances.add(dist)
                     else:
-                        # NaN or <= 0 means failed
                         failed_distances.add(dist)
+                else:
+                    failed_distances.add(dist)
 
-                if done_distances:
-                    print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
+            if done_distances:
+                print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
                       f"{sorted(done_distances)} um")
-                if failed_distances:
-                    print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
+            if failed_distances:
+                print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
                       f"{sorted(failed_distances)} um")
-                if failed_distances and args.lod_skip_retry:
-                    print(f"🔄  --lod-skip-retry: accepting failures for {sorted(failed_distances)} um.")
-                    done_distances.update(failed_distances)
-                    failed_distances.clear()
-            else:
-                # Old CSV without lod_nm → just don't prefill
-                print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
+            if failed_distances and args.lod_skip_retry:
+                print(f"🔄  --lod-skip-retry: accepting failures for {sorted(failed_distances)} um.")
+                done_distances.update(failed_distances)
+                failed_distances.clear()
+        elif args.resume and not df_prev.empty:
+            print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
 
     # Worklist excludes done distances
     d_run_work = [int(d) for d in d_run if int(d) not in done_distances]
@@ -6441,7 +6979,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
         # Append atomically per distance (only if we have a real result)
         if res and len(res.keys()) > 0:
-            append_row_atomic(lod_csv, res, list(res.keys()))
+            append_row_atomic(lod_csv_branch, res, list(res.keys()))
         
         lod_results.append(res)
         
@@ -6537,46 +7075,37 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
     df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
 
-    if lod_csv.exists():
-        prior = pd.read_csv(lod_csv)
-        subset = ['distance_um'] + (['use_ctrl'] if 'use_ctrl' in set(prior.columns) | set(df_lod_new.columns) else [])
-        combined = prior if df_lod_new.empty else pd.concat([prior, df_lod_new], ignore_index=True)
-        
-        # De-dupe LoD CSV preferring valid rows over NaNs (resume-safe)
-        if 'lod_nm' in combined.columns:
-            combined['__is_valid__'] = pd.to_numeric(combined['lod_nm'], errors='coerce').gt(0) & np.isfinite(pd.to_numeric(combined['lod_nm'], errors='coerce'))
-            keys = ['distance_um'] + (['use_ctrl'] if 'use_ctrl' in combined.columns else [])
-            # within each (distance, ctrl) group: prefer last valid; else last row
-            sorted_combined = combined.sort_index()  # resume appends at higher index
-            latest_per_group = sorted_combined.groupby(keys, as_index=False, group_keys=False).tail(1)
-            valid_latest = (
-                sorted_combined[sorted_combined['__is_valid__']]
-                .groupby(keys, as_index=False, group_keys=False)
-                .tail(1)
-            )
-            combined = (
-                pd.concat([latest_per_group, valid_latest])
-                .drop_duplicates(subset=keys, keep='last')
-                .drop(columns=['__is_valid__'])
-                .sort_values(keys)
-            )
-        else:
-            combined = combined.drop_duplicates(subset=subset, keep='last').sort_values(subset)
-        
-        _atomic_write_csv(lod_csv, combined)
-        df_lod = combined
-    elif not df_lod_new.empty:
-        _atomic_write_csv(lod_csv, df_lod_new)
-        df_lod = df_lod_new
-    else:
-        print("⚠️  No LoD points were produced in this run.")
-        df_lod = pd.DataFrame()  # Empty DataFrame with no columns
+    lod_branch_combined = _update_branch_csv(
+        "lod",
+        lod_csv_branch,
+        [df_lod_new],
+        use_ctrl,
+        _dedupe_lod_dataframe,
+        existing_lod_branch
+    )
+    if not args.ablation_parallel:
+        _merge_branch_csv(lod_csv, [lod_csv_branch, lod_csv_other], _dedupe_lod_dataframe)
 
+    try:
+        df_lod_merged = pd.read_csv(lod_results_path) if lod_results_path.exists() else pd.DataFrame()
+    except Exception:
+        df_lod_merged = pd.DataFrame()
+
+    df_lod = lod_branch_combined if not lod_branch_combined.empty else pd.DataFrame()
+
+    merged_points = len(df_lod_merged) if not df_lod_merged.empty else 0
     if not df_lod.empty:
-        _atomic_write_csv(lod_csv, df_lod)
-        print(f"\n✅ LoD vs distance saved to {lod_csv} ({len(df_lod)} points)")
+        if merged_points:
+            if args.ablation_parallel:
+                merged_note = f"; branch total {merged_points}"
+            else:
+                merged_note = f"; merged total {merged_points}"
+        else:
+            merged_note = ""
+        target_label = "branch" if args.ablation_parallel else "canonical"
+        print(f"\n✅ LoD vs distance saved to {lod_results_path} ({len(df_lod)} points{merged_note}; {target_label} {lod_results_path.name})")
     else:
-        print(f"\n⚠️  No valid LoD data to save to {lod_csv}")
+        print(f"\n⚠️  No valid LoD data to save for use_ctrl={use_ctrl}")
     
     # Manual parent update for non-GUI backends
     if not hierarchy_supported:
@@ -6621,9 +7150,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # --- pick an anchor for ISI sweep (after LoD) ---
         d_ref = None
         nm_ref = None
-        lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
-        if lod_csv.exists():
-            df_lod_all = pd.read_csv(lod_csv)
+        lod_canonical_path = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
+        lod_anchor_path = lod_results_path if lod_results_path.exists() else lod_canonical_path
+        if not lod_anchor_path.exists() and lod_canonical_path.exists():
+            lod_anchor_path = lod_canonical_path
+        if lod_anchor_path.exists():
+            df_lod_all = pd.read_csv(lod_anchor_path)
             # choose CTRL-matching rows
             if 'use_ctrl' in df_lod_all.columns:
                 df_lod_all = df_lod_all[df_lod_all['use_ctrl'] == bool(cfg['pipeline'].get('use_control_channel', True))]
@@ -6700,7 +7232,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         else:
             isi_jobs = len(guard_values) * len(seeds)
 
-        isi_csv = data_dir / f"isi_tradeoff_{mode.lower()}{suffix}.csv"
+        ctrl_flag = bool(cfg['pipeline'].get('use_control_channel', True))
+        isi_csv, isi_csv_branch, isi_csv_other = _stage_csv_paths("isi", data_dir, mode, suffix, ctrl_flag)
+        isi_results_path = isi_csv if not args.ablation_parallel else isi_csv_branch
+        existing_isi_branch = _ensure_ablation_branch(
+            "isi", isi_csv, isi_csv_branch, ctrl_flag, bool(args.resume), _dedupe_isi_dataframe
+        )
         pm.set_status(mode=mode, sweep="ISI trade-off")
         isi_key = ("sweep", mode, "ISI_tradeoff")
         isi_bar = None
@@ -6714,7 +7251,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 guard_values,
                 f"ISI trade-off ({mode})",
                 progress_mode=args.progress,
-                persist_csv=isi_csv,
+                persist_csv=isi_csv_branch,
                 resume=args.resume,
                 debug_calibration=args.debug_calibration,
                 pm=pm,
@@ -6726,23 +7263,35 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             df_isi = pd.DataFrame()
         if isi_bar:
             isi_bar.close()
-        # De-duplicate by (guard_factor, use_ctrl)
-        if isi_csv.exists():
-            existing = pd.read_csv(isi_csv)
-            gf_key = 'guard_factor' if 'guard_factor' in existing.columns else 'pipeline.guard_factor'
-            if gf_key in existing.columns:
-                combined = existing if df_isi.empty else pd.concat([existing, df_isi], ignore_index=True)
-                subset_cols: List[str] = []
-                if 'distance_um' in combined.columns:
-                    subset_cols.append('distance_um')
-                subset_cols.append(gf_key)
-                if 'use_ctrl' in combined.columns:
-                    subset_cols.append('use_ctrl')
-                combined = combined.drop_duplicates(subset=subset_cols, keep='last').sort_values(by=subset_cols)
-                _atomic_write_csv(isi_csv, combined)
-        elif not df_isi.empty:
-            _atomic_write_csv(isi_csv, df_isi)
-        print(f"✅ ISI trade-off saved to {isi_csv}")
+        isi_branch_combined = _update_branch_csv(
+            "isi",
+            isi_csv_branch,
+            [df_isi],
+            ctrl_flag,
+            _dedupe_isi_dataframe,
+            existing_isi_branch
+        )
+
+        if not args.ablation_parallel:
+            _merge_branch_csv(isi_csv, [isi_csv_branch, isi_csv_other], _dedupe_isi_dataframe)
+
+        try:
+            df_isi_merged = pd.read_csv(isi_results_path) if isi_results_path.exists() else pd.DataFrame()
+        except Exception:
+            df_isi_merged = pd.DataFrame()
+
+        if not isi_branch_combined.empty:
+            if not df_isi_merged.empty:
+                merged_note = f"; merged total {len(df_isi_merged)}" if not args.ablation_parallel else f"; branch total {len(df_isi_merged)}"
+            else:
+                merged_note = ""
+            target_label = "branch" if args.ablation_parallel else "canonical"
+            print(f"✅ ISI trade-off saved to {isi_results_path} ({len(isi_branch_combined)} points{merged_note}; {target_label} {isi_results_path.name})")
+        elif not df_isi_merged.empty:
+            status_label = "branch" if args.ablation_parallel else "merged"
+            print(f"↩️  ISI trade-off already up-to-date for use_ctrl={ctrl_flag} ({status_label} total {len(df_isi_merged)})")
+        else:
+            print(f"⚠️  No ISI trade-off data to save for use_ctrl={ctrl_flag}")
         
         # Manual parent update for non-GUI backends
         if not hierarchy_supported:
@@ -6822,6 +7371,18 @@ def main() -> None:
     _install_signal_handlers()
     
     args = parse_arguments()
+    
+    if args.merge_ablation_csvs:
+        if args.mode and args.mode != "ALL":
+            merge_modes = [args.mode]
+        elif args.modes:
+            merge_modes = ["MoSK", "CSK", "Hybrid"] if str(args.modes).lower() == "all" else [args.modes]
+        else:
+            merge_modes = ["MoSK", "CSK", "Hybrid"]
+        print("🔗 Merging per-ablation CSV branches...")
+        custom_dir = Path(args.merge_data_dir) if args.merge_data_dir else None
+        merge_ablation_csvs_for_modes(merge_modes, args.merge_stages, custom_dir)
+        return
     
     # Auto-enable sleep inhibition when GUI is requested
     if args.progress == "gui":
