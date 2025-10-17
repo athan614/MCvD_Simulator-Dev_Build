@@ -1588,7 +1588,8 @@ def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
     Atomic CSV write using temp file pattern (like _atomic_write_json).
     Also emits a JSON sidecar with summary metadata for reproducibility.
     """
-    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    unique_tag = f".tmp.{os.getpid()}_{threading.get_ident()}_{int(time.time()*1e9)}"
+    tmp = csv_path.with_suffix(csv_path.suffix + unique_tag)
     df.to_csv(tmp, index=False)
 
     def _replace() -> None:
@@ -1841,6 +1842,7 @@ def _update_branch_csv(stage: str,
                        use_ctrl: bool,
                        dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame],
                        existing_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    flush_staged_rows(branch_csv)
     acc = _StageBranchAccumulator(stage, default_use_ctrl=use_ctrl)
     if existing_df is not None and not existing_df.empty:
         acc.add_dataframe(existing_df)
@@ -1937,6 +1939,8 @@ def _ensure_ablation_branch(stage: str,
 def _merge_branch_csv(canonical_csv: Path,
                       branch_paths: List[Path],
                       dedupe_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> None:
+    for path in branch_paths + [canonical_csv]:
+        flush_staged_rows(path)
     frames: List[pd.DataFrame] = []
     for path in branch_paths + [canonical_csv]:
         if path.exists():
@@ -2116,16 +2120,52 @@ def _with_file_lock(path: Path, fn: Callable[[], None], timeout_s: float = 60.0)
                     return fn()
             time.sleep(0.1)
 
+def _staging_dir_for(csv_path: Path) -> Path:
+    staging = csv_path.parent / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
+
+def _shard_path(csv_path: Path) -> Path:
+    pid = os.getpid()
+    tid = threading.get_ident()
+    staging = _staging_dir_for(csv_path)
+    return staging / f"{csv_path.stem}__{pid}_{tid}.csv"
+
+def flush_staged_rows(csv_path: Path) -> None:
+    staging = csv_path.parent / ".staging"
+    if not staging.exists():
+        return
+    pattern = f"{csv_path.stem}__*.csv"
+    for shard in staging.glob(pattern):
+        try:
+            shard_df = pd.read_csv(shard)
+        except Exception:
+            shard.unlink(missing_ok=True)
+            continue
+        if shard_df.empty:
+            shard.unlink(missing_ok=True)
+            continue
+
+        def _append_shard() -> None:
+            if csv_path.exists():
+                try:
+                    existing = pd.read_csv(csv_path)
+                    combined = pd.concat([existing, shard_df], ignore_index=True)
+                except Exception:
+                    combined = shard_df
+            else:
+                combined = shard_df
+            _atomic_write_csv(csv_path, combined)
+
+        _with_file_lock(csv_path, _append_shard)
+        shard.unlink(missing_ok=True)
+
 def append_row_atomic(csv_path: Path, row: Dict[str, Any], columns: Optional[List[str]] = None) -> None:
     """
-    Append a row with a lock + atomic rename. Read *and* write occur under the lock
-    to prevent lost updates when multiple processes append concurrently.
-    
-    ENHANCED: Persists CSK configuration triple (M, target_channel, combiner) for plot provenance.
+    Stage rows to per-worker shard files; use ``flush_staged_rows`` to merge them later.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # ✅ Add combiner metadata columns BEFORE creating DataFrame
+
     if row.get('mode', '').startswith('CSK') and row.get('csk_store_combiner_meta', True):
         if 'combiner' not in row:
             row['combiner'] = row.get('csk_selected_combiner', row.get('csk_combiner', 'zscore'))
@@ -2134,34 +2174,20 @@ def append_row_atomic(csv_path: Path, row: Dict[str, Any], columns: Optional[Lis
         if 'sigma_sero' not in row:
             row['sigma_sero'] = row.get('noise_sigma_sero', np.nan)
         if 'rho_cc' not in row:
-            # Note: This should be populated from the config when creating the row
-            # For now, use a fallback or remove if not available
-            row['rho_cc'] = row.get('rho_cc', 0.0)  # Use direct key or default
+            row['rho_cc'] = row.get('rho_cc', 0.0)
         if 'leakage_frac' not in row:
             combiner = row.get('combiner', 'zscore')
             row['leakage_frac'] = row.get('csk_leakage_frac', 0.0) if combiner == 'leakage' else np.nan
-        
-        # NEW: Add CSK configuration triple for plot provenance
         row.setdefault('csk_levels', row.get('M', 4))
         row.setdefault('csk_target_channel', 'DA')
-    
-    # ✅ NOW create DataFrame with complete metadata
+
     new_row = pd.DataFrame([row])
     if columns is not None:
         new_row = new_row.reindex(columns=columns)
 
-    def _read_and_write():
-        if csv_path.exists():
-            try:
-                existing = pd.read_csv(csv_path)
-                combined = pd.concat([existing, new_row], ignore_index=True)
-            except Exception:
-                combined = new_row
-        else:
-            combined = new_row
-        _atomic_write_csv(csv_path, combined)
-
-    _with_file_lock(csv_path, _read_and_write)
+    shard = _shard_path(csv_path)
+    header = not shard.exists()
+    new_row.to_csv(shard, mode='a', header=header, index=False)
 
 def load_completed_values(csv_path: Path, key: str, use_ctrl: Optional[bool] = None) -> set:
     """Return the set of completed sweep values for resume, optionally filtered by CTRL state."""
@@ -2496,6 +2522,10 @@ def parse_arguments() -> argparse.Namespace:
                         help="Cap the number of seeds used for LoD validation (default: use all seeds).")
     parser.add_argument("--max-symbol-duration-s", type=float, default=None,
                         help="Skip LoD search at distances where symbol period exceeds this limit (seconds).")
+    parser.add_argument("--lod-analytic-noise", action="store_true",
+                        help="Force analytic noise during LoD sweeps (ignore cached/frozen noise).")
+    parser.add_argument("--analytic-noise-all", action="store_true",
+                        help="Force analytic noise for both zero-signal and LoD stages (skip zero-signal measurements).")
     parser.add_argument("--analytic-lod-bracket", action="store_true",
                     help="Use Gaussian SER approximation for tighter LoD bracketing (experimental).")
     parser.set_defaults(use_ctrl=True, analytic_lod_bracket=True)
@@ -3495,25 +3525,28 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
         cfg_run = deepcopy(cfg_base)
         cfg_run['disable_progress'] = True
         cfg_run['verbose'] = False
+        pipeline = cfg_run.setdefault('pipeline', {})
+        force_analytic_noise = bool(cfg_run.get('_force_analytic_noise', False))
 
-        # Set sweep parameter (maintaining window/ISI consistency)
+        preexisting_freeze = pipeline.get('_frozen_noise')
+        have_distance_freeze = isinstance(preexisting_freeze, dict) and bool(preexisting_freeze)
+        prefer_distance_freeze = bool(cfg_run.get('_prefer_distance_freeze', False))
+
         _apply_sweep_param(cfg_run, param_name, param_value)
 
-        noise_freeze_map = cfg_run.get('_noise_freeze_map')
         expect_frozen_noise = False
-        if isinstance(noise_freeze_map, dict):
-            expect_frozen_noise = True
-            param_noise_map = noise_freeze_map.get(param_name)
-            if param_noise_map:
-                payload = param_noise_map.get(_value_key(param_value))
-                if payload and isinstance(payload, dict):
-                    cfg_run['pipeline']['_frozen_noise'] = deepcopy(payload)
-                    expect_frozen_noise = True
+        payload: Optional[Dict[str, Any]] = None
+        if not force_analytic_noise:
+            noise_freeze_map = cfg_run.get('_noise_freeze_map')
+            if isinstance(noise_freeze_map, dict):
+                param_noise_map = noise_freeze_map.get(param_name) or {}
+                candidate = param_noise_map.get(_value_key(param_value))
+                if isinstance(candidate, dict) and candidate:
+                    payload = candidate
 
-        if cfg_run['pipeline'].get('_freeze_calibration_active'):
+        if pipeline.get('_freeze_calibration_active'):
             expect_frozen_noise = True
 
-        freeze_payload: Optional[Dict[str, Any]] = None
         if freeze_snapshot:
             thresholds_freeze = freeze_snapshot.get('thresholds', {})
             if thresholds_override:
@@ -3523,10 +3556,26 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             else:
                 thresholds_override = dict(thresholds_freeze)
             freeze_payload = freeze_snapshot.get('noise', {})
-            cfg_run['pipeline']['_freeze_calibration_active'] = True
-            cfg_run['pipeline']['_freeze_baseline_id'] = freeze_snapshot.get('baseline_id', '')
-            if freeze_payload:
-                cfg_run['pipeline']['_frozen_noise'] = freeze_payload
+            pipeline['_freeze_calibration_active'] = True
+            pipeline['_freeze_baseline_id'] = freeze_snapshot.get('baseline_id', '')
+            if not force_analytic_noise and isinstance(freeze_payload, dict) and freeze_payload:
+                pipeline['_frozen_noise'] = freeze_payload
+                expect_frozen_noise = True
+                payload = None
+
+        if force_analytic_noise:
+            payload = None
+            pipeline.pop('_frozen_noise', None)
+            expect_frozen_noise = False
+        elif param_name == 'pipeline.Nm_per_symbol' and prefer_distance_freeze and have_distance_freeze:
+            pass
+        else:
+            if isinstance(payload, dict) and payload:
+                pipeline['_frozen_noise'] = deepcopy(payload)
+                expect_frozen_noise = True
+            else:
+                if not isinstance(pipeline.get('_frozen_noise'), dict):
+                    expect_frozen_noise = False
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
@@ -3601,7 +3650,10 @@ def run_sweep(cfg: Dict[str, Any],
     # Mark resume context for threshold management
     if resume:
         cfg['_resume_active'] = True
-    
+
+    if persist_csv is not None:
+        flush_staged_rows(persist_csv)
+
     pool = global_pool.get_pool()
     # Use provided progress manager or create new one
     local_pm = pm or ProgressManager(progress_mode)
@@ -4228,6 +4280,8 @@ def run_sweep(cfg: Dict[str, Any],
                 local_pm.stop()
             except Exception:
                 pass
+    if persist_csv is not None:
+        flush_staged_rows(persist_csv)
     return pd.DataFrame(aggregated_rows)
 
 # ============= LOD SEARCH =============
@@ -4892,6 +4946,9 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
         noise_payload = noise_distance_map.get(_value_key(float(cfg['pipeline']['distance_um'])))
         if isinstance(noise_payload, dict):
             cfg['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+            cfg['_prefer_distance_freeze'] = True
+        else:
+            cfg.pop('_prefer_distance_freeze', None)
 
     cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
 
@@ -5236,6 +5293,9 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
             if isinstance(noise_payload, dict):
                 cfg_lod['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+                cfg_lod['_prefer_distance_freeze'] = True
+            else:
+                cfg_lod.pop('_prefer_distance_freeze', None)
 
         cfg_lod['pipeline']['Nm_per_symbol'] = lod_nm
 
@@ -6676,25 +6736,33 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
 
     # Standalone zero-signal noise characterization (optional stage)
-    run_zero_signal_noise_analysis(
-        cfg=cfg,
-        mode=mode,
-        args=args,
-        nm_values=nm_values,
-        lod_distance_grid=lod_distance_grid,
-        seeds=seeds,
-        data_dir=data_dir,
-        suffix=suffix,
-        pm=pm,
-        hierarchy_supported=hierarchy_supported,
-        mode_key=mode_key,
-    )
+    force_lod_analytic = args.lod_analytic_noise or args.analytic_noise_all
+
+    if args.analytic_noise_all:
+        print("??  Skipping zero-signal noise sweep: analytic noise forced.")
+    else:
+        run_zero_signal_noise_analysis(
+            cfg=cfg,
+            mode=mode,
+            args=args,
+            nm_values=nm_values,
+            lod_distance_grid=lod_distance_grid,
+            seeds=seeds,
+            data_dir=data_dir,
+            suffix=suffix,
+            pm=pm,
+            hierarchy_supported=hierarchy_supported,
+            mode_key=mode_key,
+        )
 
     # ---------- 2) LoD vs Distance ----------
-    print("\n2. Building LoD vs distance curve…")
+    print('\n2. Building LoD vs distance curve.')
     d_run = [int(x) for x in lod_distance_grid]
     lod_csv, lod_csv_branch, lod_csv_other = _stage_csv_paths("lod", data_dir, mode, suffix, use_ctrl)
     lod_results_path = lod_csv if not args.ablation_parallel else lod_csv_branch
+    if force_lod_analytic:
+        cfg['_force_analytic_noise'] = True
+    flush_staged_rows(lod_csv_branch)
     pm.set_status(mode=mode, sweep="LoD vs distance")
     # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
     pool = global_pool.get_pool(max_workers=maxw)
@@ -7075,6 +7143,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
     df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
 
+    flush_staged_rows(lod_csv_branch)
     lod_branch_combined = _update_branch_csv(
         "lod",
         lod_csv_branch,
@@ -7085,6 +7154,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     )
     if not args.ablation_parallel:
         _merge_branch_csv(lod_csv, [lod_csv_branch, lod_csv_other], _dedupe_lod_dataframe)
+    cfg.pop('_force_analytic_noise', None)
 
     try:
         df_lod_merged = pd.read_csv(lod_results_path) if lod_results_path.exists() else pd.DataFrame()
