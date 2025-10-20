@@ -1170,8 +1170,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
         _set_if_default("lod_seq_len", 600)
         _set_if_default("lod_validate_seq_len", 1000)
         _set_if_default("lod_distance_concurrency", 16)
-        if not getattr(args, "lod_analytic_noise", False):
-            args.lod_analytic_noise = True
+        if not (getattr(args, "lod_analytic_noise", False) or getattr(args, "analytic_noise_all", False)):
             if getattr(args, "max_symbol_duration_s", None) in (None, 180.0):
                 args.max_symbol_duration_s = 0.0
             if getattr(args, "guard_samples_cap", None) is None:

@@ -46,7 +46,7 @@ def _resolve_decision_window(cfg: Dict[str, Any], Ts: float, dt: float) -> float
     """
     detection = cfg.setdefault('detection', {})
     pipeline_cfg = cfg.setdefault('pipeline', {})
-    policy = str(detection.get('decision_window_policy', 'full_ts')).lower()
+    policy = str(detection.get('decision_window_policy', 'fraction_of_ts')).lower()
 
     if policy in ('full_ts', 'full', 'ts'):
         win_s = Ts

@@ -158,6 +158,22 @@ def _should_apply_threshold_key(key: Any) -> bool:
     return key not in DIAGNOSTIC_THRESHOLD_KEYS
 
 
+def _apply_thresholds_into_cfg(cfg: Dict[str, Any], thresholds: Dict[str, Any]) -> None:
+    """
+    Copy calibration thresholds into cfg in a routing-safe way:
+    - route noise.* keys into cfg['noise']
+    - route recognised threshold keys into cfg['pipeline']
+    - ignore diagnostic payloads (handled by _should_apply_threshold_key)
+    """
+    pipe = cfg.setdefault('pipeline', {})
+    noise = cfg.setdefault('noise', {})
+    for key, value in thresholds.items():
+        if isinstance(key, str) and key.startswith('noise.'):
+            noise[key.split('.', 1)[1]] = value
+        elif _should_apply_threshold_key(key):
+            pipe[key] = value
+
+
 def _infer_csk_threshold_orientation(thresholds: Iterable[Any], default_qeff: float) -> bool:
     """
     Infer the monotonic orientation of CSK decision thresholds.
@@ -3579,18 +3595,12 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
 
         # Thresholds: use override if supplied, else cached calibration
         if thresholds_override is not None:
-            for k, v in thresholds_override.items():
-                if isinstance(k, str) and k.startswith('noise.'):
-                    cfg_run.setdefault('noise', {})[k.split('.', 1)[1]] = v
-                elif _should_apply_threshold_key(k):
-                    cfg_run['pipeline'][k] = v
+            _apply_thresholds_into_cfg(cfg_run, thresholds_override)
         elif cfg_run['pipeline']['modulation'] in ['MoSK', 'CSK', 'Hybrid'] and \
              param_name in ['pipeline.Nm_per_symbol', 'pipeline.distance_um', 'pipeline.guard_factor', 'oect.gm_S', 'oect.C_tot_F']:
             cal_seeds = list(range(10))
             thresholds = calibrate_thresholds_cached(cfg_run, cal_seeds, recalibrate)
-            for k, v in thresholds.items():
-                if _should_apply_threshold_key(k):
-                    cfg_run['pipeline'][k] = v
+            _apply_thresholds_into_cfg(cfg_run, thresholds)
             if debug_calibration and cfg_run['pipeline']['modulation'] == 'CSK':
                 target_ch = cfg_run['pipeline'].get('csk_target_channel', 'DA').lower()
                 key = f'csk_thresholds_{target_ch}'
@@ -4326,8 +4336,7 @@ def _analytic_lod_bracket(cfg_base: Dict[str, Any], seeds: List[int], target_ser
 
                 # thresholds at this Nm (few seeds, cached)
                 th = calibrate_thresholds_cached(cfg_p, list(range(min(3, len(seeds)))))
-                for k, v in th.items():
-                    cfg_p['pipeline'][k] = v
+                _apply_thresholds_into_cfg(cfg_p, th)
 
                 if mode == 'MoSK':
                     stats_0, stats_1 = [], []
@@ -4459,12 +4468,22 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
         cfg_test = deepcopy(cfg_base)
         cfg_test['pipeline']['Nm_per_symbol'] = nm
         cfg_test['pipeline']['sequence_length'] = 100  # Short for speed
+
+        mode = str(cfg_test['pipeline'].get('modulation', 'MoSK')).upper()
+        th_override: Dict[str, Any] = {}
+        if mode in ('CSK', 'HYBRID'):
+            try:
+                cfg_cal = deepcopy(cfg_test)
+                th_override = calibrate_thresholds_cached(cfg_cal, list(range(4)))
+            except Exception:
+                th_override = {}
         
         results = []
         for seed in quick_seeds:
             res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm, seed,
-                                    sweep_name="bracket_validation",
-                                    cache_tag=cache_tag)
+                                       sweep_name="bracket_validation",
+                                       cache_tag=cache_tag,
+                                       thresholds_override=th_override if th_override else None)
             if res:
                 results.append(res)
         
@@ -4667,8 +4686,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         cfg_test['pipeline']['Nm_per_symbol'] = nm_mid
 
         # Apply cached thresholds for the current test point
-        for k, v in _get_th(nm_mid).items():
-            cfg_test['pipeline'][k] = v
+        _apply_thresholds_into_cfg(cfg_test, _get_th(nm_mid))
 
         # --- Gather cached seed results first (if any) ---
         results: List[Dict[str, Any]] = []
@@ -4788,8 +4806,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 
                 cfg_probe = deepcopy(cfg_base)
                 cfg_probe['pipeline']['Nm_per_symbol'] = nm_probe
-                for k, v in _get_th(nm_probe).items():
-                    cfg_probe['pipeline'][k] = v
+                _apply_thresholds_into_cfg(cfg_probe, _get_th(nm_probe))
                 
                 for probe_seed in probe_seeds:
                     # Check cache first
@@ -4868,9 +4885,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         
         cal_seeds = list(range(10))
         thresholds = calibrate_thresholds(cfg_final, cal_seeds, recalibrate=False, save_to_file=True, verbose=False)
-        for k, v in thresholds.items():
-            if _should_apply_threshold_key(k):
-                cfg_final['pipeline'][k] = v
+        _apply_thresholds_into_cfg(cfg_final, thresholds)
 
         # NEW: Cap validation seeds for performance
         max_validation_seeds = cfg_base.get('max_lod_validation_seeds', len(seeds))
@@ -4960,8 +4975,7 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
 
     # Apply thresholds at this exact operating point
     th = calibrate_thresholds_cached(cfg, list(range(10)))
-    for k, v in th.items():
-        cfg['pipeline'][k] = v
+    _apply_thresholds_into_cfg(cfg, th)
 
     # NEW: Read adaptive stopping configuration
     target_ci = float(cfg_base.get('_stage13_target_ci', 0.0))  # reuse runner knob
@@ -5167,8 +5181,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             # Ensure the same thresholds used during LoD search are active here
             cal_seeds = list(range(10))
             th = calibrate_thresholds_cached(cfg, cal_seeds)
-            for k, v in th.items():
-                cfg['pipeline'][k] = v
+            _apply_thresholds_into_cfg(cfg, th)
             
             # --- Calculate data rate at LoD using per-seed SER (recommended) ---
             per_seed_rates = []
@@ -5301,8 +5314,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
 
         # Apply thresholds at this exact (distance, Ts, Nm)
         th_lod = calibrate_thresholds_cached(cfg_lod, list(range(4)))
-        for k, v in th_lod.items():
-            cfg_lod['pipeline'][k] = v
+        _apply_thresholds_into_cfg(cfg_lod, th_lod)
         
         sigma_values = []
         sigma_thermal_values = []
@@ -5553,9 +5565,7 @@ def run_csk_nt_pair_sweeps(args, cfg_base: Dict[str, Any], seeds: List[int], nm_
         # Calibrate for this pair (short, cached)
         cal_seeds = list(range(10))
         thresholds = calibrate_thresholds_cached(cfg_pair, cal_seeds, args.recalibrate)
-        for k, v in thresholds.items():
-            if _should_apply_threshold_key(k):
-                cfg_pair['pipeline'][k] = v
+        _apply_thresholds_into_cfg(cfg_pair, thresholds)
         out_csv = data_dir / f"ser_vs_nm_csk_{first.lower()}_{second.lower()}.csv"
         print(f"  • Running SER vs Nm for pair {first}-{second} → {out_csv.name}")
         
@@ -6227,8 +6237,7 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
                     try:
                         cal_seeds = list(range(4))  # Fast calibration with 4 seeds
                         th = calibrate_thresholds_cached(cfg, cal_seeds)
-                        for k, v in th.items():
-                            cfg['pipeline'][k] = v
+                        _apply_thresholds_into_cfg(cfg, th)
                     except Exception:
                         pass  # Fallback to default thresholds if calibration fails
                     res = run_single_instance(cfg, seed, attach_isi_meta=True)
@@ -6564,8 +6573,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # store to disk so subsequent processes reuse quickly
         initial_thresholds = calibrate_thresholds(cfg, cal_seeds, recalibrate=False, save_to_file=True, verbose=args.debug_calibration)
         print("✅ Calibration complete")
-        for k, v in initial_thresholds.items():
-            cfg['pipeline'][k] = v
+        _apply_thresholds_into_cfg(cfg, initial_thresholds)
 
     df_ser_nm = run_sweep(
         cfg, seeds,
