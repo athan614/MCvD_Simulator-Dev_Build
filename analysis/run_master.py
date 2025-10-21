@@ -467,6 +467,8 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
         cmd.append("--analytic-lod-bracket")
+    if getattr(args, 'lod_debug', False):
+        cmd.append("--lod-debug")
     # pass through optional LoD skips/limits:
     if getattr(args, 'max_ts_for_lod', None) is not None:
         cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
@@ -607,6 +609,8 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--lod-validate-seq-len", str(args.lod_validate_seq_len)])
     if getattr(args, 'analytic_lod_bracket', False):
         cmd.append("--analytic-lod-bracket")
+    if getattr(args, 'lod_debug', False):
+        cmd.append("--lod-debug")
     # pass through optional LoD skips/limits:
     if getattr(args, 'max_ts_for_lod', None) is not None:
         cmd.extend(["--max-ts-for-lod", str(args.max_ts_for_lod)])
@@ -722,6 +726,8 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
         cmd.extend(["--lod-num-seeds", str(args.lod_num_seeds)])
     if args.lod_seq_len is not None:
         cmd.extend(["--lod-seq-len", str(args.lod_seq_len)])
+    if getattr(args, 'lod_debug', False):
+        cmd.append("--lod-debug")
     if getattr(args, 'force_noise_resample', False):
         cmd.append("--force-noise-resample")
     
@@ -879,6 +885,8 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 help="Override sequence_length during final LoD validation only (pass-through)")
     p.add_argument("--analytic-lod-bracket", action="store_true",
                 help="Use Gaussian SER approximation for tighter LoD bracketing (pass-through)")
+    p.add_argument("--lod-debug", action="store_true",
+                help="Enable verbose LoD diagnostics (writes debug logs)")
     p.add_argument("--max-lod-validation-seeds", type=int, default=None,
                 help="Cap #seeds for final LoD validation (pass-through)")
     p.add_argument("--max-symbol-duration-s", type=float, default=None,

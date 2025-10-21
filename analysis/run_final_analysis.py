@@ -33,6 +33,11 @@ import logging
 
 _SYNTHETIC_NOISE_WARNING_SHOWN = False
 
+# NOTE: LoD debug instrumentation scaffolding (remove once diagnostics conclude)
+LOD_DEBUG_ENABLED: bool = False
+_LOD_DEBUG_PATH: Optional[Path] = None
+_LOD_DEBUG_LOCK = threading.Lock()
+
 
 def _warn_synthetic_noise(reason: str) -> None:
     """Emit a one-time warning that analytic (synthetic) noise is being used."""
@@ -65,6 +70,26 @@ from src.config_utils import preprocess_config
 # Progress UI
 from analysis.ui_progress import ProgressManager
 from analysis.log_utils import setup_tee_logging
+
+
+# NOTE: LoD debug instrumentation helper – remove when diagnostics complete
+def _lod_debug_log(event: Dict[str, Any]) -> None:
+    global _LOD_DEBUG_PATH
+    if not LOD_DEBUG_ENABLED:
+        return
+    try:
+        if _LOD_DEBUG_PATH is None:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            debug_dir = project_root / "results" / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            _LOD_DEBUG_PATH = debug_dir / f"lod_debug_{timestamp}_pid{os.getpid()}.jsonl"
+        payload = dict(event)
+        payload.setdefault("timestamp", time.time())
+        with _LOD_DEBUG_LOCK:
+            with open(_LOD_DEBUG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(_json_safe(payload)) + "\n")
+    except Exception:
+        pass
 
 MODE_NAME_ALIASES: Dict[str, str] = {
     "MOSK": "MoSK",
@@ -172,6 +197,43 @@ def _apply_thresholds_into_cfg(cfg: Dict[str, Any], thresholds: Dict[str, Any]) 
             noise[key.split('.', 1)[1]] = value
         elif _should_apply_threshold_key(key):
             pipe[key] = value
+
+    # Honor calibration metadata so runtime uses the same decision window
+    detection = cfg.setdefault('detection', {})
+    dw_used: Optional[float] = None
+
+    def _safe_float(value: Any) -> Optional[float]:
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    meta = thresholds.get('__meta__')
+    if isinstance(meta, dict):
+        raw_dw = meta.get('decision_window_used', meta.get('decision_window_s'))
+        dw_used = _safe_float(raw_dw)
+
+    if dw_used is None:
+        fallback = thresholds.get('decision_window_used')
+        dw_used = _safe_float(fallback)
+
+    if dw_used is None or not (math.isfinite(dw_used) and dw_used > 0.0):
+        Ts_val_raw = pipe.get('symbol_period_s')
+        Ts_val = _safe_float(Ts_val_raw)
+        if Ts_val is not None and math.isfinite(Ts_val) and Ts_val > 0.0:
+            try:
+                dw_used = _enforce_min_window(cfg, Ts_val)
+            except Exception:
+                dw_used = None
+
+    if dw_used is not None and math.isfinite(dw_used) and dw_used > 0.0:
+        detection['decision_window_s'] = float(dw_used)
+        detection['decision_window_policy'] = 'fixed'
+        pipe['time_window_s'] = max(float(pipe.get('time_window_s', 0.0)), float(dw_used))
 
 
 def _infer_csk_threshold_orientation(thresholds: Iterable[Any], default_qeff: float) -> bool:
@@ -841,6 +903,8 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                         continue
                     print(f"   {k}: {v if not isinstance(v, list) else f'list[{len(v)}]'}")
             result = {k: v for k, v in cached.items() if k not in ("_metadata", "__meta__")}
+            if meta:
+                result['__meta__'] = meta
             if mode.startswith("CSK") and tgt:
                 key = f"csk_thresholds_{tgt.lower()}"
                 thresh_vals = result.get(key)
@@ -1161,6 +1225,33 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
 
     thresholds['detector_mode'] = detector_mode
 
+    # Record calibration metadata for downstream consumers
+    try:
+        qeff_signs = _qeff_signs(cfg)
+    except Exception:
+        qeff_signs = (0, 0)
+    meta_payload: Dict[str, Any] = {
+        "mode": str(cfg['pipeline'].get('modulation')),
+        "M": int(cfg['pipeline'].get('csk_levels', 0)),
+        "target": str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper(),
+        "combiner": str(cfg['pipeline'].get('csk_combiner', 'zscore')),
+        "leakage_frac": float(cfg['pipeline'].get('csk_leakage_frac', 0.0)),
+        "Nm": float(cfg['pipeline'].get('Nm_per_symbol', 0.0)),
+        "distance_um": float(cfg['pipeline'].get('distance_um', 0.0)),
+        "Ts": float(Ts),
+        "decision_window_used": float(min_win),
+        "guard_factor": float(cfg['pipeline'].get('guard_factor', 0.0)),
+        "use_ctrl": bool(cfg['pipeline'].get('use_control_channel', True)),
+        "nt_pair_label": f"{cfg['neurotransmitters']['DA'].get('name','DA')}–{cfg['neurotransmitters']['SERO'].get('name','SERO')}"
+                          if 'neurotransmitters' in cfg else "",
+        "nt_pair_fp": _fingerprint_nt_pair(cfg),
+        "q_eff_signs": qeff_signs,
+        "version": "2.0",
+        "detector_mode": detector_mode,
+        "timestamp": time.time()
+    }
+    thresholds['__meta__'] = meta_payload
+
     # ---------- persist to disk with rich __meta__ (atomic) ----------
     if save_to_file:
         try:
@@ -1178,28 +1269,7 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
                 else:
                     payload[k] = v
 
-            # Metadata
-            s_da, s_se = _qeff_signs(cfg)
-            meta = {
-                "mode": str(cfg['pipeline'].get('modulation')),
-                "M": int(cfg['pipeline'].get('csk_levels', 0)),
-                "target": str(cfg['pipeline'].get('csk_target_channel', 'DA')).upper(),
-                "combiner": str(cfg['pipeline'].get('csk_combiner', 'zscore')),
-                "leakage_frac": float(cfg['pipeline'].get('csk_leakage_frac', 0.0)),
-                "Nm": float(cfg['pipeline'].get('Nm_per_symbol', 0.0)),
-                "distance_um": float(cfg['pipeline'].get('distance_um', 0.0)),
-                "Ts": float(Ts),
-                "decision_window_used": float(min_win),
-                "guard_factor": float(cfg['pipeline'].get('guard_factor', 0.0)),
-                "use_ctrl": bool(cfg['pipeline'].get('use_control_channel', True)),
-                "nt_pair_label": f"{cfg['neurotransmitters']['DA'].get('name','DA')}–{cfg['neurotransmitters']['SERO'].get('name','SERO')}",
-                "nt_pair_fp": _fingerprint_nt_pair(cfg),
-                "q_eff_signs": (s_da, s_se),
-                "version": "2.0",
-                "detector_mode": detector_mode,
-                "timestamp": time.time()
-            }
-            payload["__meta__"] = meta
+            payload["__meta__"] = meta_payload
 
             tmp_file = threshold_file.with_suffix('.tmp')
             with open(tmp_file, 'w', encoding='utf-8') as f:
@@ -1287,6 +1357,20 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     # Check memory cache first
     if cache_key in calibration_cache:
         cached_result = calibration_cache[cache_key]
+        if '__meta__' not in cached_result:
+            threshold_file = _thresholds_filename(cfg)
+            if threshold_file.exists():
+                try:
+                    with open(threshold_file, 'r', encoding='utf-8') as fh:
+                        cached_payload = json.load(fh)
+                    meta_disk = cached_payload.get('__meta__')
+                    if meta_disk:
+                        cached_copy = dict(cached_result)
+                        cached_copy['__meta__'] = meta_disk
+                        calibration_cache[cache_key] = cached_copy
+                        cached_result = cached_copy
+                except Exception:
+                    pass
         if cfg['pipeline']['modulation'].startswith('CSK') and \
            'csk_thresholds_increasing' not in cached_result:
             cached_copy = dict(cached_result)
@@ -2453,6 +2537,8 @@ def parse_arguments() -> argparse.Namespace:
                         default="always",
                         help="Run ISI trade-off sweep: always (default), auto (only when ISI enabled), or never.")
     parser.add_argument("--debug-calibration", action="store_true", help="Print detailed calibration information")
+    parser.add_argument("--lod-debug", action="store_true",
+                        help="Enable verbose diagnostics for LoD sweeps (writes results/debug/*.jsonl)")
     parser.add_argument("--channel-profile", choices=["tri", "dual", "single"], default="tri",
                         help="Physical channel setup: tri (DA+SERO+CTRL), dual (DA+SERO), single (DA only).")
     parser.add_argument("--csk-level-scheme", choices=["uniform", "zero-based"], default="uniform",
@@ -4477,8 +4563,34 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
                 th_override = calibrate_thresholds_cached(cfg_cal, list(range(4)))
             except Exception:
                 th_override = {}
-        
+
+        debug_entry: Optional[Dict[str, Any]] = None
+        if LOD_DEBUG_ENABLED:
+            # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
+            meta = th_override.get('__meta__') if isinstance(th_override, dict) else None
+            def _maybe_float(val: Any) -> Optional[float]:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+            debug_entry = {
+                "phase": "lod_quick_ser_start",
+                "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                "nm": int(nm),
+                "mode": mode,
+                "sequence_length": int(cfg_test['pipeline'].get('sequence_length', 0)),
+                "decision_window_s": float(cfg_test.get('detection', {}).get('decision_window_s', float('nan'))),
+                "decision_window_policy": str(cfg_test.get('detection', {}).get('decision_window_policy', 'unknown')),
+                "threshold_meta": {
+                    "decision_window_used": _maybe_float(meta.get('decision_window_used')),
+                    "Ts": _maybe_float(meta.get('Ts')),
+                    "lod_nm": _maybe_float(meta.get('Nm')),
+                } if isinstance(meta, dict) else None,
+                "quick_seeds": [int(s) for s in quick_seeds],
+            }
+
         results = []
+        seed_logs: List[Dict[str, Any]] = []
         for seed in quick_seeds:
             res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm, seed,
                                        sweep_name="bracket_validation",
@@ -4486,16 +4598,54 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
                                        thresholds_override=th_override if th_override else None)
             if res:
                 results.append(res)
-        
+                if debug_entry is not None:
+                    seed_logs.append({
+                        "seed": int(seed),
+                        "errors": int(res.get('errors', 0)),
+                        "sequence_length": int(cfg_test['pipeline']['sequence_length']),
+                        "ser": float(res.get('ser', res.get('SER', float('nan')))),
+                        "decision_window_s": float(res.get('decision_window_s', float('nan'))),
+                        "symbol_period_s": float(res.get('symbol_period_s', float('nan'))),
+                    })
+
         if not results:
+            if debug_entry is not None:
+                debug_entry.update({
+                    "phase": "lod_quick_ser_result",
+                    "result_ser": float('nan'),
+                    "seed_results": seed_logs,
+                    "status": "no_results",
+                })
+                _lod_debug_log(debug_entry)
             return 1.0  # Assume failure if no results
-        
+
         total_symbols = len(results) * cfg_test['pipeline']['sequence_length']
         total_errors = sum(int(r.get('errors', 0)) for r in results)
-        return total_errors / total_symbols if total_symbols > 0 else 1.0
+        ser_val = total_errors / total_symbols if total_symbols > 0 else 1.0
+
+        if debug_entry is not None:
+            debug_entry.update({
+                "phase": "lod_quick_ser_result",
+                "result_ser": float(ser_val),
+                "total_errors": int(total_errors),
+                "total_symbols": int(total_symbols),
+                "seed_results": seed_logs,
+                "status": "ok",
+            })
+            _lod_debug_log(debug_entry)
+
+        return ser_val
     
     # Check lower bound
     ser_min = _quick_ser(nm_min)
+    if LOD_DEBUG_ENABLED:
+        _lod_debug_log({
+            "phase": "lod_quick_ser_lower_bound",
+            "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+            "nm": int(nm_min),
+            "ser": float(ser_min),
+            "target_ser": float(target_ser),
+        })
     if ser_min <= target_ser:
         # Lower bound too good, push it down
         while nm_min > 50 and ser_min <= target_ser:
@@ -4504,6 +4654,15 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
     
     # Check upper bound
     ser_max = _quick_ser(nm_max)
+    if LOD_DEBUG_ENABLED:
+        _lod_debug_log({
+            "phase": "lod_quick_ser_upper_bound",
+            "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+            "nm": int(nm_max),
+            "ser": float(ser_max),
+            "target_ser": float(target_ser),
+            "nm_ceiling": int(nm_ceiling),
+        })
     if ser_max > target_ser:
         # Upper bound not good enough, try to grow it
         while nm_max < nm_ceiling and ser_max > target_ser:
@@ -4512,13 +4671,33 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
         
         # If we hit ceiling and still can't achieve target
         if nm_max >= nm_ceiling and ser_max > target_ser:
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_quick_ser_ceiling",
+                    "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                    "nm_min": int(nm_min),
+                    "nm_max": int(nm_max),
+                    "ser_min": float(ser_min),
+                    "ser_max": float(ser_max),
+                    "target_ser": float(target_ser),
+                })
             return nm_min, nm_max, "nm_ceiling_exhausted"
-    
+
     # Final validation
     if ser_min <= target_ser or ser_max > target_ser:
         # Still invalid bracket
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_quick_ser_bracket_failure",
+                "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                "nm_min": int(nm_min),
+                "nm_max": int(nm_max),
+                "ser_min": float(ser_min),
+                "ser_max": float(ser_max),
+                "target_ser": float(target_ser),
+            })
         return nm_min, nm_max, "bracket_validation_failed"
-    
+
     return nm_min, nm_max, None
 
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
@@ -4534,6 +4713,19 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     nm_max = nm_ceiling
     nm_max_default = nm_ceiling
 
+    if LOD_DEBUG_ENABLED:
+        # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
+        _lod_debug_log({
+            "phase": "lod_find_start",
+            "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+            "nm_min_initial": int(nm_min),
+            "nm_max_initial": int(nm_max),
+            "nm_ceiling": int(nm_ceiling),
+            "target_ser": float(target_ser),
+            "seeds": [int(s) for s in seeds],
+            "resume": bool(resume),
+        })
+
     # NEW: Try analytic bracketing if enabled (experimental feature)
     analytic_bracket_cache = None  # Cache for analytic bracket result
     if cfg_base.get('_analytic_lod_bracket', False):
@@ -4543,6 +4735,14 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             nm_min = max(nm_min, nm_min_analytic)
             nm_max = min(nm_max, nm_max_analytic)
             print(f"    📊 Using analytic bracket: [{nm_min} - {nm_max}]")
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_find_analytic_bracket",
+                    "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                    "nm_min": int(nm_min),
+                    "nm_max": int(nm_max),
+                    "analytic_bounds": [int(nm_min_analytic), int(nm_max_analytic)],
+                })
 
     # NEW: warm-start bracket if provided with analytic intersection
     warm = int(cfg_base.get('_warm_lod_guess', 0))
@@ -4575,10 +4775,28 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 nm_min = max(nm_min, nm_min_analytic)
                 
                 print(f"    🔄 Warm + analytic intersect: [{nm_min} - {nm_max}] (capped at {nm_ceiling})")
+                if LOD_DEBUG_ENABLED:
+                    _lod_debug_log({
+                        "phase": "lod_find_warm_intersect",
+                        "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                        "warm_guess": int(warm),
+                        "nm_min": int(nm_min),
+                        "nm_max": int(nm_max),
+                        "upper_from_warm": int(upper_from_warm),
+                        "upper_from_analytic": int(upper_from_analytic),
+                    })
         else:
             # Pure warm-start without analytic constraints
             nm_max = min(nm_max_default, int(mult * warm))
             print(f"    🔥 Warm-start bracket: [{nm_min} - {nm_max}]")
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_find_warm_only",
+                    "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+                    "warm_guess": int(warm),
+                    "nm_min": int(nm_min),
+                    "nm_max": int(nm_max),
+                })
     
     lod_nm: float = float('nan')
     best_ser: float = 1.0
@@ -4594,6 +4812,12 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     state = _lod_state_load(mode_name, float(dist_um), use_ctrl) if resume else None
 
     if state:
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_find_resume_state",
+                "distance_um": float(dist_um),
+                "state_keys": list(state.keys()),
+            })
         # 1) Fast exit when a previous run already marked 'done' (robust to NaN)
         nm_min_state = state.get("nm_min")
         nm_max_state = state.get("nm_max")
@@ -4603,6 +4827,12 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             int(nm_min_state) == int(nm_max_state) and int(nm_min_state) > 0):
             lod_nm = int(nm_min_state)
             print(f"    ✔ Resume: LoD already found in previous run → {lod_nm}")
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_find_resume_done",
+                    "distance_um": float(dist_um),
+                    "lod_nm": int(lod_nm),
+                })
             return lod_nm, target_ser, 0
 
         # 2) Try to reconstruct a sane bracket from per-Nm tallies
@@ -4669,6 +4899,15 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         if skip_reason == "nm_ceiling_exhausted":
             _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}})
             print(f"    🧹 Cleared LoD state for future runs with higher ceiling")
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_find_skip",
+                "distance_um": float(dist_um),
+                "skip_reason": skip_reason,
+                "nm_min": int(nm_min),
+                "nm_max": int(nm_max),
+                "target_ser": float(target_ser),
+            })
         return float('nan'), 1.0, 0
 
     for iteration in range(20):
@@ -4783,6 +5022,22 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             nm_min = nm_mid + 1
             continue
 
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_iteration_result",
+                "distance_um": float(dist_um),
+                "iteration": int(iteration),
+                "nm_mid": int(nm_mid),
+                "nm_min": int(nm_min),
+                "nm_max": int(nm_max),
+                "ser": float(ser),
+                "target_ser": float(target_ser),
+                "k_err": int(k_err),
+                "n_seen": int(n_seen),
+                "results_cached": len(cached),
+                "results_collected": len(results),
+            })
+
         print(f"      [{dist_um}μm|{ctrl_str}] Nm={nm_mid}: SER={ser:.4f} {'✓ PASS' if ser <= target_ser else '✗ FAIL'}")
 
         # Track best attempt regardless of whether it passes
@@ -4792,6 +5047,16 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
 
         if ser <= target_ser:
             lod_nm = nm_mid
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_iteration_pass",
+                    "distance_um": float(dist_um),
+                    "iteration": int(iteration),
+                    "nm_mid": int(nm_mid),
+                    "ser": float(ser),
+                    "nm_min": int(nm_min),
+                    "nm_max": int(nm_max),
+                })
             
             # NEW: LoD down-step confirmation accelerator
             # Try a more aggressive value with minimal seeds for fast screening
@@ -4835,11 +5100,28 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                         print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS → skip to Nm={nm_probe}")
                         lod_nm = nm_probe
                         nm_max = nm_probe - 1
+                        if LOD_DEBUG_ENABLED:
+                            _lod_debug_log({
+                                "phase": "lod_downstep_success",
+                                "distance_um": float(dist_um),
+                                "nm_probe": int(nm_probe),
+                                "probe_ser": float(probe_ser),
+                                "probe_k_err": int(probe_k_err),
+                                "probe_n_seen": int(probe_n_seen),
+                            })
                         progress_count += len(probe_seeds)  # Count probe work
                         break
                     elif decide_above:
                         # Probe fails decisively, stick with original nm_mid
                         print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL → continue bisection")
+                        if LOD_DEBUG_ENABLED:
+                            _lod_debug_log({
+                                "phase": "lod_downstep_fail",
+                                "distance_um": float(dist_um),
+                                "nm_probe": int(nm_probe),
+                                "probe_k_err": int(probe_k_err),
+                                "probe_n_seen": int(probe_n_seen),
+                            })
                         progress_count += len(probe_seeds)  # Count probe work  
                         break
                 else:
@@ -4850,13 +5132,41 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                             print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS (SER={probe_ser:.4f}) → skip to Nm={nm_probe}")
                             lod_nm = nm_probe
                             nm_max = nm_probe - 1
+                            if LOD_DEBUG_ENABLED:
+                                _lod_debug_log({
+                                    "phase": "lod_downstep_success",
+                                    "distance_um": float(dist_um),
+                                    "nm_probe": int(nm_probe),
+                                    "probe_ser": float(probe_ser),
+                                    "probe_k_err": int(probe_k_err),
+                                    "probe_n_seen": int(probe_n_seen),
+                                })
                         else:
                             print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL (SER={probe_ser:.4f}) → continue bisection")
+                            if LOD_DEBUG_ENABLED:
+                                _lod_debug_log({
+                                    "phase": "lod_downstep_fail",
+                                    "distance_um": float(dist_um),
+                                    "nm_probe": int(nm_probe),
+                                    "probe_ser": float(probe_ser),
+                                    "probe_k_err": int(probe_k_err),
+                                    "probe_n_seen": int(probe_n_seen),
+                                })
                         progress_count += len(probe_seeds)
             
             nm_max = nm_mid - 1  # Standard bisection update
         else:
             nm_min = nm_mid + 1
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_iteration_fail",
+                    "distance_um": float(dist_um),
+                    "iteration": int(iteration),
+                    "nm_mid": int(nm_mid),
+                    "ser": float(ser),
+                    "nm_min": int(nm_min),
+                    "nm_max": int(nm_max),
+                })
             
         # Count each binary search iteration
         progress_count += 1
@@ -4865,6 +5175,17 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         _lod_state_save(mode_name, float(dist_um), use_ctrl,
                         {"nm_min": nm_min, "nm_max": nm_max, "iteration": iteration,
                          "last_nm": nm_mid})
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_iteration_bounds",
+                "distance_um": float(dist_um),
+                "iteration": int(iteration),
+                "nm_min": int(nm_min),
+                "nm_max": int(nm_max),
+                "lod_nm_current": float(lod_nm),
+                "best_ser": float(best_ser),
+                "best_nm": int(best_nm) if best_nm is not None else None,
+            })
 
     # OPTIMIZATION 1: Cap LoD validation retries
     # Only run a single-point validation when the bracket collapsed to one point
@@ -4872,6 +5193,14 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         print(f"    [{dist_um}μm|{ctrl_str}] Final validation at Nm={nm_min}")
         cfg_final = deepcopy(cfg_base)
         cfg_final['pipeline']['Nm_per_symbol'] = nm_min
+        if LOD_DEBUG_ENABLED:
+            _lod_debug_log({
+                "phase": "lod_final_validation_start",
+                "distance_um": float(dist_um),
+                "nm": int(nm_min),
+                "nm_ceiling": int(nm_ceiling),
+                "seeds": [int(s) for s in seeds],
+            })
         
         # NEW: enforce minimum decision window here
         Ts = float(cfg_final['pipeline'].get(
@@ -4928,11 +5257,30 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             if final_ser <= target_ser:
                 # Track actual progress - binary search iterations + final check seeds + overhead
                 actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
+                if LOD_DEBUG_ENABLED:
+                    _lod_debug_log({
+                        "phase": "lod_final_validation_success",
+                        "distance_um": float(dist_um),
+                        "nm": int(nm_min),
+                        "final_ser": float(final_ser),
+                        "validation_seeds": len(results2),
+                    })
                 return nm_min, final_ser, actual_progress
 
     # Return best attempt if no solution found, otherwise return found solution
     final_lod_nm = lod_nm if not math.isnan(lod_nm) else float('nan')
     final_ser = best_ser  # Always return the best SER seen (either successful or closest attempt)
+    
+    if LOD_DEBUG_ENABLED:
+        _lod_debug_log({
+            "phase": "lod_find_result",
+            "distance_um": float(cfg_base['pipeline'].get('distance_um', float('nan'))),
+            "lod_nm": float(final_lod_nm),
+            "best_ser": float(final_ser),
+            "progress_count": int(progress_count),
+            "nm_min_final": int(nm_min),
+            "nm_max_final": int(nm_max),
+        })
     
     # Return actual count instead of constant
     return final_lod_nm, final_ser, progress_count
@@ -5077,6 +5425,24 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     cfg.setdefault('detection', {})
     cfg['detection']['decision_window_s'] = min_win
 
+    if LOD_DEBUG_ENABLED:
+        # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
+        _lod_debug_log({
+            "phase": "lod_distance_start",
+            "distance_um": float(dist_um),
+            "target_ser": float(target_ser),
+            "seeds": [int(s) for s in seeds],
+            "resume": bool(resume),
+            "warm_lod_guess": int(warm_lod_guess) if warm_lod_guess else None,
+            "analytic_lod_bracket": bool(cfg.get('_analytic_lod_bracket', False)),
+            "lod_nm_min": int(cfg_base['pipeline'].get('lod_nm_min', 50)),
+            "lod_nm_max": int(cfg_base.get('pipeline', {}).get('lod_nm_max', cfg_base.get('lod_max_nm', 1000000))),
+            "decision_window_s": float(cfg['detection']['decision_window_s']),
+            "decision_window_policy": str(cfg.get('detection', {}).get('decision_window_policy', 'unknown')),
+            "sequence_length": int(cfg['pipeline'].get('sequence_length', 0)),
+            "progress_mode": getattr(args, "progress", None) if args else None,
+        })
+
     noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
     if isinstance(noise_distance_map, dict):
         noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
@@ -5100,6 +5466,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             # Continue with LoD analysis instead of returning NaN
         else:
             print(f"⚠️  Skipping distance {dist_um}μm: symbol period {Ts_dyn:.1f}s exceeds limit {max_symbol_duration_s}s")
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_distance_skip",
+                    "distance_um": float(dist_um),
+                    "reason": "ts_explosion",
+                    "Ts_dyn": float(Ts_dyn),
+                    "max_symbol_duration_s": float(max_symbol_duration_s),
+                })
             return {
                 'distance_um': dist_um,
                 'lod_nm': float('nan'),
@@ -5133,6 +5507,14 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             print(f"⚠️  WARNING: distance {dist_um}μm has long symbol period {Ts_dyn:.1f}s (exceeds CLI limit {cap_cli}s), continuing anyway")
             # Continue with LoD analysis instead of returning NaN
         else:
+            if LOD_DEBUG_ENABLED:
+                _lod_debug_log({
+                    "phase": "lod_distance_skip",
+                    "distance_um": float(dist_um),
+                    "reason": "ts_cli_limit",
+                    "Ts_dyn": float(Ts_dyn),
+                    "cli_limit": float(cap_cli),
+                })
             return {
                 'distance_um': dist_um, 'lod_nm': float('nan'), 'ser_at_lod': float('nan'),
                 'data_rate_bps': float('nan'), 'data_rate_ci_low': float('nan'), 'data_rate_ci_high': float('nan'),
@@ -5409,6 +5791,16 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         skipped_reason = skipped_reason or 'not_bracketed'
 
     isi_overlap_ratio_final = estimate_isi_overlap_ratio(cfg)
+
+    if LOD_DEBUG_ENABLED:
+        _lod_debug_log({
+            "phase": "lod_distance_result",
+            "distance_um": float(dist_um),
+            "lod_nm": float(lod_nm),
+            "ser_at_lod": float(ser_at_lod),
+            "skipped_reason": skipped_reason,
+            "actual_progress": int(actual_progress),
+        })
 
     return {
         'distance_um': dist_um,
@@ -7449,6 +7841,11 @@ def main() -> None:
     _install_signal_handlers()
     
     args = parse_arguments()
+    global LOD_DEBUG_ENABLED
+    LOD_DEBUG_ENABLED = bool(getattr(args, "lod_debug", False))
+    if LOD_DEBUG_ENABLED:
+        # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
+        _lod_debug_log({"phase": "lod_debug_enabled"})
     
     if args.merge_ablation_csvs:
         if args.mode and args.mode != "ALL":
