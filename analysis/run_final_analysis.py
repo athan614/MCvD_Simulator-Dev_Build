@@ -83,6 +83,7 @@ def _lod_debug_log(event: Dict[str, Any]) -> None:
     if not LOD_DEBUG_ENABLED:
         return
     try:
+        # Lazily initialize per-process debug sink
         if _LOD_DEBUG_PATH is None:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             debug_dir = project_root / "results" / "debug"
@@ -90,9 +91,15 @@ def _lod_debug_log(event: Dict[str, Any]) -> None:
             _LOD_DEBUG_PATH = debug_dir / f"lod_debug_{timestamp}_pid{os.getpid()}.jsonl"
         payload = dict(event)
         payload.setdefault("timestamp", time.time())
+        payload.setdefault("pid", os.getpid())
+        payload_line = json.dumps(_json_safe(payload))
         with _LOD_DEBUG_LOCK:
             with open(_LOD_DEBUG_PATH, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(_json_safe(payload)) + "\n")
+                fh.write(payload_line + "\n")
+            try:
+                print(f"[LOD-DEBUG] {payload_line}", flush=True)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -239,6 +246,45 @@ def _apply_thresholds_into_cfg(cfg: Dict[str, Any], thresholds: Dict[str, Any]) 
         detection['decision_window_s'] = float(dw_used)
         detection['decision_window_policy'] = 'fixed'
         pipe['time_window_s'] = max(float(pipe.get('time_window_s', 0.0)), float(dw_used))
+
+
+def _sanitize_frozen_noise_payload(
+    payload: Any,
+    *,
+    keep_window: bool = True,
+    keep_components: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return a copy of the frozen-noise payload with sigma/ρ overrides removed.
+
+    LoD searches rely on live signal+noise statistics. This helper strips the
+    keys that would otherwise clamp the detector to the Nm=0 snapshot while
+    optionally preserving deterministic windowing metadata.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    sanitized = deepcopy(payload)
+    for key in (
+        'sigma_da',
+        'sigma_sero',
+        'sigma_diff',
+        'sigma_diff_mosk',
+        'rho_for_diff',
+        'rho_cc',
+    ):
+        sanitized.pop(key, None)
+
+    if not keep_window:
+        sanitized.pop('detection_window_s', None)
+    if not keep_components:
+        sanitized.pop('noise_components', None)
+    else:
+        components = sanitized.get('noise_components')
+        if isinstance(components, dict):
+            sanitized['noise_components'] = dict(components)
+
+    return sanitized if sanitized else None
 
 
 def _infer_csk_threshold_orientation(thresholds: Iterable[Any], default_qeff: float) -> bool:
@@ -502,6 +548,12 @@ def get_optimal_workers(mode: str = "optimal") -> int:
         return max(p_threads - 4, 1)
 
 def worker_init():
+    global LOD_DEBUG_ENABLED
+    try:
+        if _env_lod_debug_enabled():
+            LOD_DEBUG_ENABLED = True
+    except Exception:
+        pass
     if CPU_CONFIG is not None:
         try:
             # Get current process and available P-cores
@@ -768,6 +820,11 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     Calibration with ISI off & decision window = Ts (or enforced minimum). Returns thresholds dict.
     Incorporates robust cache compatibility, finite filtering, and optional early-stop for MoSK/Hybrid.
     """
+    cfg = deepcopy(cfg)
+    pipeline_clean = cfg.setdefault('pipeline', {})
+    pipeline_clean.pop('_frozen_noise', None)
+    cfg.pop('_prefer_distance_freeze', None)
+
     mode = cfg['pipeline']['modulation']
     detector_mode = str(cfg['pipeline'].get('detector_mode', 'zscore')).lower()
     if detector_mode not in ('zscore', 'raw', 'whitened'):
@@ -1345,6 +1402,12 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     """
     Memory + disk cached calibration. Persist JSON so multiple processes/runs reuse it.
     """
+    cfg_clean = deepcopy(cfg)
+    pipeline_clean = cfg_clean.setdefault('pipeline', {})
+    pipeline_clean.pop('_frozen_noise', None)
+    cfg_clean.pop('_prefer_distance_freeze', None)
+    cfg = cfg_clean
+
     cache_key = get_cache_key(cfg)
     
     # If recalibrating, clear both memory and disk cache
@@ -4888,6 +4951,8 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             return th_cache[nm]
         cfg_tmp = deepcopy(cfg_base)
         cfg_tmp['pipeline']['Nm_per_symbol'] = nm
+        cfg_tmp.setdefault('pipeline', {}).pop('_frozen_noise', None)
+        cfg_tmp.pop('_prefer_distance_freeze', None)
         th = calibrate_thresholds_cached(cfg_tmp, list(range(6)))  # faster with fewer seeds
         th_cache[nm] = th
         return th
@@ -5452,7 +5517,16 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     if isinstance(noise_distance_map, dict):
         noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
         if isinstance(noise_payload, dict):
-            cfg['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+            frozen_payload = _sanitize_frozen_noise_payload(noise_payload)
+            if frozen_payload:
+                cfg['pipeline']['_frozen_noise'] = frozen_payload
+                cfg['_prefer_distance_freeze'] = True
+            else:
+                cfg['pipeline'].pop('_frozen_noise', None)
+                cfg.pop('_prefer_distance_freeze', None)
+        else:
+            cfg['pipeline'].pop('_frozen_noise', None)
+            cfg.pop('_prefer_distance_freeze', None)
 
     isi_overlap_ratio_initial = estimate_isi_overlap_ratio(cfg)
     _maybe_warn_isi_overlap(cfg, isi_overlap_ratio_initial, context=f"LoD distance {dist_um:.0f} um")
@@ -5692,10 +5766,19 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         if isinstance(noise_distance_map, dict):
             noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
             if isinstance(noise_payload, dict):
-                cfg_lod['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
-                cfg_lod['_prefer_distance_freeze'] = True
+                frozen_payload_lod = _sanitize_frozen_noise_payload(noise_payload)
+                if frozen_payload_lod:
+                    cfg_lod['pipeline']['_frozen_noise'] = frozen_payload_lod
+                    cfg_lod['_prefer_distance_freeze'] = True
+                else:
+                    cfg_lod['pipeline'].pop('_frozen_noise', None)
+                    cfg_lod.pop('_prefer_distance_freeze', None)
             else:
+                cfg_lod['pipeline'].pop('_frozen_noise', None)
                 cfg_lod.pop('_prefer_distance_freeze', None)
+        else:
+            cfg_lod['pipeline'].pop('_frozen_noise', None)
+            cfg_lod.pop('_prefer_distance_freeze', None)
 
         cfg_lod['pipeline']['Nm_per_symbol'] = lod_nm
 
@@ -5721,7 +5804,8 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
                                         debug_calibration=debug_calibration, 
-                                        sweep_name="lod_validation", cache_tag="lod_sigma")
+                                        sweep_name="lod_validation", cache_tag="lod_sigma",
+                                        thresholds_override=th_lod)
             if result:
                 sigma_val = result.get('noise_sigma_I_diff_measured', result.get('noise_sigma_I_diff', float('nan')))
                 sigma_values.append(_as_float(sigma_val))

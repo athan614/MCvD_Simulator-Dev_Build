@@ -66,6 +66,10 @@ STAGE_REGISTRY: Dict[str, StageDefinition] = {
             "results/cache/*/lod_sigma*/**",
             "results/cache/*/d*um/**",
         ),
+        extra_patterns=(
+            "results/data/lod_vs_distance_*.meta.json",
+            "results/data/lod_vs_distance_*.lock",
+        ),
     ),
     "3": StageDefinition(
         id="3",
