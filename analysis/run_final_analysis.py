@@ -34,7 +34,12 @@ import logging
 _SYNTHETIC_NOISE_WARNING_SHOWN = False
 
 # NOTE: LoD debug instrumentation scaffolding (remove once diagnostics conclude)
-LOD_DEBUG_ENABLED: bool = False
+LOD_DEBUG_ENV_KEY = "MCVD_LOD_DEBUG"
+def _env_lod_debug_enabled() -> bool:
+    raw = os.environ.get(LOD_DEBUG_ENV_KEY, "")
+    return raw.lower() in ("1", "true", "yes", "on")
+
+LOD_DEBUG_ENABLED: bool = _env_lod_debug_enabled()
 _LOD_DEBUG_PATH: Optional[Path] = None
 _LOD_DEBUG_LOCK = threading.Lock()
 
@@ -7842,10 +7847,14 @@ def main() -> None:
     
     args = parse_arguments()
     global LOD_DEBUG_ENABLED
-    LOD_DEBUG_ENABLED = bool(getattr(args, "lod_debug", False))
-    if LOD_DEBUG_ENABLED:
+    if getattr(args, "lod_debug", False):
+        os.environ[LOD_DEBUG_ENV_KEY] = "1"
+        LOD_DEBUG_ENABLED = True
         # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
         _lod_debug_log({"phase": "lod_debug_enabled"})
+    else:
+        os.environ.pop(LOD_DEBUG_ENV_KEY, None)
+        LOD_DEBUG_ENABLED = False
     
     if args.merge_ablation_csvs:
         if args.mode and args.mode != "ALL":
