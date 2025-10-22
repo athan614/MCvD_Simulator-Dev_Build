@@ -3741,8 +3741,13 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             pass
         else:
             if isinstance(payload, dict) and payload:
-                pipeline['_frozen_noise'] = deepcopy(payload)
-                expect_frozen_noise = True
+                sanitized_payload = _sanitize_frozen_noise_payload(payload)
+                if sanitized_payload:
+                    pipeline['_frozen_noise'] = sanitized_payload
+                    expect_frozen_noise = True
+                else:
+                    pipeline.pop('_frozen_noise', None)
+                    expect_frozen_noise = False
             else:
                 if not isinstance(pipeline.get('_frozen_noise'), dict):
                     expect_frozen_noise = False
@@ -5377,10 +5382,12 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
     noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
     if isinstance(noise_distance_map, dict):
         noise_payload = noise_distance_map.get(_value_key(float(cfg['pipeline']['distance_um'])))
-        if isinstance(noise_payload, dict):
-            cfg['pipeline']['_frozen_noise'] = deepcopy(noise_payload)
+        frozen_payload = _sanitize_frozen_noise_payload(noise_payload)
+        if frozen_payload:
+            cfg['pipeline']['_frozen_noise'] = frozen_payload
             cfg['_prefer_distance_freeze'] = True
         else:
+            cfg['pipeline'].pop('_frozen_noise', None)
             cfg.pop('_prefer_distance_freeze', None)
 
     cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
@@ -5801,22 +5808,69 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             except (TypeError, ValueError):
                 return float('nan')
 
+        cfg_lod['pipeline']['_collect_noise_components'] = True
+
+        sigma_values: List[float] = []
+        sigma_values_measured: List[float] = []
+        sigma_thermal_values: List[float] = []
+        sigma_thermal_measured: List[float] = []
+        sigma_flicker_values: List[float] = []
+        sigma_flicker_measured: List[float] = []
+        sigma_drift_values: List[float] = []
+        sigma_drift_measured: List[float] = []
+        thermal_fraction_values: List[float] = []
+        thermal_fraction_measured: List[float] = []
         for seed in seeds[:5]:  # Limited seeds for efficiency
             result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
                                         debug_calibration=debug_calibration, 
                                         sweep_name="lod_validation", cache_tag="lod_sigma",
                                         thresholds_override=th_lod)
             if result:
-                sigma_val = result.get('noise_sigma_I_diff_measured', result.get('noise_sigma_I_diff', float('nan')))
-                sigma_values.append(_as_float(sigma_val))
-                sigma_thermal_val = result.get('noise_sigma_thermal_measured', result.get('noise_sigma_thermal', float('nan')))
-                sigma_thermal_values.append(_as_float(sigma_thermal_val))
-                sigma_flicker_val = result.get('noise_sigma_flicker_measured', result.get('noise_sigma_flicker', float('nan')))
-                sigma_flicker_values.append(_as_float(sigma_flicker_val))
-                sigma_drift_val = result.get('noise_sigma_drift_measured', result.get('noise_sigma_drift', float('nan')))
-                sigma_drift_values.append(_as_float(sigma_drift_val))
-                thermal_fraction_val = result.get('noise_thermal_fraction_measured', result.get('noise_thermal_fraction', float('nan')))
-                thermal_fraction_values.append(_as_float(thermal_fraction_val))
+                sigma_meas = _as_float(result.get('noise_sigma_I_diff_measured'))
+                if math.isfinite(sigma_meas):
+                    sigma_values_measured.append(sigma_meas)
+                    sigma_values.append(sigma_meas)
+                else:
+                    sigma_val = _as_float(result.get('noise_sigma_I_diff'))
+                    if math.isfinite(sigma_val):
+                        sigma_values.append(sigma_val)
+
+                sigma_thermal_meas = _as_float(result.get('noise_sigma_thermal_measured'))
+                if math.isfinite(sigma_thermal_meas):
+                    sigma_thermal_measured.append(sigma_thermal_meas)
+                    sigma_thermal_values.append(sigma_thermal_meas)
+                else:
+                    sigma_thermal_val = _as_float(result.get('noise_sigma_thermal'))
+                    if math.isfinite(sigma_thermal_val):
+                        sigma_thermal_values.append(sigma_thermal_val)
+
+                sigma_flicker_meas = _as_float(result.get('noise_sigma_flicker_measured'))
+                if math.isfinite(sigma_flicker_meas):
+                    sigma_flicker_measured.append(sigma_flicker_meas)
+                    sigma_flicker_values.append(sigma_flicker_meas)
+                else:
+                    sigma_flicker_val = _as_float(result.get('noise_sigma_flicker'))
+                    if math.isfinite(sigma_flicker_val):
+                        sigma_flicker_values.append(sigma_flicker_val)
+
+                sigma_drift_meas = _as_float(result.get('noise_sigma_drift_measured'))
+                if math.isfinite(sigma_drift_meas):
+                    sigma_drift_measured.append(sigma_drift_meas)
+                    sigma_drift_values.append(sigma_drift_meas)
+                else:
+                    sigma_drift_val = _as_float(result.get('noise_sigma_drift'))
+                    if math.isfinite(sigma_drift_val):
+                        sigma_drift_values.append(sigma_drift_val)
+
+                thermal_frac_meas = _as_float(result.get('noise_thermal_fraction_measured'))
+                if math.isfinite(thermal_frac_meas):
+                    thermal_fraction_measured.append(thermal_frac_meas)
+                    thermal_fraction_values.append(thermal_frac_meas)
+                else:
+                    thermal_frac_val = _as_float(result.get('noise_thermal_fraction'))
+                    if math.isfinite(thermal_frac_val):
+                        thermal_fraction_values.append(thermal_frac_val)
+
                 if 'I_dc_used_A' in result:
                     i_dc_values.append(result['I_dc_used_A'])
                 if 'V_g_bias_V_used' in result:
@@ -5832,26 +5886,38 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 except Exception: 
                     pass
         
+        cfg_lod['pipeline'].pop('_collect_noise_components', None)
+
         def _finite_list_median(values):
             arr = np.asarray(values, dtype=float)
             finite = arr[np.isfinite(arr)]
             return float(np.median(finite)) if finite.size else float('nan')
 
         lod_sigma_median = _finite_list_median(sigma_values)
+        lod_sigma_measured = _finite_list_median(sigma_values_measured)
         lod_sigma_thermal = _finite_list_median(sigma_thermal_values)
+        lod_sigma_thermal_measured = _finite_list_median(sigma_thermal_measured)
         lod_sigma_flicker = _finite_list_median(sigma_flicker_values)
+        lod_sigma_flicker_measured = _finite_list_median(sigma_flicker_measured)
         lod_sigma_drift = _finite_list_median(sigma_drift_values)
+        lod_sigma_drift_measured = _finite_list_median(sigma_drift_measured)
         lod_thermal_fraction = _finite_list_median(thermal_fraction_values)
+        lod_thermal_fraction_measured = _finite_list_median(thermal_fraction_measured)
         lod_I_dc = _finite_list_median(i_dc_values)
         lod_V_g_bias = _finite_list_median(v_g_bias_values)
         lod_gm = _finite_list_median(gm_values)
         lod_c_tot = _finite_list_median(c_tot_values)
     else:
         lod_sigma_median = float('nan')
+        lod_sigma_measured = float('nan')
         lod_sigma_thermal = float('nan')
+        lod_sigma_thermal_measured = float('nan')
         lod_sigma_flicker = float('nan')
+        lod_sigma_flicker_measured = float('nan')
         lod_sigma_drift = float('nan')
+        lod_sigma_drift_measured = float('nan')
         lod_thermal_fraction = float('nan')
+        lod_thermal_fraction_measured = float('nan')
         lod_I_dc = float('nan')
         lod_V_g_bias = float('nan')
         lod_gm = float('nan')
@@ -5911,11 +5977,16 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'noise_sigma_flicker': lod_sigma_flicker,
         'noise_sigma_drift': lod_sigma_drift,
         'noise_thermal_fraction': lod_thermal_fraction,
-        'noise_sigma_I_diff_measured': lod_sigma_median,
-        'noise_sigma_thermal_measured': lod_sigma_thermal,
-        'noise_sigma_flicker_measured': lod_sigma_flicker,
-        'noise_sigma_drift_measured': lod_sigma_drift,
-        'noise_thermal_fraction_measured': lod_thermal_fraction,
+        'noise_sigma_I_diff_measured': lod_sigma_measured,
+        'noise_sigma_thermal_measured': lod_sigma_thermal_measured,
+        'noise_sigma_flicker_measured': lod_sigma_flicker_measured,
+        'noise_sigma_drift_measured': lod_sigma_drift_measured,
+        'noise_thermal_fraction_measured': lod_thermal_fraction_measured,
+        'noise_sigma_I_diff_is_measured': bool(math.isfinite(lod_sigma_measured)),
+        'noise_sigma_thermal_is_measured': bool(math.isfinite(lod_sigma_thermal_measured)),
+        'noise_sigma_flicker_is_measured': bool(math.isfinite(lod_sigma_flicker_measured)),
+        'noise_sigma_drift_is_measured': bool(math.isfinite(lod_sigma_drift_measured)),
+        'noise_thermal_fraction_is_measured': bool(math.isfinite(lod_thermal_fraction_measured)),
         'I_dc_used_A': float(lod_I_dc),
         'V_g_bias_V_used': float(lod_V_g_bias),
         'gm_S': float(lod_gm),
