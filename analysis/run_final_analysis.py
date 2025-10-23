@@ -30,6 +30,7 @@ import queue as pyqueue
 import signal
 import subprocess
 import logging
+from statistics import NormalDist
 
 _SYNTHETIC_NOISE_WARNING_SHOWN = False
 
@@ -669,6 +670,80 @@ MAX_CACHE_SIZE = 50
 
 calibration_cache: Dict[str, Dict[str, Union[float, List[float], str]]] = {}
 
+_CACHE_STRIP_TOPLEVEL_KEYS: Set[str] = {
+    'disable_progress',
+    'progress',
+    'verbose',
+    '_resume_active',
+    '_lod_eval_trace',
+    'lod_trace',
+    'actual_progress',
+    'skipped_reason',
+    'full_seeds',
+    '_warm_lod_guess',
+    '_warm_bracket_min',
+    '_warm_bracket_max',
+    '_sanitized_distance_freeze_cache',
+    '_sanitized_freeze_cache',
+}
+
+_CACHE_STRIP_PIPELINE_KEYS: Set[str] = {
+    'random_seed',
+    'show_progress',
+    'progress_label',
+    'lod_trace',
+    '_warm_lod_guess',
+    '_warm_bracket_min',
+    '_warm_bracket_max',
+    '_lod_eval_trace',
+    '_sanitized_distance_freeze_cache',
+    '_sanitized_freeze_cache',
+}
+
+_CACHE_STRIP_DETECTION_KEYS: Set[str] = {
+    'decision_window_policy_runtime',
+    'decision_window_runtime_s',
+}
+
+
+def _stable_cache_token(value: Any) -> str:
+    """Return a deterministic string token for cache hashing."""
+    if isinstance(value, dict):
+        items = (f"{k}:{_stable_cache_token(value[k])}" for k in sorted(value))
+        return "{" + ",".join(items) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable_cache_token(v) for v in value) + "]"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Inf" if value > 0 else "-Inf"
+        return f"{value:.12g}"
+    if isinstance(value, (int, bool)):
+        return str(int(value)) if isinstance(value, bool) else str(value)
+    if value is None:
+        return "None"
+    return str(value)
+
+
+def _prepare_cfg_for_threshold_cache(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip run-only flags so logically equivalent configs share cache keys."""
+    for key in list(_CACHE_STRIP_TOPLEVEL_KEYS):
+        cfg.pop(key, None)
+
+    pipeline = cfg.get('pipeline')
+    if isinstance(pipeline, dict):
+        for key in list(_CACHE_STRIP_PIPELINE_KEYS):
+            pipeline.pop(key, None)
+
+    detection = cfg.get('detection')
+    if isinstance(detection, dict):
+        for key in list(_CACHE_STRIP_DETECTION_KEYS):
+            detection.pop(key, None)
+
+    return cfg
+
+
 def get_cache_key(cfg: Dict[str, Any]) -> str:
     def _nt_pair_fp(cfg: Dict[str, Any]) -> str:
         # compact hash of the DA/SERO parameter tuples so cache respects pair identity
@@ -714,7 +789,8 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
         cfg['pipeline'].get('csk_combiner', 'zscore'),
         cfg['pipeline'].get('csk_leakage_frac', 0.0),
     ]
-    return str(hash(tuple(str(p) for p in key_params)))
+    token = "::".join(_stable_cache_token(p) for p in key_params)
+    return hashlib.sha1(token.encode('utf-8')).hexdigest()
 
 def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     """
@@ -1406,6 +1482,7 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     pipeline_clean = cfg_clean.setdefault('pipeline', {})
     pipeline_clean.pop('_frozen_noise', None)
     cfg_clean.pop('_prefer_distance_freeze', None)
+    cfg_clean = _prepare_cfg_for_threshold_cache(cfg_clean)
     cfg = cfg_clean
 
     cache_key = get_cache_key(cfg)
@@ -2390,6 +2467,322 @@ def _value_key(v):
     """
     return canonical_value_key(v)
 
+
+def _cached_sanitized_freeze_payload(cfg_root: Dict[str, Any],
+                                     param_name: str,
+                                     param_value: Union[float, int],
+                                     payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a cached sanitized noise payload for the given parameter value."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    cache_root = cfg_root.setdefault('_sanitized_freeze_cache', {})
+    param_cache = cache_root.setdefault(param_name, {})
+    key = _value_key(param_value)
+    if key in param_cache:
+        cached = param_cache[key]
+        return deepcopy(cached) if cached is not None else None
+    sanitized = _sanitize_frozen_noise_payload(payload)
+    param_cache[key] = deepcopy(sanitized) if sanitized else None
+    return deepcopy(sanitized) if sanitized else None
+
+
+def _get_distance_freeze_payload(cfg_root: Dict[str, Any],
+                                 distance_um: float) -> Optional[Dict[str, Any]]:
+    """Fetch a sanitized distance-based freeze payload with caching."""
+    noise_distance_map = cfg_root.get('_noise_freeze_distance_map', {})
+    if not isinstance(noise_distance_map, dict):
+        return None
+    payload = noise_distance_map.get(_value_key(float(distance_um)))
+    return _cached_sanitized_freeze_payload(cfg_root, "pipeline.distance_um", float(distance_um), payload)
+
+
+def _sanitize_thresholds_for_resume(th: Dict[str, Any]) -> Dict[str, Any]:
+    clean: Dict[str, Any] = {}
+    for key, value in th.items():
+        if key in ('_calibration_trace', '__meta__'):
+            continue
+        clean[key] = value
+    return clean
+
+
+def _float_close(a: float, b: float, rel: float = 1e-8, abs_tol: float = 1e-12) -> bool:
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    if math.isinf(a) or math.isinf(b):
+        return a == b
+    return abs(a - b) <= max(abs_tol, rel * max(abs(a), abs(b), 1.0))
+
+
+def _derive_hds_nm_values(lod_entry: Optional[Dict[str, Any]],
+                          lod_state: Optional[Dict[str, Any]],
+                          default_nm_values: Sequence[Union[int, float]],
+                          nm_min_default: int,
+                          nm_max_default: int) -> List[int]:
+    candidates: Set[int] = {max(50, int(float(v))) for v in default_nm_values if float(v) > 0}
+    nm_min = nm_min_default
+    nm_max = nm_max_default
+
+    if lod_state:
+        try:
+            nm_min_state = int(float(lod_state.get("nm_min", nm_min_default)))
+            nm_min = max(nm_min, nm_min_state)
+        except Exception:
+            pass
+        try:
+            nm_max_state = int(float(lod_state.get("nm_max", nm_max_default)))
+            nm_max = min(nm_max, nm_max_state)
+        except Exception:
+            pass
+        tested = lod_state.get("tested", {})
+        if isinstance(tested, dict):
+            for key in tested.keys():
+                try:
+                    candidates.add(max(50, int(float(key))))
+                except Exception:
+                    continue
+
+    lod_nm_val = None
+    if lod_entry and math.isfinite(float(lod_entry.get("lod_nm", float("nan")))):
+        lod_nm_val = max(50, int(float(lod_entry["lod_nm"])))
+        rel_steps = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+        for ratio in rel_steps:
+            nm = int(max(50, round(lod_nm_val * ratio)))
+            candidates.add(nm)
+
+    filtered = [nm for nm in candidates if nm_min <= nm <= nm_max]
+    if not filtered:
+        filtered = [nm for nm in candidates if nm_min_default <= nm <= nm_max_default]
+    filtered_sorted = sorted(set(filtered))
+
+    if len(filtered_sorted) > 18:
+        step = max(1, len(filtered_sorted) // 18)
+        filtered_sorted = filtered_sorted[::step]
+
+    return filtered_sorted
+
+
+def _replay_hds_from_lod_cache(dist_um: float,
+                               cfg_base: Dict[str, Any],
+                               nm_values: Sequence[int],
+                               seeds: Sequence[int],
+                               cache_tag: Optional[str]) -> Optional[pd.DataFrame]:
+    if not nm_values or not seeds:
+        return None
+
+    mode = cfg_base.get('pipeline', {}).get('modulation', '')
+    if mode != 'Hybrid':
+        return None
+
+    use_ctrl = bool(cfg_base.get('pipeline', {}).get('use_control_channel', True))
+    Ts_expected = float(cfg_base.get('pipeline', {}).get('symbol_period_s', float('nan')))
+    window_expected = float(cfg_base.get('detection', {}).get('decision_window_s', float('nan')))
+    baseline_expected = str(cfg_base.get('pipeline', {}).get('calibration_baseline_id', '') or '')
+    seq_len_expected = int(cfg_base.get('pipeline', {}).get('sequence_length', 0))
+
+    cache_candidates: List[Optional[str]] = []
+    if cache_tag:
+        base_tag = cache_tag[:-4] if cache_tag.endswith('_hds') else cache_tag
+        cache_candidates.append(base_tag)
+        if base_tag != cache_tag:
+            cache_candidates.append(cache_tag)
+    cache_candidates.append(f"d{int(dist_um)}um")
+    if None not in cache_candidates:
+        cache_candidates.append(None)
+
+    rows: List[Dict[str, Any]] = []
+
+    for nm in nm_values:
+        seed_payloads: Optional[List[Dict[str, Any]]] = None
+        for tag in cache_candidates:
+            candidate_payloads: List[Dict[str, Any]] = []
+            for seed in seeds:
+                payload = read_seed_cache(mode, "lod_search", nm, seed, use_ctrl, cache_tag=tag)
+                if payload is None:
+                    candidate_payloads = []
+                    break
+
+                Ts_cache = payload.get('symbol_period_s')
+                if math.isfinite(Ts_expected) and Ts_cache is not None and math.isfinite(float(Ts_cache)):
+                    if not _float_close(float(Ts_cache), Ts_expected):
+                        candidate_payloads = []
+                        break
+
+                window_cache = payload.get('decision_window_s')
+                if math.isfinite(window_expected) and window_cache is not None and math.isfinite(float(window_cache)):
+                    if not _float_close(float(window_cache), window_expected):
+                        candidate_payloads = []
+                        break
+
+                baseline_cache = payload.get('calibration_baseline_id')
+                if baseline_expected:
+                    if str(baseline_cache or '') != baseline_expected:
+                        candidate_payloads = []
+                        break
+
+                candidate_payloads.append(payload)
+
+            if candidate_payloads:
+                seed_payloads = candidate_payloads
+                break
+
+        if seed_payloads is None:
+            return None
+
+        seq_lengths = [int(p.get('sequence_length', 0)) for p in seed_payloads]
+        total_symbols = sum(seq_lengths)
+        expected_seq_len = seq_len_expected or (seq_lengths[0] if seq_lengths else 0)
+        min_symbols_required = max(expected_seq_len * len(seeds), len(seeds) * 100)
+        if total_symbols < max(min_symbols_required, expected_seq_len):
+            return None
+
+        total_errors = sum(int(p.get('errors', 0)) for p in seed_payloads)
+        ser = total_errors / total_symbols if total_symbols > 0 else float('nan')
+
+        mosk_errors = sum(int(p.get('subsymbol_errors', {}).get('mosk', 0)) for p in seed_payloads)
+        csk_errors = sum(int(p.get('subsymbol_errors', {}).get('csk', 0)) for p in seed_payloads)
+        mosk_ser = mosk_errors / total_symbols if total_symbols > 0 else float('nan')
+        csk_ser = csk_errors / total_symbols if total_symbols > 0 else float('nan')
+
+        mosk_correct_total = sum(int(p.get('n_mosk_correct', 0)) for p in seed_payloads)
+        if mosk_correct_total <= 0 and total_symbols > 0:
+            mosk_correct_total = max(total_symbols - mosk_errors, 0)
+
+        conditional_csk_ser = csk_errors / mosk_correct_total if mosk_correct_total > 0 else 0.0
+        mosk_exposure_frac = mosk_correct_total / total_symbols if total_symbols > 0 else 0.0
+
+        mosk_error_pct = (mosk_errors / total_symbols * 100.0) if total_symbols > 0 else float('nan')
+        csk_error_pct = (csk_errors / total_symbols * 100.0) if total_symbols > 0 else float('nan')
+        hybrid_error_pct = ((mosk_errors + csk_errors) / total_symbols * 100.0) if total_symbols > 0 else float('nan')
+
+        bits_per_symbol_csk_branch = float(math.log2(max(cfg_base.get('pipeline', {}).get('csk_levels', 4), 2)))
+        if total_symbols > 0:
+            bits_mosk_realized = (total_symbols - mosk_errors) / total_symbols
+            bits_csk_realized = ((mosk_correct_total - csk_errors) / total_symbols) * bits_per_symbol_csk_branch
+        else:
+            bits_mosk_realized = float('nan')
+            bits_csk_realized = float('nan')
+        bits_total = bits_mosk_realized + bits_csk_realized if (math.isfinite(bits_mosk_realized) and math.isfinite(bits_csk_realized)) else float('nan')
+
+        ci_low, ci_high = _wilson_interval(total_errors, total_symbols, z=1.96) if total_symbols > 0 else (float('nan'), float('nan'))
+
+        detector_mode = str(next((p.get('detector_mode') for p in seed_payloads if p.get('detector_mode')), cfg_base.get('pipeline', {}).get('detector_mode', 'zscore'))).lower()
+        baseline_ids = {str(p.get('calibration_baseline_id', '')).strip() for p in seed_payloads if p.get('calibration_baseline_id')}
+        if baseline_expected:
+            baseline_ids.add(baseline_expected)
+
+        first_payload = seed_payloads[0]
+        ctrl_auto = bool(first_payload.get('ctrl_auto_applied', cfg_base.get('_ctrl_auto', False)))
+        rho_cc_measured = first_payload.get('rho_cc_measured')
+        burst_shape = cfg_base.get('pipeline', {}).get('burst_shape', '')
+        t_release_ms = first_payload.get('T_release_ms', float('nan'))
+
+        row: Dict[str, Any] = {
+            'pipeline.Nm_per_symbol': float(nm),
+            'Nm_per_symbol': float(nm),
+            'ser': float(ser),
+            'ser_ci_low': float(ci_low),
+            'ser_ci_high': float(ci_high),
+            'num_runs': len(seed_payloads),
+            'symbols_evaluated': int(total_symbols),
+            'sequence_length': int(expected_seq_len or (seq_lengths[0] if seq_lengths else 0)),
+            'distance_um': float(dist_um),
+            'use_ctrl': use_ctrl,
+            'mode': mode,
+            'detector_mode': detector_mode,
+            'snr_db': float('nan'),
+            'snr_semantics': "MoSK contrast statistic (sign-aware DA vs SERO)" if mode in ("MoSK", "Hybrid") else "CSK Q-statistic (dual-channel combiner)",
+            'symbol_period_s': float(Ts_expected),
+            'decision_window_s': float(window_expected),
+            'mosk_ser': float(mosk_ser),
+            'csk_ser': float(csk_ser),
+            'csk_ser_cond': float(conditional_csk_ser),
+            'conditional_csk_ser': float(conditional_csk_ser),
+            'csk_ser_eff': float(conditional_csk_ser * mosk_exposure_frac),
+            'mosk_exposure_frac': float(mosk_exposure_frac),
+            'mosk_correct_total': int(mosk_correct_total),
+            'csk_exposure_rate': float(mosk_exposure_frac),
+            'conditional_csk_error_given_exposure': float(conditional_csk_ser),
+            'mosk_error_pct': float(mosk_error_pct),
+            'csk_error_pct': float(csk_error_pct),
+            'hybrid_total_error_pct': float(hybrid_error_pct),
+            'hybrid_bits_per_symbol_mosk': float(bits_mosk_realized),
+            'hybrid_bits_per_symbol_csk': float(bits_csk_realized),
+            'hybrid_bits_per_symbol_total': float(bits_total),
+            'rho_cc': float(cfg_base.get('noise', {}).get('rho_between_channels_after_ctrl', cfg_base.get('pipeline', {}).get('rho_cc', 0.0))),
+            'rho_cc_measured': float(rho_cc_measured) if rho_cc_measured is not None else float('nan'),
+            'ctrl_auto_applied': ctrl_auto,
+            'calibration_frozen': any(bool(p.get('calibration_frozen', False)) for p in seed_payloads),
+            'calibration_baseline_id': next(iter(baseline_ids)) if baseline_ids else '',
+            'calibration_baseline_param': '',
+            'calibration_baseline_value': float('nan'),
+            'burst_shape': burst_shape,
+            'T_release_ms': float(t_release_ms) if t_release_ms is not None else float('nan'),
+            'source': 'lod_cache_replay',
+            'data_source': 'lod_cache_replay',
+        }
+
+        rows.append(row)
+
+    return pd.DataFrame(rows) if rows else None
+
+
+def _compute_hds_distance(dist_um: float,
+                          cfg_base: Dict[str, Any],
+                          nm_values: Sequence[int],
+                          seeds: Sequence[int],
+                          progress_mode: str,
+                          resume: bool,
+                          debug_calibration: bool,
+                          cache_tag: str) -> Optional[pd.DataFrame]:
+    cfg_d = deepcopy(cfg_base)
+    cfg_d['pipeline']['distance_um'] = float(dist_um)
+
+    try:
+        Ts = calculate_dynamic_symbol_period(float(dist_um), cfg_d)
+        cfg_d['pipeline']['symbol_period_s'] = Ts
+        min_win = _enforce_min_window(cfg_d, Ts)
+        cfg_d['pipeline']['time_window_s'] = max(cfg_d['pipeline'].get('time_window_s', 0.0), min_win)
+        cfg_d.setdefault('detection', {})
+        cfg_d['detection']['decision_window_s'] = min_win
+    except Exception:
+        pass
+
+    freeze_payload = _get_distance_freeze_payload(cfg_base, float(dist_um))
+    if freeze_payload:
+        cfg_d['pipeline']['_frozen_noise'] = deepcopy(freeze_payload)
+        cfg_d['_prefer_distance_freeze'] = True
+    else:
+        cfg_d['pipeline'].pop('_frozen_noise', None)
+        cfg_d.pop('_prefer_distance_freeze', None)
+
+    if not nm_values:
+        return None
+
+    # Attempt cache replay from LoD seed results first
+    replay_df = _replay_hds_from_lod_cache(dist_um, cfg_d, nm_values, seeds, cache_tag)
+    if replay_df is not None:
+        return replay_df
+
+    df_d = run_sweep(
+        cfg_d,
+        list(seeds),
+        'pipeline.Nm_per_symbol',
+        [float(n) for n in nm_values],
+        f"HDS grid Hybrid (d={int(dist_um)} um)",
+        progress_mode=progress_mode,
+        persist_csv=None,
+        resume=resume,
+        debug_calibration=debug_calibration,
+        cache_tag=cache_tag,
+    )
+
+    if df_d.empty:
+        return None
+
+    df_d = df_d.copy()
+    df_d['distance_um'] = float(dist_um)
+    return df_d
+
 def _auto_refine_nm_points_from_df(df: pd.DataFrame,
                                    target: float = 0.01,
                                    extra_points: int = 2,
@@ -2495,6 +2888,18 @@ def _deterministic_screen(k: int, n_done: int, n_total_planned: int, target: flo
     # Worst-case final SER if all remaining are wrong
     p_worst = (k + (n_total_planned - n_done)) / n_total_planned
     return (p_worst < target, p_best > target)
+
+
+def _wilson_interval(k: int, n: int, z: float) -> Tuple[float, float]:
+    """Wilson score interval for Bernoulli proportion with normal quantile z."""
+    if n <= 0:
+        return (0.0, 1.0)
+    p_hat = k / n
+    z2_over_n = (z * z) / n
+    denom = 1.0 + z2_over_n
+    center = (p_hat + z2_over_n / 2.0) / denom
+    rad = z * math.sqrt((p_hat * (1.0 - p_hat) / n) + (z2_over_n / (4.0 * n))) / denom
+    return (max(0.0, center - rad), min(1.0, center + rad))
 
 def seed_cache_path(mode: str, sweep: str, value: Union[float, int], seed: int, 
                     use_ctrl: Optional[bool] = None, cache_tag: Optional[str] = None) -> Path:
@@ -3741,7 +4146,7 @@ def run_param_seed_combo(cfg_base: Dict[str, Any], param_name: str,
             pass
         else:
             if isinstance(payload, dict) and payload:
-                sanitized_payload = _sanitize_frozen_noise_payload(payload)
+                sanitized_payload = _cached_sanitized_freeze_payload(cfg_base, param_name, param_value, payload)
                 if sanitized_payload:
                     pipeline['_frozen_noise'] = sanitized_payload
                     expect_frozen_noise = True
@@ -4773,18 +5178,316 @@ def _validate_and_fix_bracket(cfg_base: Dict[str, Any], nm_min: int, nm_max: int
 
     return nm_min, nm_max, None
 
+
+def _default_bracket_from_guess(guess_nm: float,
+                                distance_um: float,
+                                nm_min: int,
+                                nm_max: int) -> Tuple[int, int]:
+    """Generate a conservative bracket around an Nm guess for the next LoD search."""
+    if not math.isfinite(guess_nm) or guess_nm <= 0:
+        return (nm_min, nm_max)
+    if distance_um >= 175:
+        lower_mult, upper_mult = 0.45, 1.85
+    elif distance_um >= 125:
+        lower_mult, upper_mult = 0.5, 1.7
+    elif distance_um >= 75:
+        lower_mult, upper_mult = 0.55, 1.55
+    else:
+        lower_mult, upper_mult = 0.6, 1.45
+    lower = max(nm_min, max(50, int(guess_nm * lower_mult)))
+    upper = min(nm_max, max(lower + 1, int(guess_nm * upper_mult)))
+    return (lower, upper)
+
+
+def _predict_lod_from_history(distance_um: float,
+                              history_points: Sequence[Dict[str, Any]],
+                              target_ser: float,
+                              nm_min: int,
+                              nm_max: int) -> Tuple[Optional[float], Optional[Tuple[int, int]]]:
+    """
+    Fit a simple log-linear model using historical (distance, Nm, SER) samples
+    to predict the Nm required to hit the target SER at the requested distance.
+    Returns (nm_guess, (nm_lower, nm_upper)) or (None, None) when insufficient data.
+    """
+    candidates: List[Tuple[float, float, float, float]] = []
+    for entry in history_points:
+        try:
+            d_val = float(entry.get("distance_um", float("nan")))
+            nm_val = float(entry.get("nm", 0.0))
+            ser_val = float(entry.get("ser", float("nan")))
+            n_seen = float(entry.get("n_seen", entry.get("samples", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(d_val) and math.isfinite(nm_val) and math.isfinite(ser_val)):
+            continue
+        if d_val <= 0 or nm_val <= 0:
+            continue
+        if ser_val <= 0.0:
+            ser_val = 1e-6
+        if ser_val >= 0.6:
+            continue  # skip very loose points that provide little slope info
+        candidates.append((d_val, nm_val, ser_val, max(n_seen, 1.0)))
+
+    if len(candidates) < 3:
+        return (None, None)
+
+    # Prepare weighted least squares to favour samples with more observations
+    X_rows: List[List[float]] = []
+    y_vals: List[float] = []
+    for d_val, nm_val, ser_val, n_seen in candidates:
+        weight = math.sqrt(max(n_seen, 1.0))
+        log_nm = math.log(nm_val)
+        log_ser = math.log(max(ser_val, 1e-6))
+        X_rows.append([weight, weight * log_nm, weight * d_val])
+        y_vals.append(weight * log_ser)
+
+    X = np.array(X_rows, dtype=float)
+    y = np.array(y_vals, dtype=float)
+
+    try:
+        beta, residuals, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return (None, None)
+
+    if rank < 3:
+        return (None, None)
+
+    a, b, c = (float(beta[0]), float(beta[1]), float(beta[2]))
+    if not math.isfinite(b) or abs(b) < 1e-4 or b >= 0:
+        return (None, None)
+
+    log_target = math.log(max(target_ser, 1e-6))
+    log_nm = (log_target - a - c * distance_um) / b
+    if not math.isfinite(log_nm):
+        return (None, None)
+    nm_guess = math.exp(log_nm)
+    nm_guess = max(float(nm_min), min(float(nm_max), nm_guess))
+
+    # Estimate residual spread in log-space
+    if residuals.size > 0 and len(candidates) > 3:
+        dof = max(len(candidates) - 3, 1)
+        sigma = math.sqrt(max(residuals[0] / dof, 1e-10))
+    else:
+        fitted = X @ beta
+        residual_vec = y - fitted
+        sigma = math.sqrt(max(float(np.mean(residual_vec ** 2)), 1e-10))
+
+    delta_log_nm = sigma / max(abs(b), 1e-4)
+    safety = max(delta_log_nm * 1.75, math.log(1.4))
+    lower = int(max(nm_min, max(50.0, math.exp(log_nm - safety))))
+    upper = int(min(nm_max, max(lower + 1, math.exp(log_nm + safety))))
+
+    # Ensure monotonic consistency with nearest neighbours
+    below = [nm for d, nm, ser, _ in candidates if d <= distance_um and ser <= target_ser * 1.5]
+    above = [nm for d, nm, ser, _ in candidates if d >= distance_um and ser >= target_ser * 0.67]
+    if below:
+        lower = max(lower, int(0.75 * max(below)))
+    if above:
+        upper = min(upper, int(1.25 * min(above)))
+        upper = max(upper, lower + 1)
+
+    return (nm_guess, (lower, upper))
+
+
+def _extend_history_with_lod_rows(history: List[Dict[str, Any]],
+                                  df: Optional[pd.DataFrame],
+                                  target_ser: float = 0.01) -> None:
+    """Populate history list with (distance, Nm, SER) samples derived from existing CSV rows."""
+    if df is None or df.empty:
+        return
+    for _, row in df.iterrows():
+        try:
+            dist = float(row.get('distance_um', float('nan')))
+            nm_val = float(row.get('lod_nm', float('nan')))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(dist) and math.isfinite(nm_val)):
+            continue
+        if nm_val <= 0 or dist <= 0:
+            continue
+        ser_val = row.get('ser_at_lod', target_ser)
+        try:
+            ser_val_f = float(ser_val)
+        except (TypeError, ValueError):
+            ser_val_f = target_ser
+        if not math.isfinite(ser_val_f) or ser_val_f <= 0:
+            ser_val_f = target_ser
+        samples = row.get('symbols_evaluated')
+        try:
+            n_seen = float(samples) if samples is not None else 0.0
+        except (TypeError, ValueError):
+            n_seen = 0.0
+        history.append({
+            "distance_um": dist,
+            "nm": nm_val,
+            "ser": max(ser_val_f, 1e-6),
+            "n_seen": max(n_seen, 1.0),
+            "source": "lod_csv",
+        })
+
+
+def _normalize_lod_trace_entries(distance_um: float,
+                                 entries: Sequence[Dict[str, Any]],
+                                 default_target: float = 0.01) -> List[Dict[str, Any]]:
+    """Normalize raw trace entries into a consistent schema for persistence/regression."""
+    normalized: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            nm_val = float(entry.get("nm", float("nan")))
+            ser_val = float(entry.get("ser", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(nm_val) and math.isfinite(ser_val)):
+            continue
+        if nm_val <= 0:
+            continue
+        try:
+            n_seen = float(entry.get("n_seen", entry.get("samples", 0.0)))
+        except (TypeError, ValueError):
+            n_seen = 0.0
+        try:
+            k_err = float(entry.get("k_err", 0.0))
+        except (TypeError, ValueError):
+            k_err = 0.0
+        timestamp = entry.get("timestamp", time.time())
+        try:
+            timestamp_f = float(timestamp)
+        except (TypeError, ValueError):
+            timestamp_f = time.time()
+        normalized.append({
+            "distance_um": float(distance_um),
+            "nm": nm_val,
+            "ser": max(ser_val, 1e-6),
+            "n_seen": max(n_seen, 0.0),
+            "k_err": max(k_err, 0.0),
+            "phase": str(entry.get("phase", "unknown")),
+            "status": str(entry.get("status", "")),
+            "timestamp": timestamp_f,
+            "target_ser": float(entry.get("target_ser", default_target)),
+        })
+    return normalized
+
+
+def _lod_history_cache_path(mode: str, use_ctrl: bool, suffix: str = "") -> Path:
+    ctrl_seg = "wctrl" if use_ctrl else "noctrl"
+    base = project_root / "results" / "cache" / mode.lower() / "lod_history"
+    base.mkdir(parents=True, exist_ok=True)
+    suffix_clean = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in suffix)
+    return base / f"lod_trace_{ctrl_seg}{suffix_clean}.jsonl"
+
+
+def _load_lod_history_cache(mode: str, use_ctrl: bool, suffix: str = "") -> List[Dict[str, Any]]:
+    path = _lod_history_cache_path(mode, use_ctrl, suffix)
+    if not path.exists():
+        return []
+    points: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    points.append(obj)
+    except Exception:
+        return []
+    return points
+
+
+def _append_lod_history_cache(mode: str,
+                              use_ctrl: bool,
+                              suffix: str,
+                              entries: Sequence[Dict[str, Any]]) -> None:
+    if not entries:
+        return
+    path = _lod_history_cache_path(mode, use_ctrl, suffix)
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(_json_safe(entry)) + "\n")
+    except Exception:
+        pass
 def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                      target_ser: float = 0.01,
                      debug_calibration: bool = False,
                      progress_cb: Optional[Any] = None,
                      resume: bool = False,
-                     cache_tag: Optional[str] = None) -> Tuple[Union[int, float], float, int]:
+                     cache_tag: Optional[str] = None) -> Tuple[Union[int, float], float, int, Dict[str, Any]]:
     nm_min = int(cfg_base['pipeline'].get('lod_nm_min', 50))
     # NEW: configurable ceiling with fallback for backward compatibility
     nm_ceiling = int(cfg_base.get('pipeline', {}).get('lod_nm_max', 
                     cfg_base.get('lod_max_nm', 1000000)))
     nm_max = nm_ceiling
     nm_max_default = nm_ceiling
+
+    lod_delta = float(cfg_base.get("_stage13_lod_delta", 1e-4))
+    ci_margin = float(cfg_base.get('_lod_ci_margin', 0.2))
+    ci_margin = min(max(ci_margin, 0.0), 0.9)
+    wilson_delta = max(min(lod_delta, 0.2), 1e-10)
+    try:
+        wilson_z = float(NormalDist().inv_cdf(1.0 - wilson_delta / 2.0))
+        if not math.isfinite(wilson_z) or wilson_z <= 0:
+            wilson_z = 3.0
+    except Exception:
+        wilson_z = 3.0
+
+    cfg_base['_lod_eval_trace'] = []
+    eval_trace: List[Dict[str, Any]] = cfg_base['_lod_eval_trace']
+
+    def _record_trace_entry(nm_value: int,
+                            phase: str,
+                            k_val: int,
+                            n_val: int,
+                            ser_val: float,
+                            seeds_completed: int,
+                            extra: Optional[Dict[str, Any]] = None) -> None:
+        entry: Dict[str, Any] = {
+            "nm": int(nm_value),
+            "phase": phase,
+            "k_err": int(k_val),
+            "n_seen": int(n_val),
+            "ser": float(ser_val),
+            "seeds_completed": int(seeds_completed),
+            "timestamp": time.time(),
+            "distance_um": float(cfg_base['pipeline'].get('distance_um', 0.0)),
+            "target_ser": float(target_ser),
+        }
+        if extra:
+            entry.update(extra)
+        entry.setdefault("status", "pass" if ser_val <= target_ser else "fail")
+        eval_trace.append(entry)
+
+    metrics: Dict[str, Any] = {
+        "calibration_s": 0.0,
+        "simulation_s": 0.0,
+        "downstep_s": 0.0,
+        "overhead_s": 0.0,
+        "seeds_simulated": 0,
+        "iterations": 0,
+    }
+
+    def _final_metrics() -> Dict[str, Any]:
+        metrics["total_s"] = (
+            float(metrics["calibration_s"])
+            + float(metrics["simulation_s"])
+            + float(metrics["overhead_s"])
+        )
+        return metrics
+
+    warm_lower = int(cfg_base.get('_warm_bracket_min', 0))
+    warm_upper = int(cfg_base.get('_warm_bracket_max', 0))
+    if warm_lower > 0:
+        nm_min = max(nm_min, warm_lower)
+    if warm_upper > 0:
+        nm_max = min(nm_max, warm_upper)
+    if nm_min > nm_max:
+        nm_min, nm_max = max(50, nm_min), max(51, nm_min + 1)
 
     if LOD_DEBUG_ENABLED:
         # NOTE: LoD debug instrumentation (remove once diagnostics conclude)
@@ -4881,6 +5584,9 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
     # Track actual progress increments
     progress_count = 0
     
+    # Persisted thresholds across resumes
+    th_cache: Dict[int, Dict[str, Union[float, List[float], str]]] = {}
+    
     # Load prior state if resuming
     state = _lod_state_load(mode_name, float(dist_um), use_ctrl) if resume else None
 
@@ -4906,7 +5612,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                     "distance_um": float(dist_um),
                     "lod_nm": int(lod_nm),
                 })
-            return lod_nm, target_ser, 0
+            return lod_nm, target_ser, 0, _final_metrics()
 
         # 2) Try to reconstruct a sane bracket from per-Nm tallies
         t = state.get("tested", {})
@@ -4939,18 +5645,25 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         # 3) Guard: never continue with an invalid bracket
         if nm_min > nm_max:
             print("    ⚠️  Stale LoD state (nm_min>nm_max). Clearing state and restarting bracket.")
-            _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}})
+            _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}, "th_cache": {}})
             nm_min = cfg_base['pipeline'].get('lod_nm_min', 50)
             nm_max = nm_ceiling
         else:
             print(f"    ↩️  Resuming LoD search @ {dist_um}μm: range {nm_min}-{nm_max}")
+        
+        stored_th = state.get("th_cache")
+        if isinstance(stored_th, dict):
+            for key, payload in stored_th.items():
+                try:
+                    nm_key = int(float(key))
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    th_cache[nm_key] = payload
     
     # Extract CTRL state for debug logging
     ctrl_str = "CTRL" if use_ctrl else "NoCtrl"
 
-    # NEW: Cache thresholds during bisection to reduce calibration overhead
-    th_cache: Dict[int, Dict[str, Union[float, List[float], str]]] = {}  # nm -> thresholds dict
-    
     def _get_th(nm: int):
         if nm in th_cache:
             return th_cache[nm]
@@ -4958,7 +5671,9 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         cfg_tmp['pipeline']['Nm_per_symbol'] = nm
         cfg_tmp.setdefault('pipeline', {}).pop('_frozen_noise', None)
         cfg_tmp.pop('_prefer_distance_freeze', None)
+        t0 = time.perf_counter()
         th = calibrate_thresholds_cached(cfg_tmp, list(range(6)))  # faster with fewer seeds
+        metrics["calibration_s"] += time.perf_counter() - t0
         th_cache[nm] = th
         return th
     
@@ -4968,11 +5683,15 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         cfg_base, nm_min, nm_max, nm_ceiling, target_ser, seeds, cache_tag=tag
     )
 
+    seq_len_full = int(cfg_base['pipeline'].get('sequence_length', 1000))
+    seq_len_min = int(cfg_base.get('_lod_search_seq_min', max(50, seq_len_full // 5)))
+    seq_len_mid = int(cfg_base.get('_lod_search_seq_mid', max(seq_len_min, seq_len_full // 2)))
+
     if skip_reason:
         print(f"    [{dist_um}μm|{ctrl_str}] Skipping LoD search: {skip_reason}")
         # Clear any misleading state when ceiling is exhausted
         if skip_reason == "nm_ceiling_exhausted":
-            _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}})
+            _lod_state_save(mode_name, float(dist_um), use_ctrl, {"tested": {}, "th_cache": {}})
             print(f"    🧹 Cleared LoD state for future runs with higher ceiling")
         if LOD_DEBUG_ENABLED:
             _lod_debug_log({
@@ -4983,7 +5702,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 "nm_max": int(nm_max),
                 "target_ser": float(target_ser),
             })
-        return float('nan'), 1.0, 0
+        return float('nan'), 1.0, 0, _final_metrics()
 
     for iteration in range(20):
         if CANCEL.is_set():
@@ -4995,9 +5714,24 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             break
 
         print(f"    [{dist_um}μm|{ctrl_str}] Testing Nm={nm_mid} (iteration {iteration+1}/20, range: {nm_min}-{nm_max})")
+        iter_start = time.perf_counter()
+        cal_before = metrics["calibration_s"]
+        sim_before = metrics["simulation_s"]
+        bracket_span = max(1, nm_max - nm_min)
+        seq_len_dynamic = seq_len_full
+        close_to_target = best_ser <= target_ser * 1.5
+        if not close_to_target:
+            if iteration < 2 and bracket_span > nm_mid:
+                seq_len_dynamic = seq_len_min
+            elif bracket_span > max(nm_mid // 2, 25):
+                seq_len_dynamic = seq_len_mid
+        if close_to_target or bracket_span <= max(10, nm_mid // 3):
+            seq_len_dynamic = seq_len_full
+        seq_len_dynamic = max(seq_len_min, min(seq_len_full, seq_len_dynamic))
 
         cfg_test = deepcopy(cfg_base)
         cfg_test['pipeline']['Nm_per_symbol'] = nm_mid
+        cfg_test['pipeline']['sequence_length'] = int(seq_len_dynamic)
 
         # Apply cached thresholds for the current test point
         _apply_thresholds_into_cfg(cfg_test, _get_th(nm_mid))
@@ -5007,6 +5741,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         k_err = 0
         n_seen = 0
         seq_len = int(cfg_test['pipeline']['sequence_length'])
+        total_planned = len(seeds) * seq_len
         tested_nm = {}
         if state and "tested" in state and str(nm_mid) in state["tested"]:
             tested_nm = state["tested"][str(nm_mid)]
@@ -5034,7 +5769,8 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             k_err = int(tested_nm.get("k_err", 0))
             n_seen = int(tested_nm.get("n_seen", 0))
         
-        delta = float(cfg_base.get("_stage13_lod_delta", 1e-4))
+        delta_conf = lod_delta
+        total_planned = len(seeds) * seq_len if seq_len > 0 else 0
         
         # loop remaining (non-cached) seeds with screening
         for i, seed in enumerate(seeds):
@@ -5043,15 +5779,18 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 continue
             
             # reuse our generic worker to also persist the per-seed result
+            t_sim_start = time.perf_counter()
             res = run_param_seed_combo(cfg_test, 'pipeline.Nm_per_symbol', nm_mid, seed,
                                        debug_calibration=False,
                                        thresholds_override=_get_th(nm_mid),
                                        sweep_name="lod_search",
                                        cache_tag=cache_tag)
+            metrics["simulation_s"] += time.perf_counter() - t_sim_start
             if res is not None:
                 results.append(res)
                 k_err += int(res.get('errors', 0))
                 n_seen += seq_len
+                metrics["seeds_simulated"] += 1
                 if progress_cb is not None:
                     try: 
                         progress_cb.put_nowait(1)
@@ -5065,20 +5804,31 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                     "tested": {
                         **(state.get("tested", {}) if state else {}),
                         str(nm_mid): {"k_err": k_err, "n_seen": n_seen}
-                    }
+                    },
+                    "th_cache": {
+                        str(k): _sanitize_thresholds_for_resume(th_cache[k])
+                        for k in th_cache
+                    },
                 }
                 _lod_state_save(mode_name, float(dist_um), use_ctrl, checkpoint)
                 
                 # Deterministic screen: if even worst/best remaining cannot cross target
                 decide_below, decide_above = _deterministic_screen(
-                    k_err, n_seen, len(seeds)*seq_len, target_ser
+                    k_err, n_seen, total_planned, target_ser
                 )
                 if decide_below or decide_above:
                     break
-                # Hoeffding bounds: if CI fully below/above target
-                low, high = _hoeffding_bounds(k_err, n_seen, delta=delta)
-                if high < target_ser or low > target_ser:
-                    break
+                if n_seen > 0:
+                    # Variance-aware Wilson interval
+                    wilson_low, wilson_high = _wilson_interval(k_err, n_seen, wilson_z)
+                    margin_low = max(0.0, target_ser * (1.0 - ci_margin))
+                    margin_high = target_ser * (1.0 + ci_margin)
+                    if wilson_high <= margin_low or wilson_low >= margin_high:
+                        break
+                    # Hoeffding bounds: if CI fully below/above target
+                    hoeff_low, hoeff_high = _hoeffding_bounds(k_err, n_seen, delta=delta_conf)
+                    if hoeff_high < target_ser or hoeff_low > target_ser:
+                        break
             # light heartbeat
             if (len(results) % 3) == 0:
                 print(f"      [{dist_um}μm] Nm={nm_mid}: {len(results)}/{len(seeds)} seeds")
@@ -5096,6 +5846,18 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             # No information collected for this Nm; move to higher Nm
             nm_min = nm_mid + 1
             continue
+
+        trace_extra: Dict[str, Any] = {"sequence_length": int(seq_len_dynamic)}
+        if n_seen > 0:
+            w_low, w_high = _wilson_interval(k_err, n_seen, wilson_z)
+            h_low, h_high = _hoeffding_bounds(k_err, n_seen, delta=delta_conf)
+            trace_extra.update({
+                "wilson_low": float(w_low),
+                "wilson_high": float(w_high),
+                "hoeffding_low": float(h_low),
+                "hoeffding_high": float(h_high),
+            })
+        _record_trace_entry(nm_mid, "binary_search", k_err, n_seen, ser, len(results), trace_extra)
 
         if LOD_DEBUG_ENABLED:
             _lod_debug_log({
@@ -5147,62 +5909,95 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 cfg_probe = deepcopy(cfg_base)
                 cfg_probe['pipeline']['Nm_per_symbol'] = nm_probe
                 _apply_thresholds_into_cfg(cfg_probe, _get_th(nm_probe))
+                probe_seq_len = max(seq_len_min, int(max(50, seq_len_dynamic * 0.5)))
+                cfg_probe['pipeline']['sequence_length'] = probe_seq_len
                 
                 for probe_seed in probe_seeds:
                     # Check cache first
                     cached_probe = read_seed_cache(mode_name, "lod_search", nm_probe, probe_seed, use_ctrl, cache_tag=cache_tag)
                     if cached_probe:
                         probe_k_err += int(cached_probe.get('errors', 0))
-                        probe_n_seen += seq_len
+                        probe_n_seen += probe_seq_len
                     else:
                         # Run minimal simulation
+                        t_probe = time.perf_counter()
                         res_probe = run_param_seed_combo(cfg_probe, 'pipeline.Nm_per_symbol', nm_probe, probe_seed,
                                                         debug_calibration=False, thresholds_override=_get_th(nm_probe),
                                                         sweep_name="lod_search", cache_tag=cache_tag)
+                        elapsed_probe = time.perf_counter() - t_probe
+                        metrics["simulation_s"] += elapsed_probe
+                        metrics["downstep_s"] += elapsed_probe
                         if res_probe:
                             probe_k_err += int(res_probe.get('errors', 0))
-                            probe_n_seen += seq_len
+                            probe_n_seen += probe_seq_len
+                            metrics["seeds_simulated"] += 1
                     
                     # Early deterministic screen after each seed
-                    total_planned = len(probe_seeds) * seq_len
+                    total_planned = len(probe_seeds) * probe_seq_len
                     decide_below, decide_above = _deterministic_screen(probe_k_err, probe_n_seen, total_planned, target_ser)
-                    if decide_below:
-                        # Probe passes! Skip bisection iterations
+                    if decide_below or decide_above:
                         probe_ser = probe_k_err / probe_n_seen if probe_n_seen > 0 else 1.0
-                        if probe_ser < best_ser:
-                            best_ser = probe_ser
-                            best_nm = nm_probe
-                        print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS → skip to Nm={nm_probe}")
-                        lod_nm = nm_probe
-                        nm_max = nm_probe - 1
-                        if LOD_DEBUG_ENABLED:
-                            _lod_debug_log({
-                                "phase": "lod_downstep_success",
-                                "distance_um": float(dist_um),
-                                "nm_probe": int(nm_probe),
-                                "probe_ser": float(probe_ser),
-                                "probe_k_err": int(probe_k_err),
-                                "probe_n_seen": int(probe_n_seen),
+                        trace_flag = "success" if decide_below else "fail"
+                        trace_extra_probe = {"status": trace_flag, "sequence_length": int(probe_seq_len)}
+                        if probe_n_seen > 0:
+                            w_low_p, w_high_p = _wilson_interval(probe_k_err, probe_n_seen, wilson_z)
+                            h_low_p, h_high_p = _hoeffding_bounds(probe_k_err, probe_n_seen, delta=delta_conf)
+                            trace_extra_probe.update({
+                                "wilson_low": float(w_low_p),
+                                "wilson_high": float(w_high_p),
+                                "hoeffding_low": float(h_low_p),
+                                "hoeffding_high": float(h_high_p),
                             })
+                        _record_trace_entry(nm_probe, "downstep_probe", probe_k_err, probe_n_seen,
+                                            probe_ser, len(probe_seeds), trace_extra_probe)
+
+                        if decide_below:
+                            # Probe passes! Skip bisection iterations
+                            if probe_ser < best_ser:
+                                best_ser = probe_ser
+                                best_nm = nm_probe
+                            print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS → skip to Nm={nm_probe}")
+                            lod_nm = nm_probe
+                            nm_max = nm_probe - 1
+                            if LOD_DEBUG_ENABLED:
+                                _lod_debug_log({
+                                    "phase": "lod_downstep_success",
+                                    "distance_um": float(dist_um),
+                                    "nm_probe": int(nm_probe),
+                                    "probe_ser": float(probe_ser),
+                                    "probe_k_err": int(probe_k_err),
+                                    "probe_n_seen": int(probe_n_seen),
+                                })
+                        else:
+                            # Probe fails decisively, stick with original nm_mid
+                            print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL → continue bisection")
+                            if LOD_DEBUG_ENABLED:
+                                _lod_debug_log({
+                                    "phase": "lod_downstep_fail",
+                                    "distance_um": float(dist_um),
+                                    "nm_probe": int(nm_probe),
+                                    "probe_ser": float(probe_ser),
+                                    "probe_k_err": int(probe_k_err),
+                                    "probe_n_seen": int(probe_n_seen),
+                                })
                         progress_count += len(probe_seeds)  # Count probe work
-                        break
-                    elif decide_above:
-                        # Probe fails decisively, stick with original nm_mid
-                        print(f"      [{dist_um}μm|{ctrl_str}] ✗ Down-step probe FAIL → continue bisection")
-                        if LOD_DEBUG_ENABLED:
-                            _lod_debug_log({
-                                "phase": "lod_downstep_fail",
-                                "distance_um": float(dist_um),
-                                "nm_probe": int(nm_probe),
-                                "probe_k_err": int(probe_k_err),
-                                "probe_n_seen": int(probe_n_seen),
-                            })
-                        progress_count += len(probe_seeds)  # Count probe work  
                         break
                 else:
                     # All probe seeds completed, check final SER
                     if probe_n_seen > 0:
                         probe_ser = probe_k_err / probe_n_seen
+                        trace_extra_probe = {"status": "success" if probe_ser <= target_ser else "fail",
+                                             "sequence_length": int(probe_seq_len)}
+                        w_low_p, w_high_p = _wilson_interval(probe_k_err, probe_n_seen, wilson_z)
+                        h_low_p, h_high_p = _hoeffding_bounds(probe_k_err, probe_n_seen, delta=delta_conf)
+                        trace_extra_probe.update({
+                            "wilson_low": float(w_low_p),
+                            "wilson_high": float(w_high_p),
+                            "hoeffding_low": float(h_low_p),
+                            "hoeffding_high": float(h_high_p),
+                        })
+                        _record_trace_entry(nm_probe, "downstep_probe", probe_k_err, probe_n_seen,
+                                            probe_ser, len(probe_seeds), trace_extra_probe)
                         if probe_ser <= target_ser:
                             print(f"      [{dist_um}μm|{ctrl_str}] ✓ Down-step probe SUCCESS (SER={probe_ser:.4f}) → skip to Nm={nm_probe}")
                             lod_nm = nm_probe
@@ -5243,13 +6038,22 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                     "nm_max": int(nm_max),
                 })
             
+        iter_elapsed = time.perf_counter() - iter_start
+        used_cal = metrics["calibration_s"] - cal_before
+        used_sim = metrics["simulation_s"] - sim_before
+        metrics["overhead_s"] += max(0.0, iter_elapsed - max(0.0, used_cal) - max(0.0, used_sim))
+        metrics["iterations"] += 1
         # Count each binary search iteration
         progress_count += 1
         
         # persist bounds after each iteration
         _lod_state_save(mode_name, float(dist_um), use_ctrl,
                         {"nm_min": nm_min, "nm_max": nm_max, "iteration": iteration,
-                         "last_nm": nm_mid})
+                         "last_nm": nm_mid,
+                         "th_cache": {
+                             str(k): _sanitize_thresholds_for_resume(th_cache[k])
+                             for k in th_cache
+                         }})
         if LOD_DEBUG_ENABLED:
             _lod_debug_log({
                 "phase": "lod_iteration_bounds",
@@ -5298,6 +6102,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
             print(f"    [{dist_um}μm|{ctrl_str}] Validation capped at {max_validation_seeds}/{len(seeds)} seeds")
 
         results2: List[Dict[str, Any]] = []
+        validation_start = time.perf_counter()
         for i, sd in enumerate(validation_seeds):
             cfg_run2 = deepcopy(cfg_final)
             cfg_run2['pipeline']['random_seed'] = sd
@@ -5325,10 +6130,24 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                         print(f"    [{dist_um}μm|{ctrl_str}] Early validation success after {len(results2)} seeds (SER={interim_ser:.4f})")
                         break
 
+        validation_time = time.perf_counter() - validation_start
+
         if results2:
             total_symbols = len(results2) * cfg_final['pipeline']['sequence_length']
             total_errors = sum(cast(int, r['errors']) for r in results2)
             final_ser = total_errors / total_symbols if total_symbols > 0 else 1.0
+            _record_trace_entry(
+                int(lod_nm),
+                "validation_summary",
+                int(total_errors),
+                int(total_symbols),
+                float(final_ser),
+                len(results2),
+                {
+                    "status": "pass" if final_ser <= target_ser else "fail",
+                    "validation_time_s": float(validation_time),
+                },
+            )
             if final_ser <= target_ser:
                 # Track actual progress - binary search iterations + final check seeds + overhead
                 actual_progress = 20 + len(seeds) + 5  # max 20 iterations + validation seeds + overhead
@@ -5340,7 +6159,7 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                         "final_ser": float(final_ser),
                         "validation_seeds": len(results2),
                     })
-                return nm_min, final_ser, actual_progress
+                return nm_min, final_ser, actual_progress, _final_metrics()
 
     # Return best attempt if no solution found, otherwise return found solution
     final_lod_nm = lod_nm if not math.isnan(lod_nm) else float('nan')
@@ -5358,17 +6177,21 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
         })
     
     # Return actual count instead of constant
-    return final_lod_nm, final_ser, progress_count
+    return final_lod_nm, final_ser, progress_count, _final_metrics()
 
 def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
                                         lod_nm: int,
-                                        full_seeds: List[int]) -> Tuple[float, float, float, float]:
+                                        full_seeds: List[int],
+                                        frozen_distance_payload: Optional[Dict[str, Any]] = None) -> Tuple[float, float, float, float]:
     """
     Run one pass at the chosen LoD using the FULL seeds + FULL sequence_length
     to report paper-grade SER and data-rate with 95% CI.
     Returns: (ser_at_lod, data_rate_bps, ci_low, ci_high)
     """
     cfg = deepcopy(cfg_base)
+    distance_um = float(cfg['pipeline'].get('distance_um', cfg_base.get('pipeline', {}).get('distance_um', 0.0)))
+    if frozen_distance_payload is None:
+        frozen_distance_payload = _get_distance_freeze_payload(cfg_base, distance_um)
     # Ensure symbol period and decision window are consistent for this distance
     Ts = calculate_dynamic_symbol_period(float(cfg['pipeline']['distance_um']), cfg)
     cfg['pipeline']['symbol_period_s'] = Ts
@@ -5379,17 +6202,16 @@ def _validate_lod_point_with_full_seeds(cfg_base: Dict[str, Any],
     cfg.setdefault('detection', {})
     cfg['detection']['decision_window_s'] = min_win
 
-    noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
-    if isinstance(noise_distance_map, dict):
-        noise_payload = noise_distance_map.get(_value_key(float(cfg['pipeline']['distance_um'])))
-        frozen_payload = _sanitize_frozen_noise_payload(noise_payload)
-        if frozen_payload:
-            cfg['pipeline']['_frozen_noise'] = frozen_payload
-            cfg['_prefer_distance_freeze'] = True
-        else:
-            cfg['pipeline'].pop('_frozen_noise', None)
-            cfg.pop('_prefer_distance_freeze', None)
-
+    frozen_payload = deepcopy(frozen_distance_payload) if frozen_distance_payload else None
+    if frozen_payload is None:
+        frozen_payload = _get_distance_freeze_payload(cfg_base, distance_um)
+    if frozen_payload:
+        cfg['pipeline']['_frozen_noise'] = frozen_payload
+        cfg['_prefer_distance_freeze'] = True
+    else:
+        cfg['pipeline'].pop('_frozen_noise', None)
+        cfg.pop('_prefer_distance_freeze', None)
+    
     cfg['pipeline']['Nm_per_symbol'] = int(lod_nm)
 
     # NEW: Apply LoD validation sequence length override if specified
@@ -5482,7 +6304,9 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                              debug_calibration: bool = False,
                              progress_cb: Optional[Any] = None,
                              resume: bool = False, args: Optional[Any] = None,
-                             warm_lod_guess: Optional[int] = None) -> Dict[str, Any]:
+                             warm_lod_guess: Optional[int] = None,
+                             warm_bracket: Optional[Tuple[int, int]] = None,
+                             force_analytic_bracket: Optional[bool] = None) -> Dict[str, Any]:
     """
     Process a single distance for LoD calculation.
     Returns dict with lod_nm, ser_at_lod, and data_rate_bps.
@@ -5490,6 +6314,10 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     actual_progress = 0  # Initialize before try block
     skipped_reason = None  # ✅ Initialize skipped_reason variable
     cfg = deepcopy(cfg_base)
+    distance_freeze_payload = _get_distance_freeze_payload(cfg_base, float(dist_um))
+    lod_trace: List[Dict[str, Any]] = []
+    validation_time = 0.0
+    sigma_time = 0.0
     
     # ✅ FIX: Set distance before LoD search and rebuild window consistently
     cfg['pipeline']['distance_um'] = float(dist_um)  # Bake distance into cfg
@@ -5520,20 +6348,12 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             "progress_mode": getattr(args, "progress", None) if args else None,
         })
 
-    noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
-    if isinstance(noise_distance_map, dict):
-        noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
-        if isinstance(noise_payload, dict):
-            frozen_payload = _sanitize_frozen_noise_payload(noise_payload)
-            if frozen_payload:
-                cfg['pipeline']['_frozen_noise'] = frozen_payload
-                cfg['_prefer_distance_freeze'] = True
-            else:
-                cfg['pipeline'].pop('_frozen_noise', None)
-                cfg.pop('_prefer_distance_freeze', None)
-        else:
-            cfg['pipeline'].pop('_frozen_noise', None)
-            cfg.pop('_prefer_distance_freeze', None)
+    if distance_freeze_payload:
+        cfg['pipeline']['_frozen_noise'] = deepcopy(distance_freeze_payload)
+        cfg['_prefer_distance_freeze'] = True
+    else:
+        cfg['pipeline'].pop('_frozen_noise', None)
+        cfg.pop('_prefer_distance_freeze', None)
 
     isi_overlap_ratio_initial = estimate_isi_overlap_ratio(cfg)
     _maybe_warn_isi_overlap(cfg, isi_overlap_ratio_initial, context=f"LoD distance {dist_um:.0f} um")
@@ -5584,7 +6404,8 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'gm_S': float('nan'),
                 'C_tot_F': float('nan'),
                 'actual_progress': 0,
-                'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s'
+                'skipped_reason': f'Ts_explosion_{Ts_dyn:.1f}s',
+                'lod_trace': [],
             }
     # Continue with existing logic for args.max_ts_for_lod (keep this too)
     cap_cli = getattr(args, "max_ts_for_lod", None) if args else None
@@ -5611,7 +6432,8 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
                 'noise_sigma_thermal': float('nan'), 'noise_sigma_flicker': float('nan'),
                 'noise_sigma_drift': float('nan'), 'noise_thermal_fraction': float('nan'),
                 'I_dc_used_A': float('nan'), 'V_g_bias_V_used': float('nan'), 'gm_S': float('nan'), 'C_tot_F': float('nan'),
-                'actual_progress': 0, 'skipped_reason': f'Ts>{cap_cli}s'
+                'actual_progress': 0, 'skipped_reason': f'Ts>{cap_cli}s',
+                'lod_trace': [],
             }
     
     # LoD search can use shorter sequences to bracket quickly
@@ -5621,16 +6443,52 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
     # NEW: Propagate warm-start guess
     if warm_lod_guess and warm_lod_guess > 0:
         cfg['_warm_lod_guess'] = int(warm_lod_guess)
+    else:
+        cfg.pop('_warm_lod_guess', None)
+
+    if warm_bracket:
+        lb, ub = warm_bracket
+        cfg['_warm_bracket_min'] = int(lb)
+        cfg['_warm_bracket_max'] = int(ub)
+    else:
+        cfg.pop('_warm_bracket_min', None)
+        cfg.pop('_warm_bracket_max', None)
+    
+    analytic_flag = force_analytic_bracket
+    if analytic_flag is None:
+        analytic_flag = bool(getattr(args, "analytic_lod_bracket", False)) if args else False
+    if analytic_flag:
+        cfg['_analytic_lod_bracket'] = True
+    else:
+        cfg.pop('_analytic_lod_bracket', None)
     
     # NEW: Set LoD max from args (use consistent key)
     cfg['pipeline']['lod_nm_max'] = int(getattr(args, "lod_max_nm", 1000000))
     
+    search_metrics: Dict[str, Any] = {
+        "calibration_s": 0.0,
+        "simulation_s": 0.0,
+        "downstep_s": 0.0,
+        "overhead_s": 0.0,
+        "total_s": 0.0,
+        "seeds_simulated": 0,
+        "iterations": 0,
+    }
+    search_wall = 0.0
+    search_start = time.perf_counter()
+
     try:
         cache_tag = f"d{int(dist_um)}um"
-        lod_nm, ser_at_lod, actual_progress = find_lod_for_ser(
+        lod_nm, ser_at_lod, actual_progress, search_metrics = find_lod_for_ser(
             cfg, seeds, target_ser, debug_calibration, progress_cb,
             resume=resume, cache_tag=cache_tag
         )
+        search_wall = time.perf_counter() - search_start
+        raw_trace = cfg.pop('_lod_eval_trace', [])
+        if isinstance(raw_trace, list):
+            lod_trace = [dict(entry) for entry in raw_trace if isinstance(entry, dict)]
+        else:
+            lod_trace = []
         
         # Calculate data rate at LoD
         if not np.isnan(lod_nm):
@@ -5723,6 +6581,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             data_rate_ci_high = float('nan')
     
     except Exception as e:
+        search_wall = time.perf_counter() - search_start
         print(f"Error processing distance {dist_um}: {e}")
         lod_nm = float('nan')
         ser_at_lod = float('nan')
@@ -5730,6 +6589,20 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         data_rate_ci_low = float('nan')
         data_rate_ci_high = float('nan')
         skipped_reason = 'lod_search_failed'  # ✅ Set in exception block
+        search_metrics = {
+            "calibration_s": 0.0,
+            "simulation_s": 0.0,
+            "downstep_s": 0.0,
+            "overhead_s": 0.0,
+            "total_s": 0.0,
+            "seeds_simulated": 0,
+            "iterations": 0,
+        }
+    finally:
+        cfg.pop('_warm_lod_guess', None)
+        cfg.pop('_warm_bracket_min', None)
+        cfg.pop('_warm_bracket_max', None)
+        cfg.pop('_analytic_lod_bracket', None)
     
     # NEW: Re-validate final LoD with full seeds for publication-grade statistics
     full_seeds = getattr(args, "full_seeds", seeds)  # default to reduced set if absent
@@ -5738,7 +6611,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         cfg_base_with_distance = deepcopy(cfg_base)
         cfg_base_with_distance['pipeline']['distance_um'] = dist_um
         ser_at_lod, data_rate_bps, data_rate_ci_low, data_rate_ci_high = \
-            _validate_lod_point_with_full_seeds(cfg_base_with_distance, int(lod_nm), full_seeds)
+            _validate_lod_point_with_full_seeds(cfg_base_with_distance, int(lod_nm), full_seeds, distance_freeze_payload)
         
         # NEW: Enforce 1% target after validation - adjust upward if needed
         target_ser = 0.01
@@ -5746,14 +6619,33 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
             nm_try = int(max(lod_nm, 1))
             for _ in range(6):   # hard cap safety
                 nm_try = int(math.ceil(nm_try * 1.25))
-                ser2, rate2, lo2, hi2 = _validate_lod_point_with_full_seeds(cfg_base_with_distance, nm_try, full_seeds)
+                ser2, rate2, lo2, hi2 = _validate_lod_point_with_full_seeds(cfg_base_with_distance, nm_try, full_seeds, distance_freeze_payload)
                 if ser2 <= target_ser:
                     lod_nm, ser_at_lod = nm_try, ser2
                     data_rate_bps, data_rate_ci_low, data_rate_ci_high = rate2, lo2, hi2
+                    seq_len_val = int(cfg_base_with_distance['pipeline'].get('sequence_length', cfg['pipeline']['sequence_length']))
+                    n_seen_adjust = seq_len_val * len(full_seeds)
+                    lod_trace.append({
+                        "phase": "validation_adjust",
+                        "nm": int(nm_try),
+                        "ser": float(ser2),
+                        "distance_um": float(dist_um),
+                        "n_seen": int(n_seen_adjust),
+                        "k_err": int(round(ser2 * n_seen_adjust)),
+                        "status": "pass",
+                        "timestamp": time.time(),
+                    })
                     break
     
     # NEW: Optional noise_sigma persistence aggregation
-    if lod_nm > 0:
+    lod_found = (
+        isinstance(lod_nm, (int, float))
+        and math.isfinite(float(lod_nm))
+        and float(lod_nm) > 0
+        and math.isfinite(ser_at_lod)
+        and ser_at_lod <= target_ser
+    )
+    if lod_found:
         # Re-simulate at the LoD point to collect noise_sigma_I_diff
         cfg_lod = deepcopy(cfg_base)
         cfg_lod['pipeline']['distance_um'] = dist_um
@@ -5769,20 +6661,9 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         cfg_lod.setdefault('detection', {})
         cfg_lod['detection']['decision_window_s'] = min_win       # <- align
 
-        noise_distance_map = cfg_base.get('_noise_freeze_distance_map', {})
-        if isinstance(noise_distance_map, dict):
-            noise_payload = noise_distance_map.get(_value_key(float(dist_um)))
-            if isinstance(noise_payload, dict):
-                frozen_payload_lod = _sanitize_frozen_noise_payload(noise_payload)
-                if frozen_payload_lod:
-                    cfg_lod['pipeline']['_frozen_noise'] = frozen_payload_lod
-                    cfg_lod['_prefer_distance_freeze'] = True
-                else:
-                    cfg_lod['pipeline'].pop('_frozen_noise', None)
-                    cfg_lod.pop('_prefer_distance_freeze', None)
-            else:
-                cfg_lod['pipeline'].pop('_frozen_noise', None)
-                cfg_lod.pop('_prefer_distance_freeze', None)
+        if distance_freeze_payload:
+            cfg_lod['pipeline']['_frozen_noise'] = deepcopy(distance_freeze_payload)
+            cfg_lod['_prefer_distance_freeze'] = True
         else:
             cfg_lod['pipeline'].pop('_frozen_noise', None)
             cfg_lod.pop('_prefer_distance_freeze', None)
@@ -5793,15 +6674,6 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         th_lod = calibrate_thresholds_cached(cfg_lod, list(range(4)))
         _apply_thresholds_into_cfg(cfg_lod, th_lod)
         
-        sigma_values = []
-        sigma_thermal_values = []
-        sigma_flicker_values = []
-        sigma_drift_values = []
-        thermal_fraction_values = []
-        i_dc_values = []
-        v_g_bias_values = []
-        gm_values = []
-        c_tot_values = []
         def _as_float(val: Any) -> float:
             try:
                 return float(val)
@@ -5810,6 +6682,7 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
 
         cfg_lod['pipeline']['_collect_noise_components'] = True
 
+        sigma_start = time.perf_counter()
         sigma_values: List[float] = []
         sigma_values_measured: List[float] = []
         sigma_thermal_values: List[float] = []
@@ -5820,72 +6693,87 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         sigma_drift_measured: List[float] = []
         thermal_fraction_values: List[float] = []
         thermal_fraction_measured: List[float] = []
+        i_dc_values: List[float] = []
+        v_g_bias_values: List[float] = []
+        gm_values: List[float] = []
+        c_tot_values: List[float] = []
         for seed in seeds[:5]:  # Limited seeds for efficiency
-            result = run_param_seed_combo(cfg_lod, 'pipeline.Nm_per_symbol', lod_nm, seed, 
-                                        debug_calibration=debug_calibration, 
-                                        sweep_name="lod_validation", cache_tag="lod_sigma",
-                                        thresholds_override=th_lod)
-            if result:
-                sigma_meas = _as_float(result.get('noise_sigma_I_diff_measured'))
-                if math.isfinite(sigma_meas):
-                    sigma_values_measured.append(sigma_meas)
-                    sigma_values.append(sigma_meas)
-                else:
-                    sigma_val = _as_float(result.get('noise_sigma_I_diff'))
-                    if math.isfinite(sigma_val):
-                        sigma_values.append(sigma_val)
+            result = run_param_seed_combo(
+                cfg_lod,
+                'pipeline.Nm_per_symbol',
+                lod_nm,
+                seed,
+                debug_calibration=debug_calibration,
+                sweep_name="lod_validation",
+                cache_tag="lod_sigma",
+                thresholds_override=th_lod,
+            )
+            if result is None:
+                continue
+            result_dict = cast(Dict[str, Any], result)
 
-                sigma_thermal_meas = _as_float(result.get('noise_sigma_thermal_measured'))
-                if math.isfinite(sigma_thermal_meas):
-                    sigma_thermal_measured.append(sigma_thermal_meas)
-                    sigma_thermal_values.append(sigma_thermal_meas)
-                else:
-                    sigma_thermal_val = _as_float(result.get('noise_sigma_thermal'))
-                    if math.isfinite(sigma_thermal_val):
-                        sigma_thermal_values.append(sigma_thermal_val)
+            sigma_meas = _as_float(result_dict.get('noise_sigma_I_diff_measured'))
+            if math.isfinite(sigma_meas):
+                sigma_values_measured.append(sigma_meas)
+                sigma_values.append(sigma_meas)
+            else:
+                sigma_val = _as_float(result_dict.get('noise_sigma_I_diff'))
+                if math.isfinite(sigma_val):
+                    sigma_values.append(sigma_val)
 
-                sigma_flicker_meas = _as_float(result.get('noise_sigma_flicker_measured'))
-                if math.isfinite(sigma_flicker_meas):
-                    sigma_flicker_measured.append(sigma_flicker_meas)
-                    sigma_flicker_values.append(sigma_flicker_meas)
-                else:
-                    sigma_flicker_val = _as_float(result.get('noise_sigma_flicker'))
-                    if math.isfinite(sigma_flicker_val):
-                        sigma_flicker_values.append(sigma_flicker_val)
+            sigma_thermal_meas = _as_float(result_dict.get('noise_sigma_thermal_measured'))
+            if math.isfinite(sigma_thermal_meas):
+                sigma_thermal_measured.append(sigma_thermal_meas)
+                sigma_thermal_values.append(sigma_thermal_meas)
+            else:
+                sigma_thermal_val = _as_float(result_dict.get('noise_sigma_thermal'))
+                if math.isfinite(sigma_thermal_val):
+                    sigma_thermal_values.append(sigma_thermal_val)
 
-                sigma_drift_meas = _as_float(result.get('noise_sigma_drift_measured'))
-                if math.isfinite(sigma_drift_meas):
-                    sigma_drift_measured.append(sigma_drift_meas)
-                    sigma_drift_values.append(sigma_drift_meas)
-                else:
-                    sigma_drift_val = _as_float(result.get('noise_sigma_drift'))
-                    if math.isfinite(sigma_drift_val):
-                        sigma_drift_values.append(sigma_drift_val)
+            sigma_flicker_meas = _as_float(result_dict.get('noise_sigma_flicker_measured'))
+            if math.isfinite(sigma_flicker_meas):
+                sigma_flicker_measured.append(sigma_flicker_meas)
+                sigma_flicker_values.append(sigma_flicker_meas)
+            else:
+                sigma_flicker_val = _as_float(result_dict.get('noise_sigma_flicker'))
+                if math.isfinite(sigma_flicker_val):
+                    sigma_flicker_values.append(sigma_flicker_val)
 
-                thermal_frac_meas = _as_float(result.get('noise_thermal_fraction_measured'))
-                if math.isfinite(thermal_frac_meas):
-                    thermal_fraction_measured.append(thermal_frac_meas)
-                    thermal_fraction_values.append(thermal_frac_meas)
-                else:
-                    thermal_frac_val = _as_float(result.get('noise_thermal_fraction'))
-                    if math.isfinite(thermal_frac_val):
-                        thermal_fraction_values.append(thermal_frac_val)
+            sigma_drift_meas = _as_float(result_dict.get('noise_sigma_drift_measured'))
+            if math.isfinite(sigma_drift_meas):
+                sigma_drift_measured.append(sigma_drift_meas)
+                sigma_drift_values.append(sigma_drift_meas)
+            else:
+                sigma_drift_val = _as_float(result_dict.get('noise_sigma_drift'))
+                if math.isfinite(sigma_drift_val):
+                    sigma_drift_values.append(sigma_drift_val)
 
-                if 'I_dc_used_A' in result:
-                    i_dc_values.append(result['I_dc_used_A'])
-                if 'V_g_bias_V_used' in result:
-                    v_g_bias_values.append(result['V_g_bias_V_used'])
-                if 'gm_S' in result:
-                    gm_values.append(result['gm_S'])
-                if 'C_tot_F' in result:
-                    c_tot_values.append(result['C_tot_F'])
+            thermal_frac_meas = _as_float(result_dict.get('noise_thermal_fraction_measured'))
+            if math.isfinite(thermal_frac_meas):
+                thermal_fraction_measured.append(thermal_frac_meas)
+                thermal_fraction_values.append(thermal_frac_meas)
+            else:
+                thermal_frac_val = _as_float(result_dict.get('noise_thermal_fraction'))
+                if math.isfinite(thermal_frac_val):
+                    thermal_fraction_values.append(thermal_frac_val)
+
+            if 'I_dc_used_A' in result_dict:
+                i_dc_values.append(result_dict['I_dc_used_A'])
+            if 'V_g_bias_V_used' in result_dict:
+                v_g_bias_values.append(result_dict['V_g_bias_V_used'])
+            if 'gm_S' in result_dict:
+                gm_values.append(result_dict['gm_S'])
+            if 'C_tot_F' in result_dict:
+                c_tot_values.append(result_dict['C_tot_F'])
             # Progress callback for completed noise sigma seed
             if progress_cb is not None:
-                try: 
+                try:
                     progress_cb.put(1)
-                except Exception: 
+                except Exception:
                     pass
         
+        sigma_time = time.perf_counter() - sigma_start
+
         cfg_lod['pipeline'].pop('_collect_noise_components', None)
 
         def _finite_list_median(values):
@@ -5923,12 +6811,33 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         lod_gm = float('nan')
         lod_c_tot = float('nan')
 
+    search_total = float(search_metrics.get("total_s", float(search_metrics.get("calibration_s", 0.0))
+                                           + float(search_metrics.get("simulation_s", 0.0))
+                                           + float(search_metrics.get("overhead_s", 0.0))))
+
+    lod_trace.append({
+        "phase": "timing_summary",
+        "distance_um": float(dist_um),
+        "search_wall_s": float(search_wall),
+        "search_calibration_s": float(search_metrics.get("calibration_s", 0.0)),
+        "search_simulation_s": float(search_metrics.get("simulation_s", 0.0)),
+        "search_downstep_s": float(search_metrics.get("downstep_s", 0.0)),
+        "search_overhead_s": float(search_metrics.get("overhead_s", 0.0)),
+        "search_total_s": float(search_total),
+        "search_iterations": int(search_metrics.get("iterations", 0)),
+        "search_seeds": int(search_metrics.get("seeds_simulated", 0)),
+        "validation_s": float(validation_time),
+        "sigma_s": float(sigma_time),
+    })
+
     # mark LoD state as done ONLY if valid result
     try:
         if isinstance(lod_nm, (int, float)) and math.isfinite(lod_nm) and lod_nm > 0:
-            done_state = {"done": True, "nm_min": int(lod_nm), "nm_max": int(lod_nm)}
+            current_state = _lod_state_load(cfg['pipeline']['modulation'], float(dist_um),
+                                            bool(cfg['pipeline'].get('use_control_channel', True))) or {}
+            current_state.update({"done": True, "nm_min": int(lod_nm), "nm_max": int(lod_nm)})
             _lod_state_save(cfg['pipeline']['modulation'], float(dist_um),
-                            bool(cfg['pipeline'].get('use_control_channel', True)), done_state)
+                            bool(cfg['pipeline'].get('use_control_channel', True)), current_state)
     except Exception:
         pass
     
@@ -5993,7 +6902,18 @@ def process_distance_for_lod(dist_um: float, cfg_base: Dict[str, Any],
         'C_tot_F': float(lod_c_tot),
         'actual_progress': int(actual_progress),
         'skipped_reason': skipped_reason,  # ✅ Use the variable instead of None
-        'lod_found': bool(not (isinstance(lod_nm, float) and (math.isnan(lod_nm) or lod_nm <= 0))),
+        'lod_trace': lod_trace,
+        'lod_time_search_wall_s': float(search_wall),
+        'lod_time_calibration_s': float(search_metrics.get('calibration_s', 0.0)),
+        'lod_time_simulation_s': float(search_metrics.get('simulation_s', 0.0)),
+        'lod_time_downstep_s': float(search_metrics.get('downstep_s', 0.0)),
+        'lod_time_overhead_s': float(search_metrics.get('overhead_s', 0.0)),
+        'lod_time_total_s': float(search_total),
+        'lod_time_validation_s': float(validation_time),
+        'lod_time_sigma_s': float(sigma_time),
+        'lod_time_search_iterations': int(search_metrics.get('iterations', 0)),
+        'lod_seeds_simulated': int(search_metrics.get('seeds_simulated', 0)),
+        'lod_found': bool(lod_found),
         'best_seen_ser': float(ser_at_lod),
         'lod_nm_ceiling': int(cfg.get('lod_max_nm', 1000000))
     }
@@ -7225,66 +8145,6 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         except Exception as e:
             print(f"⚠️  SER auto-refine failed: {e}")
 
-    # ---------- 1′) HDS grid (Hybrid only): Nm × distance with component errors ----------
-    if mode == "Hybrid":
-        print("\n1′. Building Hybrid HDS grid (Nm × distance)…")
-        grid_csv = data_dir / "hybrid_hds_grid.csv"
-        
-        # Use the distances configured for LoD (or fallback to a small set)
-        distances = list(lod_distance_grid)
-        if not distances:
-            # Fallback to a representative subset for the grid
-            distances = [25, 50, 100, 150, 200]
-        
-        # Use a subset of Nm values for the grid (to keep computation manageable)
-        grid_nm_values: List[Union[float, int]] = [500, 1000, 1600, 2500, 4000, 6300, 10000] # subset of nm_values
-        
-        rows = []
-        for d in distances:
-            cfg_d = deepcopy(cfg)
-            cfg_d['pipeline']['distance_um'] = int(d)
-            
-            # Recompute symbol period if your model depends on distance
-            try:
-                Ts = calculate_dynamic_symbol_period(int(d), cfg_d)
-                cfg_d['pipeline']['symbol_period_s'] = Ts
-                dt = float(cfg_d['sim']['dt_s'])
-                min_pts = int(cfg_d.get('_min_decision_points', 4))
-                min_win = _enforce_min_window(cfg_d, Ts)
-                cfg_d['pipeline']['time_window_s'] = max(cfg_d['pipeline'].get('time_window_s', 0.0), min_win)
-                cfg_d['detection']['decision_window_s'] = min_win
-            except Exception:
-                pass
-            
-            # Run SER sweep for this distance
-            df_d = run_sweep(
-                cfg_d, seeds,
-                'pipeline.Nm_per_symbol',
-                grid_nm_values,
-                f"HDS grid Hybrid (d={d} um)",
-                progress_mode=args.progress,
-                persist_csv=None,  # Don't persist intermediate results
-                resume=args.resume,
-                debug_calibration=args.debug_calibration,
-                cache_tag=f"d{int(d)}um"   # <<< NEW: distance-scoped cache tag
-            )
-            
-            if not df_d.empty:
-                df_d = df_d.copy()
-                df_d['distance_um'] = int(d)
-                rows.append(df_d)
-        
-        if rows:
-            grid = pd.concat(rows, ignore_index=True)
-            # Keep both CTRL states if present; de-dup by (d, Nm, use_ctrl)
-            nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
-            subset = ['distance_um', nm_key] + (['use_ctrl'] if 'use_ctrl' in grid.columns else [])
-            grid = grid.drop_duplicates(subset=subset, keep='last').sort_values(subset)
-            _atomic_write_csv(grid_csv, grid)
-            print(f"✅ HDS grid saved to {grid_csv}")
-        else:
-            print("⚠️ HDS grid: no rows produced (skipping).")
-
     if not df_ser_nm.empty:
         nm_col_print = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df_ser_nm.columns else 'pipeline.Nm_per_symbol'
         cols_to_show = [c for c in [nm_col_print, 'ser', 'snr_db', 'use_ctrl'] if c in df_ser_nm.columns]
@@ -7337,6 +8197,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     done_distances: set[int] = set()
     failed_distances: set[int] = set()
 
+    df_prev: Optional[pd.DataFrame] = None
     if args.resume:
         df_prev = existing_lod_branch.copy()
         if df_prev.empty and lod_csv_branch.exists():
@@ -7350,7 +8211,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 df_prev = pd.read_csv(lod_csv)
                 if 'use_ctrl' in df_prev.columns:
                     df_prev = df_prev[df_prev['use_ctrl'] == use_ctrl]
-                df_prev = _dedupe_lod_dataframe(df_prev)
+                df_prev = _dedupe_lod_dataframe(cast(pd.DataFrame, df_prev))
             except Exception as e:
                 print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
                 df_prev = pd.DataFrame()
@@ -7386,6 +8247,11 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 failed_distances.clear()
         elif args.resume and not df_prev.empty:
             print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
+
+    lod_history_points: List[Dict[str, Any]] = []
+    _extend_history_with_lod_rows(lod_history_points, existing_lod_branch)
+    _extend_history_with_lod_rows(lod_history_points, df_prev)
+    lod_history_points.extend(_load_lod_history_cache(mode, use_ctrl, suffix))
 
     # Worklist excludes done distances
     d_run_work = [int(d) for d in d_run if int(d) not in done_distances]
@@ -7531,6 +8397,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Ensure we only process distances that have progress queues
     d_run_work_with_queues = [d for d in d_run_work if d in progress_queues]
 
+    target_ser = 0.01
+
     def _submit_one(dist: int, wid_hint: int) -> None:
         """Submit one distance job to the pool."""
         wid = wid_hint % max(1, maxw)
@@ -7539,9 +8407,41 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         q = progress_queues[dist]
         seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
         args.full_seeds = seeds
+
+        nm_min_cfg = int(cfg['pipeline'].get('lod_nm_min', 50))
+        nm_max_cfg = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
+        hist_guess, hist_bracket = _predict_lod_from_history(float(dist), lod_history_points,
+                                                             target_ser, nm_min_cfg, nm_max_cfg)
+
+        warm_guess: Optional[int] = None
+        warm_bracket: Optional[Tuple[int, int]] = None
+        if hist_guess is not None:
+            warm_guess = int(max(nm_min_cfg, min(nm_max_cfg, round(hist_guess))))
+            bracket = hist_bracket or _default_bracket_from_guess(hist_guess, float(dist), nm_min_cfg, nm_max_cfg)
+            warm_bracket = (int(bracket[0]), int(bracket[1]))
+            print(f"    [warm] {dist}μm history fit → Nm≈{warm_guess} bracket {warm_bracket[0]}-{warm_bracket[1]}")
+        elif last_lod_guess:
+            warm_guess = int(last_lod_guess)
+            warm_bracket = _default_bracket_from_guess(warm_guess, float(dist), nm_min_cfg, nm_max_cfg)
+
+        if warm_bracket is not None:
+            lb, ub = warm_bracket
+            lb = max(nm_min_cfg, int(lb))
+            ub = min(nm_max_cfg, int(ub))
+            if lb >= ub:
+                lb, ub = _default_bracket_from_guess(warm_guess or nm_min_cfg, float(dist), nm_min_cfg, nm_max_cfg)
+            warm_bracket = (int(lb), int(ub))
+
+        enable_analytic = bool(getattr(args, "analytic_lod_bracket", False))
+        if not enable_analytic and hist_bracket and canonical_mode in ("MoSK", "CSK"):
+            enable_analytic = True
+
         fut = pool.submit(
-            process_distance_for_lod, float(dist), cfg, seeds_for_lod, 0.01,
-            args.debug_calibration, q, args.resume, args, warm_lod_guess=last_lod_guess
+            process_distance_for_lod, float(dist), cfg, seeds_for_lod, target_ser,
+            args.debug_calibration, q, args.resume, args,
+            warm_lod_guess=warm_guess,
+            warm_bracket=warm_bracket,
+            force_analytic_bracket=enable_analytic
         )
         pending.add(fut)
         fut2dist[fut] = dist
@@ -7574,6 +8474,15 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             # NEW: Update warm-start guess if we got a valid LoD (feeds next submissions)
             if res and not pd.isna(res.get('lod_nm', np.nan)):
                 last_lod_guess = int(res['lod_nm'])
+            trace_entries = res.get('lod_trace', [])
+            normalized_trace = _normalize_lod_trace_entries(
+                float(res.get('distance_um', dist)),
+                trace_entries if isinstance(trace_entries, list) else [],
+                target_ser)
+            if normalized_trace:
+                lod_history_points.extend(normalized_trace)
+                _append_lod_history_cache(mode, use_ctrl, suffix, normalized_trace)
+            res.pop('lod_trace', None)
         except TimeoutError:
             print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout={tmo}s), skipping")
             res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
@@ -7748,6 +8657,81 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
         print(f"\nLoD vs Distance (head) for {mode}:")
         print(df_lod[cols_to_show].head().to_string(index=False))
+
+    if mode == "Hybrid":
+        print("\n2′. Updating Hybrid HDS grid (Nm × distance)…")
+        grid_csv = data_dir / "hybrid_hds_grid.csv"
+
+        hds_distances = [int(float(d)) for d in lod_distance_grid] or [25, 50, 100, 150, 200]
+        nm_min_default = int(cfg['pipeline'].get('lod_nm_min', 50))
+        nm_max_default = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
+        default_nm_list: Sequence[Union[int, float]] = nm_values if nm_values else [500, 1000, 1600, 2500, 4000, 6300, 10000]
+
+        cfg_hds_base = deepcopy(cfg)
+        lod_by_distance: Dict[int, Dict[str, Any]] = {}
+        for entry in lod_results:
+            if not isinstance(entry, dict):
+                continue
+            dist_val = entry.get('distance_um')
+            if dist_val is None:
+                continue
+            try:
+                dist_int = int(float(dist_val))
+            except Exception:
+                continue
+            lod_by_distance[dist_int] = entry
+
+        hds_pending: Set[Future] = set()
+        hds_futures: Dict[Future, int] = {}
+        hds_rows: List[pd.DataFrame] = []
+
+        for dist in sorted(set(hds_distances)):
+            lod_state = _lod_state_load(mode, float(dist), bool(cfg['pipeline'].get('use_control_channel', True)))
+            lod_entry = lod_by_distance.get(dist)
+            nm_candidates = _derive_hds_nm_values(lod_entry, lod_state, default_nm_list, nm_min_default, nm_max_default)
+            if not nm_candidates:
+                continue
+
+            future = pool.submit(
+                _compute_hds_distance,
+                float(dist),
+                cfg_hds_base,
+                nm_candidates,
+                seeds,
+                args.progress,
+                args.resume,
+                args.debug_calibration,
+                # Use the same per-distance cache tag as LoD so Hybrid seeds fall back cleanly
+                # into the warmed state without fragmenting cache directories.
+                f"d{dist}um"
+            )
+            hds_pending.add(future)
+            hds_futures[future] = dist
+
+        for done_future in as_completed(list(hds_pending)):
+            dist = hds_futures.pop(done_future, -1)
+            if dist == -1:
+                continue
+            try:
+                df_result = done_future.result()
+            except Exception as hds_exc:
+                print(f"⚠️  HDS grid failed at distance {dist}: {hds_exc}")
+                continue
+            if isinstance(df_result, pd.DataFrame) and not df_result.empty:
+                hds_rows.append(df_result)
+        hds_pending.clear()
+
+        if hds_rows:
+            grid = pd.concat(hds_rows, ignore_index=True)
+            nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
+            subset_cols = ['distance_um', nm_key]
+            if 'use_ctrl' in grid.columns:
+                subset_cols.append('use_ctrl')
+            grid = grid.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
+            _atomic_write_csv(grid_csv, grid)
+            print(f"✅ HDS grid saved to {grid_csv} ({len(grid)} rows)")
+        else:
+            print("⚠️ HDS grid: no rows produced (skipping update).")
 
     try:
         _run_device_fom_sweeps(

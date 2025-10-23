@@ -143,6 +143,7 @@ def _build_args_namespace(
         lod_max_nm=lod_nm_max,
         max_ts_for_lod=max_ts_for_lod,
         full_seeds=list(full_seeds),
+        analytic_lod_bracket=False,
     )
 
 
@@ -209,8 +210,11 @@ def run_lod_ceiling_sweep(
                 resume=False,
                 args=args_ns,
                 warm_lod_guess=warm_guess,
+                warm_bracket=None,
+                force_analytic_bracket=None,
             ),
         )
+        res.pop("lod_trace", None)
 
         # Track warm start for faster convergence.
         lod_nm_val = res.get("lod_nm")

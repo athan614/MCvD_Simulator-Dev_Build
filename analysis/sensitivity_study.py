@@ -402,7 +402,7 @@ def _compute_lod(
 ) -> Tuple[float, float]:
     cfg_local = copy.deepcopy(cfg)
     try:
-        lod_nm, ser_at_lod, _ = find_lod_for_ser(
+        lod_nm, ser_at_lod, _, _ = find_lod_for_ser(
             cfg_local,
             list(seeds),
             target_ser=target_ser,
