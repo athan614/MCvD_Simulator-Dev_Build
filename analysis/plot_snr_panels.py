@@ -4,7 +4,7 @@ Compose SNR summary panels combining Nm, distance, and Ts sweeps.
 
 Builds modality-specific figures (up to three subplots):
   - SNR(dB) vs Nm using ser_vs_nm_{mode}.csv
-  - SNR(dB) vs distance using hds_grid_{mode}.csv or lod_vs_distance_{mode}.csv
+  - SNR(dB) vs distance using ser_snr_vs_distance_{mode}.csv (falls back to hds_grid_{mode}.csv or lod_vs_distance_{mode}.csv)
   - SNR(dB) vs Ts using snr_vs_ts_{mode}.csv (if present)
 """
 from __future__ import annotations
@@ -46,7 +46,14 @@ NM_COLUMNS = [
     "Nm_per_symbol",
     "Nm",
 ]
-SNR_COLUMNS = ["snr_db", "snr_q_db", "snr_i_db"]
+SNR_COLUMNS = [
+    "snr_db",
+    "snr_db_csk_min",
+    "snr_db_mosk",
+    "snr_db_amp",
+    "snr_q_db",
+    "snr_i_db",
+]
 SUMMARY_CSV_DEFAULT = data_dir / "snr_panels_summary.csv"
 COMBINED_FIG_DEFAULT = fig_dir / "fig_snr_panels.png"
 
@@ -168,12 +175,16 @@ def _aggregate_distance_curve(df_distance: Optional[pd.DataFrame]) -> Optional[p
     df = df_distance.dropna(subset=["distance_um", "snr_plot"])
     if df.empty:
         return None
+    agg_map: Dict[str, str] = {"snr_plot": "median"}
+    if "ser" in df.columns:
+        agg_map["ser"] = "median"
     grouped = (
-        df.groupby("distance_um")["snr_plot"]
-        .median()
-        .reset_index(name="snr_db")
+        df.groupby("distance_um")
+        .agg(agg_map)
+        .reset_index()
         .sort_values(by="distance_um")
     )
+    grouped = grouped.rename(columns={"snr_plot": "snr_db"})
     grouped["x_value"] = grouped["distance_um"]
     return grouped
 
@@ -289,10 +300,14 @@ def _pick_nm_for_distance(df: pd.DataFrame, nm_hint: Optional[float]) -> float:
 
 
 def _prepare_distance_panel(mode: str, nm_hint: Optional[float]) -> Optional[pd.DataFrame]:
-    candidates = _load_csv(f"hds_grid_{mode.lower()}")
-    source = "hds_grid"
+    mode_token = mode.lower()
+    candidates = _load_csv(f"ser_snr_vs_distance_{mode_token}")
+    source = "ser_snr_vs_distance"
     if not candidates:
-        candidates = _load_csv(f"lod_vs_distance_{mode.lower()}")
+        candidates = _load_csv(f"hds_grid_{mode_token}")
+        source = "hds_grid"
+    if not candidates:
+        candidates = _load_csv(f"lod_vs_distance_{mode_token}")
         source = "lod_vs_distance"
     if not candidates:
         return None
@@ -348,7 +363,24 @@ def _render_mode_panels(
 
     # Distance panel
     if distance_curve is not None:
-        ax_dist.plot(distance_curve["distance_um"], distance_curve["snr_db"], marker="s")
+        ax_dist.plot(distance_curve["distance_um"], distance_curve["snr_db"], marker="s", label="SNR")
+        ser_available = "ser" in distance_curve.columns and distance_curve["ser"].notna().any()
+        if ser_available:
+            ax_dist2 = ax_dist.twinx()
+            ax_dist2.plot(
+                distance_curve["distance_um"],
+                distance_curve["ser"],
+                color="tab:red",
+                linestyle="--",
+                marker="o",
+                label="SER",
+            )
+            ax_dist2.set_ylabel("SER")
+            ax_dist2.set_yscale("log")
+            ax_dist.legend(loc="upper left", fontsize=8)
+            ax_dist2.legend(loc="upper right", fontsize=8)
+        else:
+            ax_dist.legend(loc="upper left", fontsize=8)
     else:
         ax_dist.text(0.5, 0.5, "No distance data", ha="center", va="center", transform=ax_dist.transAxes)
     ax_dist.set_xlabel("Distance (µm)")

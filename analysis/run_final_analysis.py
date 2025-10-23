@@ -17,7 +17,7 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError, Future
 import multiprocessing as mp
 import psutil
-from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable, Sequence
+from typing import Dict, List, Any, Tuple, Optional, Union, TypedDict, cast, Callable, Set, Iterable, Sequence, Mapping
 import gc
 import os
 import stat
@@ -1284,7 +1284,6 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
             'combiner': str(cfg['pipeline'].get('csk_combiner', 'zscore'))
         }
 
-    # ---------- Hybrid amplitude thresholds (+ optional early‑stop) ----------
     if mode == "Hybrid":
         stats: Dict[str, List[float]] = {'da_low': [], 'da_high': [], 'sero_low': [], 'sero_high': []}
         prev_da_tau: Optional[float] = None
@@ -1855,6 +1854,7 @@ def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
 _STAGE_CSV_BASENAMES = {
     "ser": "ser_vs_nm_{mode}",
     "lod": "lod_vs_distance_{mode}",
+    "dist": "ser_snr_vs_distance_{mode}",
     "isi": "isi_tradeoff_{mode}",
 }
 
@@ -1910,6 +1910,15 @@ def _dedupe_lod_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     else:
         result = df.drop_duplicates(subset=keys, keep='last')
     return result.sort_values(keys)
+
+
+def _dedupe_distance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or 'distance_um' not in df.columns:
+        return df
+    keys = ['distance_um']
+    if 'use_ctrl' in df.columns:
+        keys.append('use_ctrl')
+    return df.drop_duplicates(subset=keys, keep='last').sort_values(keys)
 
 
 def _dedupe_isi_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -2132,6 +2141,7 @@ def merge_ablation_csvs_for_modes(modes: Sequence[str],
     dedupe_map: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
         "ser": _dedupe_ser_dataframe,
         "lod": _dedupe_lod_dataframe,
+        "dist": _dedupe_distance_dataframe,
         "isi": _dedupe_isi_dataframe,
     }
     selected_stages = list(stages) if stages else list(dedupe_map.keys())
@@ -2676,6 +2686,24 @@ def _replay_hds_from_lod_cache(dist_um: float,
         burst_shape = cfg_base.get('pipeline', {}).get('burst_shape', '')
         t_release_ms = first_payload.get('T_release_ms', float('nan'))
 
+        def _payload_float(payload: Dict[str, Any], key: str, default: float = float('nan')) -> float:
+            try:
+                val = payload.get(key, default)
+                return float(val)
+            except (TypeError, ValueError):
+                return float('nan')
+
+        snr_db = _payload_float(first_payload, 'snr_db')
+        snr_db_csk_min = _payload_float(first_payload, 'snr_db_csk_min')
+        snr_db_mosk = _payload_float(first_payload, 'snr_db_mosk')
+        snr_db_amp = _payload_float(first_payload, 'snr_db_amp')
+        snr_semantics = first_payload.get('snr_semantics')
+        if not isinstance(snr_semantics, str) or not snr_semantics.strip():
+            if mode in ("MoSK", "Hybrid"):
+                snr_semantics = "MoSK contrast statistic (sign-aware DA vs SERO)"
+            else:
+                snr_semantics = "CSK Q-statistic (dual-channel combiner)"
+
         row: Dict[str, Any] = {
             'pipeline.Nm_per_symbol': float(nm),
             'Nm_per_symbol': float(nm),
@@ -2689,8 +2717,11 @@ def _replay_hds_from_lod_cache(dist_um: float,
             'use_ctrl': use_ctrl,
             'mode': mode,
             'detector_mode': detector_mode,
-            'snr_db': float('nan'),
-            'snr_semantics': "MoSK contrast statistic (sign-aware DA vs SERO)" if mode in ("MoSK", "Hybrid") else "CSK Q-statistic (dual-channel combiner)",
+            'snr_db': float(snr_db),
+            'snr_db_csk_min': float(snr_db_csk_min),
+            'snr_db_mosk': float(snr_db_mosk),
+            'snr_db_amp': float(snr_db_amp),
+            'snr_semantics': snr_semantics,
             'symbol_period_s': float(Ts_expected),
             'decision_window_s': float(window_expected),
             'mosk_ser': float(mosk_ser),
@@ -2720,7 +2751,6 @@ def _replay_hds_from_lod_cache(dist_um: float,
             'source': 'lod_cache_replay',
             'data_source': 'lod_cache_replay',
         }
-
         rows.append(row)
 
     return pd.DataFrame(rows) if rows else None
@@ -2858,6 +2888,130 @@ def _auto_refine_nm_points_from_df(df: pd.DataFrame,
     mids = sorted({m for m in mids if lo < m < hi})
     return mids
 
+
+def _select_distance_nm_anchor(cfg: Dict[str, Any],
+                               df_lod: Optional[pd.DataFrame],
+                               use_ctrl: bool,
+                               override_nm: Optional[float] = None) -> float:
+    """
+    Resolve the Nm value used for the SER/SNR vs distance sweep.
+    """
+    if override_nm is not None and math.isfinite(override_nm) and override_nm > 0:
+        return float(override_nm)
+
+    baseline_nm = float(cfg.get('pipeline', {}).get('Nm_per_symbol', 2000.0))
+    if not math.isfinite(baseline_nm) or baseline_nm <= 0:
+        baseline_nm = 2000.0
+
+    if df_lod is None or df_lod.empty or 'lod_nm' not in df_lod.columns:
+        return baseline_nm
+
+    df = df_lod
+    if 'use_ctrl' in df.columns:
+        df = df[df['use_ctrl'] == bool(use_ctrl)]
+    if df.empty:
+        return baseline_nm
+
+    nm_series = pd.to_numeric(df['lod_nm'], errors='coerce').dropna()
+    if nm_series.empty:
+        return baseline_nm
+
+    nm_anchor = float(np.nanmedian(nm_series))
+    if not math.isfinite(nm_anchor) or nm_anchor <= 0:
+        return baseline_nm
+    return nm_anchor
+
+
+def _run_distance_metric_sweep(cfg: Dict[str, Any],
+                               seeds: Sequence[int],
+                               mode: str,
+                               distances: Sequence[Union[float, int]],
+                               data_dir: Path,
+                               suffix: str,
+                               df_lod: Optional[pd.DataFrame],
+                               args: argparse.Namespace,
+                               pm: ProgressManager,
+                               use_ctrl: bool,
+                               hierarchy_supported: bool,
+                               mode_key: Optional[Tuple[str, str]],
+                               dist_key: Optional[Tuple[str, str, str]]) -> pd.DataFrame:
+    """
+    Execute a distance sweep at a fixed Nm to capture both SER and SNR metrics.
+    """
+    distance_values = [float(d) for d in distances]
+    if not distance_values:
+        print("?? Distance sweep skipped: no distances available.")
+        return pd.DataFrame()
+
+    pm.set_status(mode=mode, sweep="SER/SNR vs distance")
+
+    dist_csv, dist_csv_branch, dist_csv_other = _stage_csv_paths("dist", data_dir, mode, suffix, use_ctrl)
+    existing_dist_branch = _ensure_ablation_branch(
+        "dist",
+        dist_csv,
+        dist_csv_branch,
+        use_ctrl,
+        bool(args.resume),
+        _dedupe_distance_dataframe,
+    )
+
+    nm_anchor = _select_distance_nm_anchor(cfg, df_lod, use_ctrl, getattr(args, "distance_sweep_nm", None))
+    if not math.isfinite(nm_anchor) or nm_anchor <= 0:
+        nm_anchor = 2000.0
+    nm_anchor = max(50.0, float(nm_anchor))
+    nm_anchor_int = int(round(nm_anchor))
+
+    print(f"\n2.5. Running SER/SNR vs distance sweep (Nm={nm_anchor_int:,d})")
+
+    prev_nm = cfg['pipeline'].get('Nm_per_symbol')
+    cfg['pipeline']['Nm_per_symbol'] = nm_anchor_int
+
+    try:
+        df_distance = run_sweep(
+            cfg,
+            list(seeds),
+            'pipeline.distance_um',
+            distance_values,
+            f"SER/SNR vs distance ({mode})",
+            progress_mode=args.progress,
+            persist_csv=dist_csv_branch,
+            resume=args.resume,
+            debug_calibration=args.debug_calibration,
+            pm=pm,
+            sweep_key=dist_key if hierarchy_supported else None,
+            parent_key=mode_key if hierarchy_supported else None,
+            recalibrate=args.recalibrate,
+        )
+    finally:
+        cfg['pipeline']['Nm_per_symbol'] = prev_nm
+
+    dist_branch_frames = [df_distance] if df_distance is not None and not df_distance.empty else []
+    dist_branch_combined = _update_branch_csv(
+        "dist",
+        dist_csv_branch,
+        dist_branch_frames,
+        use_ctrl,
+        _dedupe_distance_dataframe,
+        existing_dist_branch,
+    )
+
+    if not args.ablation_parallel:
+        _merge_branch_csv(dist_csv, [dist_csv_branch, dist_csv_other], _dedupe_distance_dataframe)
+
+    results_path = dist_csv_branch if args.ablation_parallel else dist_csv
+    if args.ablation_parallel:
+        print(f"? Distance sweep results saved to {results_path} (branch; canonical merge deferred)")
+    else:
+        print(f"? Distance sweep results saved to {results_path}")
+
+    if dist_branch_combined is not None and not dist_branch_combined.empty:
+        cols_to_show = [c for c in ['distance_um', 'ser', 'snr_db', 'use_ctrl'] if c in dist_branch_combined.columns]
+        if cols_to_show:
+            print(f"\nSER/SNR vs Distance (head) for {mode}:")
+            print(dist_branch_combined[cols_to_show].head().to_string(index=False))
+
+    return dist_branch_combined if dist_branch_combined is not None else (df_distance if df_distance is not None else pd.DataFrame())
+
 # --- Stage 13 helpers: confidence intervals / screening ---
 def _wilson_halfwidth(k: int, n: int, z: float = 1.96) -> float:
     if n <= 0:
@@ -2981,7 +3135,7 @@ def parse_arguments() -> argparse.Namespace:
         nargs="+",
         choices=list(_STAGE_CSV_BASENAMES.keys()),
         default=None,
-        help="Limit --merge-ablation-csvs to specific stages (ser,lod,isi).")
+        help="Limit --merge-ablation-csvs to specific stages (ser,lod,dist,isi).")
     parser.add_argument(
         "--merge-data-dir",
         type=str,
@@ -3131,6 +3285,10 @@ def parse_arguments() -> argparse.Namespace:
                    help="Override guard factor for ISI calculations")
     parser.add_argument("--guard-samples-cap", type=float, default=None,
                    help="Per-seed sample cap for guard-factor sweeps (0 disables cap)")
+    parser.add_argument("--distance-sweep", choices=["always", "auto", "never"], default="always",
+                    help="Generate SER/SNR vs distance sweep: always (default), auto (only when distances available), or never.")
+    parser.add_argument("--distance-sweep-nm", type=float, default=None,
+                    help="Override Nm_per_symbol used when sweeping distance (default: median LoD Nm or config baseline).")
     parser.add_argument("--lod-distance-timeout-s", type=float, default=7200.0,
                         help="Per-distance time budget during LoD analysis. <=0 disables timeout.")
     parser.add_argument("--lod-distance-concurrency", type=int, default=8,
@@ -3913,6 +4071,18 @@ def _build_noise_freeze_map(cfg_base: Dict[str, Any],
         if snapshot:
             noise_map[key] = snapshot['noise']
             med = snapshot['medians']
+            snr_db = float('nan')
+            snr_db_csk_min = float('nan')
+            snr_db_mosk = float('nan')
+            snr_db_amp = float('nan')
+            snr_semantics = "Noise-only measurement"
+            snr_csk_method = ''
+            snr_csk_boundary = ''
+            snr_amp_method = ''
+            snr_amp_worst = ''
+            csk_summary_export: Dict[int, Dict[str, float]] = {}
+            hybrid_amp_summary_export: Dict[str, Dict[str, float]] = {}
+            hybrid_amp_detail: Dict[str, float] = {}
             row: Dict[str, Any] = {
                 'sweep_param': param_name,
                 'value': float(value),
@@ -3938,6 +4108,18 @@ def _build_noise_freeze_map(cfg_base: Dict[str, Any],
                 'noise_ctrl_reduction_fraction_mean': med.get('noise_ctrl_reduction_fraction_mean', float('nan')),
                 'seed_count': snapshot.get('seed_count', len(seeds)),
             }
+            row['snr_db'] = snr_db
+            row['snr_db_csk_min'] = snr_db_csk_min
+            row['snr_db_mosk'] = snr_db_mosk
+            row['snr_db_amp'] = snr_db_amp
+            row['snr_semantics'] = snr_semantics
+            row['snr_csk_method'] = snr_csk_method
+            row['snr_csk_boundary_min'] = snr_csk_boundary
+            row['snr_amp_method'] = snr_amp_method
+            row['snr_amp_worst_molecule'] = snr_amp_worst
+            row['csk_level_stats_summary'] = csk_summary_export
+            row['hybrid_amp_stats_summary'] = hybrid_amp_summary_export
+            row['hybrid_amp_detail_db'] = hybrid_amp_detail
             rows.append(row)
         if task:
             task.update(1)
@@ -4536,12 +4718,177 @@ def run_sweep(cfg: Dict[str, Any],
                 ci_high = float('nan')
     
             # pooled decision stats for SNR proxy
+            def _coerce_finite(values: Iterable[Any]) -> List[float]:
+                clean: List[float] = []
+                for val in values:
+                    try:
+                        f = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(f):
+                        clean.append(f)
+                return clean
+
+            def _merge_stat_summary(
+                dest: Dict[Any, Dict[str, float]],
+                key: Any,
+                payload: Mapping[str, Any],
+            ) -> None:
+                try:
+                    count = float(payload.get("count", 0.0))
+                    mean = float(payload.get("mean", float("nan")))
+                    var = float(payload.get("var", float("nan")))
+                except (TypeError, ValueError):
+                    return
+                if not (math.isfinite(count) and count > 0):
+                    return
+                if not math.isfinite(mean):
+                    return
+                if not math.isfinite(var) or var < 0:
+                    var = 0.0
+                m2 = var * max(count - 1.0, 0.0)
+                entry = dest.get(key)
+                if entry is None:
+                    dest[key] = {"count": count, "mean": mean, "m2": m2}
+                    return
+                prev_count = entry.get("count", 0.0)
+                prev_mean = entry.get("mean", 0.0)
+                prev_m2 = entry.get("m2", 0.0)
+                total = prev_count + count
+                if total <= 0:
+                    return
+                delta = mean - prev_mean
+                entry["m2"] = prev_m2 + m2 + delta * delta * prev_count * count / total
+                entry["mean"] = (prev_mean * prev_count + mean * count) / total
+                entry["count"] = total
+
+            def _summary_variance(entry: Mapping[str, Any]) -> float:
+                count = float(entry.get("count", 0.0))
+                if count <= 1:
+                    return 0.0
+                if "m2" in entry:
+                    m2 = float(entry.get("m2", 0.0))
+                    if not math.isfinite(m2) or m2 < 0:
+                        return 0.0
+                    return m2 / (count - 1.0)
+                var = float(entry.get("var", 0.0))
+                if not math.isfinite(var) or var < 0:
+                    return 0.0
+                return var
+
+            def _export_summary(entry: Mapping[str, Any]) -> Dict[str, float]:
+                return {
+                    "count": float(entry.get("count", 0.0)),
+                    "mean": float(entry.get("mean", float("nan"))),
+                    "var": _summary_variance(entry),
+                }
+
+            def _paired_snr_db(samples_a: Sequence[float], samples_b: Sequence[float]) -> float:
+                if not samples_a or not samples_b:
+                    return float('nan')
+                arr_a = np.asarray(samples_a, dtype=float)
+                arr_b = np.asarray(samples_b, dtype=float)
+                if arr_a.size < 2 or arr_b.size < 2:
+                    return float('nan')
+                mean_a = float(np.mean(arr_a))
+                mean_b = float(np.mean(arr_b))
+                diff = abs(mean_b - mean_a)
+                var_a = float(np.var(arr_a, ddof=1))
+                var_b = float(np.var(arr_b, ddof=1))
+                denom = (arr_a.size + arr_b.size - 2)
+                if denom > 0 and (var_a > 0 or var_b > 0):
+                    pooled_var = (((arr_a.size - 1) * var_a) + ((arr_b.size - 1) * var_b)) / denom
+                else:
+                    pooled_var = (var_a + var_b) / 2.0
+                if pooled_var <= 0 or not math.isfinite(pooled_var):
+                    return float('nan')
+                if diff == 0:
+                    return float('-inf')
+                snr_linear = (diff / math.sqrt(pooled_var)) ** 2
+                if snr_linear <= 0 or not math.isfinite(snr_linear):
+                    return float('nan')
+                return 10.0 * math.log10(snr_linear)
+
+            def _paired_snr_db_summary(stat_a: Mapping[str, Any], stat_b: Mapping[str, Any]) -> float:
+                count_a = float(stat_a.get("count", 0.0))
+                count_b = float(stat_b.get("count", 0.0))
+                if count_a <= 0 or count_b <= 0:
+                    return float('nan')
+                mean_a = float(stat_a.get("mean", float('nan')))
+                mean_b = float(stat_b.get("mean", float('nan')))
+                if not (math.isfinite(mean_a) and math.isfinite(mean_b)):
+                    return float('nan')
+                diff = abs(mean_b - mean_a)
+                if diff == 0:
+                    return float('-inf')
+                var_a = _summary_variance(stat_a)
+                var_b = _summary_variance(stat_b)
+                pooled_num = 0.0
+                pooled_den = 0.0
+                if count_a > 1 and math.isfinite(var_a):
+                    pooled_num += (count_a - 1.0) * var_a
+                    pooled_den += count_a - 1.0
+                if count_b > 1 and math.isfinite(var_b):
+                    pooled_num += (count_b - 1.0) * var_b
+                    pooled_den += count_b - 1.0
+                if pooled_den > 0:
+                    pooled_var = pooled_num / pooled_den
+                else:
+                    finite_terms = [v for v in (var_a, var_b) if math.isfinite(v) and v >= 0.0]
+                    if not finite_terms:
+                        return float('nan')
+                    pooled_var = float(np.mean(finite_terms))
+                if pooled_var <= 0:
+                    return float('nan')
+                snr_linear = (diff ** 2) / pooled_var
+                if snr_linear <= 0 or not math.isfinite(snr_linear):
+                    return float('nan')
+                return 10.0 * math.log10(snr_linear)
+
+            def _min_adjacent_snr(level_map: Dict[int, List[float]]) -> Tuple[float, Optional[Tuple[int, int]]]:
+                if not level_map:
+                    return float('nan'), None
+                keys = sorted(level_map.keys())
+                best = float('nan')
+                best_pair: Optional[Tuple[int, int]] = None
+                for idx_level in range(len(keys) - 1):
+                    a_key = keys[idx_level]
+                    b_key = keys[idx_level + 1]
+                    snr_val = _paired_snr_db(level_map.get(a_key, []), level_map.get(b_key, []))
+                    if math.isnan(snr_val):
+                        continue
+                    if math.isnan(best) or snr_val < best:
+                        best = snr_val
+                        best_pair = (a_key, b_key)
+                return best, best_pair
+
+            def _min_adjacent_snr_summary(summary_map: Dict[int, Dict[str, float]]) -> Tuple[float, Optional[Tuple[int, int]]]:
+                if not summary_map:
+                    return float('nan'), None
+                keys = sorted(summary_map.keys())
+                best = float('nan')
+                best_pair: Optional[Tuple[int, int]] = None
+                for idx_level in range(len(keys) - 1):
+                    a_key = keys[idx_level]
+                    b_key = keys[idx_level + 1]
+                    snr_val = _paired_snr_db_summary(summary_map[a_key], summary_map[b_key])
+                    if math.isnan(snr_val):
+                        continue
+                    if math.isnan(best) or snr_val < best:
+                        best = snr_val
+                        best_pair = (a_key, b_key)
+                return best, best_pair
+
             all_a: List[float] = []
             all_b: List[float] = []
             charge_da_all: List[float] = []
             charge_sero_all: List[float] = []
             current_da_all: List[float] = []
             current_sero_all: List[float] = []
+            csk_level_samples: Dict[int, List[float]] = {}
+            csk_level_summary: Dict[int, Dict[str, float]] = {}
+            hybrid_amp_samples: Dict[int, List[float]] = {}
+            hybrid_amp_summary: Dict[Tuple[str, int], Dict[str, float]] = {}
             for r in results:
                 all_a.extend(cast(List[float], r.get('stats_da', [])))
                 all_b.extend(cast(List[float], r.get('stats_sero', [])))
@@ -4549,8 +4896,114 @@ def run_sweep(cfg: Dict[str, Any],
                 charge_sero_all.extend(cast(List[float], r.get('stats_charge_sero', [])))
                 current_da_all.extend(cast(List[float], r.get('stats_current_da', [])))
                 current_sero_all.extend(cast(List[float], r.get('stats_current_sero', [])))
+
+                level_summary = r.get('csk_level_stats')
+                if isinstance(level_summary, Mapping):
+                    for key_raw, payload in level_summary.items():
+                        if not isinstance(payload, Mapping):
+                            continue
+                        try:
+                            level_idx = int(key_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        _merge_stat_summary(csk_level_summary, level_idx, payload)
+
+                levels = r.get('stats_csk_levels', [])
+                if isinstance(levels, list):
+                    for idx_level, samples in enumerate(levels):
+                        if not isinstance(samples, list):
+                            continue
+                        filtered = _coerce_finite(samples)
+                        if filtered:
+                            csk_level_samples.setdefault(idx_level, []).extend(filtered)
+
+                amp_summary = r.get('hybrid_amp_stats')
+                if isinstance(amp_summary, Mapping):
+                    for key_raw, payload in amp_summary.items():
+                        if not isinstance(payload, Mapping):
+                            continue
+                        try:
+                            mol_label, amp_token = str(key_raw).split('_', 1)
+                            amp_idx = int(amp_token)
+                        except (ValueError, AttributeError):
+                            continue
+                        mol_norm = mol_label.upper()
+                        _merge_stat_summary(hybrid_amp_summary, (mol_norm, amp_idx), payload)
+
+                amp_stats = r.get('stats_hybrid_amp', [])
+                if isinstance(amp_stats, list):
+                    for bit_idx, samples in enumerate(amp_stats[:2]):
+                        if not isinstance(samples, list):
+                            continue
+                        filtered = _coerce_finite(samples)
+                        if filtered:
+                            hybrid_amp_samples.setdefault(bit_idx, []).extend(filtered)
+
             snr_lin = calculate_snr_from_stats(all_a, all_b) if all_a and all_b else 0.0
-            snr_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
+            snr_legacy_db = (10.0 * float(np.log10(snr_lin))) if snr_lin > 0 else float('nan')
+            snr_db = snr_legacy_db
+            mode_upper = mode_name.upper()
+            snr_db_csk_min = float('nan')
+            snr_csk_method = ''
+            snr_csk_boundary: str = ''
+            csk_summary_export = {level: _export_summary(summary) for level, summary in csk_level_summary.items()}
+            snr_db_mosk = snr_legacy_db if mode_upper in ("MOSK", "HYBRID") else float('nan')
+            snr_db_amp = float('nan')
+            snr_amp_method = ''
+            snr_amp_worst = ''
+            hybrid_amp_detail: Dict[str, float] = {}
+            hybrid_amp_summary_export = {
+                f"{mol}_{amp}": _export_summary(summary)
+                for (mol, amp), summary in hybrid_amp_summary.items()
+            }
+
+            if csk_level_summary:
+                snr_db_csk_min, boundary = _min_adjacent_snr_summary(csk_level_summary)
+                if not math.isnan(snr_db_csk_min):
+                    snr_csk_method = 'summary'
+                    if boundary:
+                        snr_csk_boundary = f"{boundary[0]}-{boundary[1]}"
+            if math.isnan(snr_db_csk_min):
+                fallback_csk, fallback_pair = _min_adjacent_snr(csk_level_samples)
+                if not math.isnan(fallback_csk):
+                    snr_db_csk_min = fallback_csk
+                    snr_csk_method = 'samples' if snr_csk_method == '' else snr_csk_method
+                    if not snr_csk_boundary and fallback_pair:
+                        snr_csk_boundary = f"{fallback_pair[0]}-{fallback_pair[1]}"
+
+            if hybrid_amp_summary:
+                grouped: Dict[str, Dict[int, Dict[str, float]]] = {}
+                for (mol, amp_idx), summary in hybrid_amp_summary.items():
+                    grouped.setdefault(mol, {})[amp_idx] = summary
+                worst_val = float('nan')
+                worst_mol = ''
+                for mol_label, entries in grouped.items():
+                    if 0 in entries and 1 in entries:
+                        snr_val = _paired_snr_db_summary(entries[0], entries[1])
+                        if not math.isnan(snr_val):
+                            hybrid_amp_detail[f"{mol_label}_0-1_db"] = snr_val
+                            if math.isnan(worst_val) or snr_val < worst_val:
+                                worst_val = snr_val
+                                worst_mol = mol_label
+                if not math.isnan(worst_val):
+                    snr_db_amp = worst_val
+                    snr_amp_method = 'summary'
+                    snr_amp_worst = worst_mol
+            if math.isnan(snr_db_amp):
+                bit0_samples = hybrid_amp_samples.get(0, [])
+                bit1_samples = hybrid_amp_samples.get(1, [])
+                if bit0_samples and bit1_samples:
+                    snr_db_amp = _paired_snr_db(bit0_samples, bit1_samples)
+                    if not math.isnan(snr_db_amp) and not snr_amp_method:
+                        snr_amp_method = 'samples'
+
+            if mode_upper == "CSK":
+                if not math.isnan(snr_db_csk_min):
+                    snr_db = snr_db_csk_min
+            elif mode_upper == "HYBRID":
+                candidates = [val for val in (snr_db_mosk, snr_db_amp) if not math.isnan(val)]
+                if candidates:
+                    snr_db = min(candidates)
             mean_charge_da = float(np.nanmean(charge_da_all)) if charge_da_all else float('nan')
             mean_charge_sero = float(np.nanmean(charge_sero_all)) if charge_sero_all else float('nan')
             mean_current_da = float(np.nanmean(current_da_all)) if current_da_all else float('nan')
@@ -4692,9 +5145,34 @@ def run_sweep(cfg: Dict[str, Any],
             burst_shape_val = burst_shapes[0] if burst_shapes else ''
     
             mode_name = cfg['pipeline']['modulation']
-            snr_semantics = ("MoSK contrast statistic (sign-aware DA vs SERO)"
-                            if mode_name in ("MoSK", "Hybrid") else
-                            "CSK Q-statistic (dual-channel combiner)")
+            mode_upper = mode_name.upper()
+            if mode_upper == "MOSK":
+                snr_semantics = "MoSK contrast statistic (sign-aware DA vs SERO)"
+            elif mode_upper == "CSK":
+                if math.isnan(snr_db_csk_min):
+                    snr_semantics = "CSK half-constellation SNR (insufficient boundary samples)"
+                else:
+                    method_label = snr_csk_method or "adjacent levels"
+                    snr_semantics = f"CSK min-boundary SNR ({method_label})"
+            elif mode_upper == "HYBRID":
+                parts: List[str] = []
+                if not math.isnan(snr_db_mosk):
+                    parts.append("MoSK")
+                if not math.isnan(snr_db_amp):
+                    parts.append("amplitude")
+                if parts:
+                    parts_label = " & ".join(parts)
+                    suffix_parts: List[str] = []
+                    if snr_amp_method:
+                        suffix_parts.append(f"amp={snr_amp_method}")
+                    if snr_csk_method and not math.isnan(snr_db_csk_min):
+                        suffix_parts.append(f"gate={snr_csk_method}")
+                    suffix = f" [{', '.join(suffix_parts)}]" if suffix_parts else ""
+                    snr_semantics = f"Hybrid min({parts_label}) SNR{suffix}"
+                else:
+                    snr_semantics = "Hybrid MoSK SNR (amplitude statistic unavailable)"
+            else:
+                snr_semantics = "SNR statistic (dual-channel combiner)"
     
             # Extract rho_cc_measured safely before creating the dictionary
             rho_cc_raw = thresholds_map.get(v, {}).get('rho_cc_measured', float('nan'))
@@ -4716,6 +5194,16 @@ def run_sweep(cfg: Dict[str, Any],
                 'ser': ser,
                 'snr_db': snr_db,
                 'snr_semantics': snr_semantics,
+                'snr_db_csk_min': snr_db_csk_min,
+                'snr_csk_method': snr_csk_method,
+                'snr_csk_boundary_min': snr_csk_boundary,
+                'snr_db_mosk': snr_db_mosk,
+                'snr_db_amp': snr_db_amp,
+                'snr_amp_method': snr_amp_method,
+                'snr_amp_worst_molecule': snr_amp_worst,
+                'csk_level_stats_summary': csk_summary_export,
+                'hybrid_amp_stats_summary': hybrid_amp_summary_export,
+                'hybrid_amp_detail_db': hybrid_amp_detail,
                 'num_runs': len(results),
                 'symbols_evaluated': int(total_symbols),
                 'sequence_length': int(cfg['pipeline']['sequence_length']),
@@ -7986,7 +8474,32 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     ser_jobs = len(nm_values) * args.num_seeds
     lod_seed_cap = 10
     lod_jobs = len(lod_distance_grid) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
-    isi_jobs = (len(guard_values) * args.num_seeds) if (not args.disable_isi) else 0
+
+    distance_policy = getattr(args, "distance_sweep", "always")
+    distances_available = bool(lod_distance_grid)
+    do_distance_metrics = False
+    if distance_policy == "always":
+        do_distance_metrics = distances_available
+    elif distance_policy == "auto":
+        do_distance_metrics = distances_available
+    else:  # "never"
+        do_distance_metrics = False
+    dist_jobs = (len(lod_distance_grid) * args.num_seeds) if do_distance_metrics else 0
+
+    do_isi = False
+    if args.isi_sweep == "always":
+        do_isi = not args.disable_isi
+    elif args.isi_sweep == "auto":
+        do_isi = bool(cfg['pipeline'].get('enable_isi', False))
+    else:
+        do_isi = False
+    isi_jobs = (len(guard_values) * args.num_seeds) if do_isi else 0
+
+    manual_total = 2  # SER + LoD
+    if do_distance_metrics:
+        manual_total += 1
+    if do_isi:
+        manual_total += 1
 
     # Hierarchy
     # Create overall progress bar first
@@ -7998,26 +8511,29 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     overall_manual = None
     mode_bar = None
     overall = None
+    df_distance_metrics = pd.DataFrame()
     
     # Initialize variables with proper types
     mode_key: Optional[Tuple[str, str]] = None
     ser_key: Optional[Tuple[str, str, str]] = None
     lod_key: Optional[Tuple[str, str, str]] = None
+    dist_key: Optional[Tuple[str, str, str]] = None
     isi_key: Optional[Tuple[str, str, str]] = None
     
     if hierarchy_supported:
         overall_key = ("overall", mode)
-        overall = pm.task(total=ser_jobs + lod_jobs + isi_jobs, 
-                         description=f"Overall ({mode})", 
+        overall = pm.task(total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
+                         description=f"Overall ({mode})",
                          key=overall_key, kind="overall")
         
         mode_key = ("mode", mode)
-        mode_bar = pm.task(total=ser_jobs + lod_jobs + isi_jobs,
+        mode_bar = pm.task(total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
                           description=f"{mode} Mode",
                           parent=overall_key, key=mode_key, kind="mode")
 
         ser_key = ("sweep", mode, "SER_vs_Nm")
-        lod_key = ("sweep", mode, "LoD_vs_distance") 
+        lod_key = ("sweep", mode, "LoD_vs_distance")
+        dist_key = ("sweep", mode, "SER_SNR_vs_distance")
         isi_key = ("sweep", mode, "ISI_vs_guard")
 
     # Always create the ser_bar with appropriate parent
@@ -8027,6 +8543,12 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                           parent=mode_key, key=("sweep", mode, "SER_vs_Nm"), kind="sweep")
     else:
         ser_bar = None
+
+    if hierarchy_supported and do_distance_metrics:
+        dist_bar = pm.task(total=dist_jobs, description="SER/SNR vs distance",
+                           parent=mode_key, key=dist_key, kind="sweep")
+    else:
+        dist_bar = None
 
     use_ctrl_flag = bool(cfg['pipeline'].get('use_control_channel', True))
     ser_csv, ser_csv_branch, ser_csv_other = _stage_csv_paths("ser", data_dir, mode, suffix, use_ctrl_flag)
@@ -8085,7 +8607,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     if not hierarchy_supported:
         # For rich/tqdm, create simple overall progress tracker
         if overall_manual is None:
-            overall_manual = pm.task(total=3, description=f"{mode} Progress")
+            overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
         overall_manual.update(1, description=f"{mode} - SER vs Nm completed")
 
     # --- Auto-refine near target SER (adds a few Nm points between the bracket) ---
@@ -8263,7 +8785,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                           parent=mode_key, key=lod_key, kind="sweep")
         # Keep the overall headline consistent with the true LoD total
         if hasattr(pm, "update_total") and overall is not None:
-            pm.update_total(key=("overall", mode), total=ser_jobs + lod_jobs + isi_jobs,
+            pm.update_total(key=("overall", mode), total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
                             label=f"Overall ({mode})", kind="overall")
     else:
         lod_bar = None
@@ -8294,11 +8816,11 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     dist_totals = {}  # NEW: track actual totals
 
     for d_um in d_run:
-        dist_key = ("dist", mode, "LoD", float(d_um))
+        dist_progress_key = ("dist", mode, "LoD", float(d_um))
         if hierarchy_supported:
             dist_bar = pm.task(total=estimated_per_distance,
                             description=f"LoD @ {float(d_um):.0f}μm",
-                            parent=lod_key, key=dist_key, kind="dist")
+                            parent=lod_key, key=dist_progress_key, kind="dist")
         else:
             dist_bar = None
         distance_bars[int(d_um)] = dist_bar
@@ -8649,7 +9171,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Manual parent update for non-GUI backends
     if not hierarchy_supported:
         if overall_manual is None:
-            overall_manual = pm.task(total=3, description=f"{mode} Progress")
+            overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
         overall_manual.update(1, description=f"{mode} - LoD vs Distance completed")
 
     # Around line 3889 in run_final_analysis.py
@@ -8657,6 +9179,34 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
         print(f"\nLoD vs Distance (head) for {mode}:")
         print(df_lod[cols_to_show].head().to_string(index=False))
+
+    if do_distance_metrics:
+        df_distance_metrics = _run_distance_metric_sweep(
+            cfg,
+            seeds,
+            mode,
+            lod_distance_grid,
+            data_dir,
+            suffix,
+            df_lod,
+            args,
+            pm,
+            use_ctrl_flag,
+            hierarchy_supported,
+            mode_key,
+            dist_key,
+        )
+        if dist_bar:
+            dist_bar.close()
+        if not hierarchy_supported:
+            if overall_manual is None:
+                overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
+            overall_manual.update(1, description=f"{mode} - SER/SNR vs Distance completed")
+    else:
+        if distance_policy == "never":
+            print("\n2.5. SER/SNR vs distance sweep skipped (--distance-sweep=never).")
+        elif not lod_distance_grid:
+            print("\n2.5. SER/SNR vs distance sweep skipped: no distance grid available.")
 
     if mode == "Hybrid":
         print("\n2′. Updating Hybrid HDS grid (Nm × distance)…")
@@ -8749,15 +9299,6 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     except Exception as device_exc:
         print(f"??  Device FoM sweep skipped: {device_exc}")
     # ---------- 3) ISI trade-off (guard-factor sweep) ----------
-    # BEFORE the sweep
-    do_isi = False
-    if args.isi_sweep == "always":
-        do_isi = True
-    elif args.isi_sweep == "auto":
-        do_isi = bool(cfg['pipeline'].get('enable_isi', False))
-    else:  # "never"
-        do_isi = False
-
     if do_isi:
         print("\n3. Running ISI trade-off sweep (guard factor)…")
         
@@ -8910,7 +9451,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # Manual parent update for non-GUI backends
         if not hierarchy_supported:
             if overall_manual is None:
-                overall_manual = pm.task(total=3, description=f"{mode} Progress")
+                overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
             overall_manual.update(1, description=f"{mode} - ISI Trade-off completed")
 
         # NEW: Generate ISI-distance grid for Hybrid mode 2D visualization

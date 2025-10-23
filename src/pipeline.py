@@ -17,6 +17,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from functools import partial
+from collections import defaultdict
 
 # Import vectorized transport functions including batch time
 from .mc_channel.transport import finite_burst_concentration, finite_burst_concentration_batch, finite_burst_concentration_batch_time
@@ -25,6 +26,55 @@ from .mc_receiver.oect import oect_trio
 from .constants import get_nt_params
 
 logger = logging.getLogger(__name__)
+
+
+class RunningStat:
+    """Online mean/variance tracker (Welford)."""
+
+    __slots__ = ("count", "mean", "_m2")
+
+    def __init__(self) -> None:
+        self.count: int = 0
+        self.mean: float = 0.0
+        self._m2: float = 0.0
+
+    def update(self, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self._m2 += delta * delta2
+
+    def merge(self, other: "RunningStat") -> None:
+        if other.count == 0:
+            return
+        if self.count == 0:
+            self.count = other.count
+            self.mean = other.mean
+            self._m2 = other._m2
+            return
+        total = self.count + other.count
+        delta = other.mean - self.mean
+        self._m2 += other._m2 + delta * delta * self.count * other.count / total
+        self.mean = (self.mean * self.count + other.mean * other.count) / total
+        self.count = total
+
+    @property
+    def variance(self) -> float:
+        if self.count <= 1:
+            return 0.0
+        return self._m2 / (self.count - 1)
+
+    def as_summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {"count": 0, "mean": float("nan"), "var": float("nan")}
+        return {
+            "count": float(self.count),
+            "mean": float(self.mean),
+            "var": float(self.variance),
+        }
 
 def to_int(value):
     """Convert value to int, handling scientific notation strings"""
@@ -673,6 +723,20 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
     stats_charge_sero: List[float] = []
     stats_current_da: List[float] = []
     stats_current_sero: List[float] = []
+    stats_csk_levels: Optional[Dict[int, RunningStat]] = None
+    stats_csk_levels_legacy: Optional[List[List[float]]] = None
+    stats_hybrid_amp: Optional[Dict[Tuple[str, int], RunningStat]] = None
+    stats_hybrid_amp_legacy: Optional[List[List[float]]] = None
+    if mod == "CSK":
+        level_count = int(cfg.get('pipeline', {}).get('csk_levels', 4))
+        if level_count <= 0:
+            level_count = 1
+        stats_csk_levels = defaultdict(RunningStat)
+        # Retain legacy list capture to keep backward-compatible payloads while new summaries mature
+        stats_csk_levels_legacy = [[] for _ in range(level_count)]
+    elif mod == "Hybrid":
+        stats_hybrid_amp = defaultdict(RunningStat)
+        stats_hybrid_amp_legacy = [[], []]
     constellation_points: List[Dict[str, float]] = []
     mosk_stats_raw: List[float] = []
     mosk_stats_z: List[float] = []
@@ -1112,6 +1176,15 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 stats_charge_sero.append(primary_charge)
                 stats_current_sero.append(primary_current)
 
+            true_level = int(s_tx)
+            if stats_csk_levels is not None:
+                stats_csk_levels[true_level].update(float(decision_stat))
+            if stats_csk_levels_legacy is not None:
+                try:
+                    stats_csk_levels_legacy[true_level].append(float(decision_stat))
+                except (ValueError, IndexError):
+                    pass
+
             # Log configuration on first symbol (for debugging)
             if i == 0:
                 cb = cfg['pipeline'].get('csk_selected_combiner', combiner)
@@ -1234,8 +1307,16 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 stats_charge_sero.append(q_sero_raw)
                 stats_current_sero.append(mean_i_sero_raw)
 
-            true_mol_bit = s_tx >> 1
-            true_amp_bit = s_tx & 1
+            true_mol_bit = int(s_tx >> 1)
+            true_amp_bit = int(s_tx & 1)
+            if stats_hybrid_amp is not None:
+                mol_label = 'DA' if true_mol_bit == 0 else 'SERO'
+                stats_hybrid_amp[(mol_label, true_amp_bit)].update(float(decision_stat_amp))
+            if stats_hybrid_amp_legacy is not None:
+                try:
+                    stats_hybrid_amp_legacy[true_amp_bit].append(float(decision_stat_amp))
+                except (ValueError, IndexError):
+                    pass
             # Enhanced subsymbol error tracking:
             if b_hat != true_mol_bit:
                 subsymbol_errors['mosk'] += 1
@@ -1320,6 +1401,13 @@ def run_sequence(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "stats_charge_sero": stats_charge_sero,
         "stats_current_da": stats_current_da,
         "stats_current_sero": stats_current_sero,
+        "stats_csk_levels": stats_csk_levels_legacy if stats_csk_levels_legacy is not None else [],
+        "csk_level_stats": {int(level): stat.as_summary() for level, stat in (stats_csk_levels or {}).items()},
+        "stats_hybrid_amp": stats_hybrid_amp_legacy if stats_hybrid_amp_legacy is not None else [],
+        "hybrid_amp_stats": {
+            f"{mol}_{amp}": stat.as_summary()
+            for (mol, amp), stat in (stats_hybrid_amp or {}).items()
+        },
         "constellation_points": constellation_points,
         "mosk_stats_raw": mosk_stats_raw,
         "mosk_stats_zscore": mosk_stats_z,

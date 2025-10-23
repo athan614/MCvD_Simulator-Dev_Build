@@ -70,7 +70,7 @@ from analysis.maintenance_suite import (
 
 # Maintenance stage numbering shared with run_final_analysis:
 #   Stage 1 - SER vs Nm sweeps
-#   Stage 2 - LoD vs distance search
+#   Stage 2 - LoD vs distance search + SER/SNR sweep
 #   Stage 3 - Device FoM parameter sweeps
 #   Stage 4 - Guard-frontier / ISI trade-off
 #   Stage 5 - Main figures
@@ -129,6 +129,8 @@ _STAGE_ALIAS_MAP = {
     "lod": 2,
     "lod_vs_distance": 2,
     "distance": 2,
+    "dist": 2,
+    "ser_snr_vs_distance": 2,
     "device": 3,
     "device_fom": 3,
     "devicefom": 3,
@@ -788,7 +790,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                    help="Run modes concurrently within each ablation run (e.g., 3 for all three)")
     # Quick-stage execution (Stage references mirror run_final_analysis)
     #   Stage 1 - SER vs Nm
-    #   Stage 2 - LoD vs distance
+#   Stage 2 - LoD vs distance + SER/SNR sweep
     #   Stage 3 - Device FoM sweeps
     #   Stage 4 - Guard frontier / ISI trade-off
     #   Stage 5 - Main figures
