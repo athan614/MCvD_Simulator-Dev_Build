@@ -32,9 +32,12 @@ import subprocess
 import sys
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, no_type_check
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import yaml
 
 # Disable BLAS/OpenMP oversubscription for optimal process-level parallelism
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -120,6 +123,40 @@ def _extend_nm_grid_flags(cmd: List[str], args: argparse.Namespace) -> None:
         value = getattr(args, attr, "")
         if value:
             cmd.extend([flag, value])
+
+
+DEFAULT_CONFIG_PATH = project_root / "config" / "default.yaml"
+
+
+@lru_cache(maxsize=1)
+def _load_default_config() -> Dict[str, Any]:
+    with open(DEFAULT_CONFIG_PATH, encoding="utf-8") as cfg_file:
+        return yaml.safe_load(cfg_file)
+
+
+def _format_cli_number(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if num.is_integer():
+        return str(int(num))
+    return str(num)
+
+
+def _distance_cli_specs_from_config() -> List[str]:
+    cfg = _load_default_config()
+    dist_cfg = cfg.get("lod_distances_um", {}) or {}
+    mode_order = ("MoSK", "CSK", "Hybrid")
+    specs: List[str] = []
+    for mode in mode_order:
+        values = dist_cfg.get(mode)
+        if not values:
+            continue
+        formatted = ",".join(_format_cli_number(v) for v in values)
+        if formatted:
+            specs.append(f"{mode}={formatted}")
+    return specs
 
 
 _STAGE_ALIAS_MAP = {
@@ -1116,12 +1153,9 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
 
             # Avoid infeasible tails: skip LoD when Ts is too large (no physics change)
             if not args.distances:
-                # keep long points optional; user can restore by passing --max-ts-for-lod=None
-                args.distances = [
-                    "MoSK=25,35,45,55,65,75,85,95,105,125,150,175,200",
-                    "CSK=15,25,35,45,55,65,75,85,95,105,115,125",
-                    "Hybrid=15,20,25,30,35,40,45,55,65,75,85,95,105,115,125,150",
-                ]
+                cfg_specs = _distance_cli_specs_from_config()
+                if cfg_specs:
+                    args.distances = cfg_specs
 
             # Force comprehensive coverage
             if lock_modes:
@@ -1505,7 +1539,13 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 return 0
             
             # Determine which modes to run
-            modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+            modes = list(mode_list)
+            if use_ctrl:
+                modes = [m for m in modes if m.upper() != "MOSK"]
+            if not modes:
+                print(f"\n🧪 Simulate ({'CTRL' if use_ctrl else 'NoCTRL'}) — modes: [] (skipped)")
+                _mark_done(state, skey)
+                return 0
             print(f"\n🧪 Simulate ({'CTRL' if use_ctrl else 'NoCTRL'}) — modes: {modes}")
 
             # Run per-mode children concurrently (isolated process pools)
@@ -1774,55 +1814,60 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                         sys.exit(rc)
 
             if args.csk_baselines:
-                if master_cancelled.is_set():
-                    _safe_close_progress(pm, overall, sub)
-                    print("?? Master pipeline stopped by user")
-                    sys.exit(130)
-
-                if not (args.resume and state.get("csk_baselines", {}).get("done")):
-                    print("\n?? Running CSK baseline sweeps (single vs dual)...")
-
-                    def _exec_baseline(cmd: List[str]) -> None:
-                        print(f"  $ {' '.join(cmd)}")
-                        rc = _run_tracked(cmd)
-                        if rc == 130:
-                            _safe_close_progress(pm, overall, sub, "csk_baselines")
-                            print("?? Master pipeline stopped by user")
-                            sys.exit(130)
-                        elif rc != 0:
-                            _safe_close_progress(pm, overall, sub, "csk_baselines")
-                            sys.exit(rc)
-
-                    ser_baselines = [
-                        (False, ["--variant", "single_DA_noctrl", "--csk-target", "DA", "--csk-dual", "off"]),
-                        (False, ["--variant", "single_SERO_noctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
-                        (False, ["--variant", "dual_noctrl", "--csk-dual", "on"]),
-                    ]
-                    for use_ctrl, extra in ser_baselines:
-                        cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
-                        cmd.extend(extra)
-                        _exec_baseline(cmd)
-
-                    lod_baselines = [
-                        (True, ["--variant", "single_DA_ctrl", "--csk-target", "DA", "--csk-dual", "off"]),
-                        (True, ["--variant", "single_SERO_ctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
-                        (True, ["--variant", "dual_ctrl", "--csk-dual", "on"]),
-                    ]
-                    for use_ctrl, extra in lod_baselines:
-                        cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
-                        cmd.extend(extra)
-                        _exec_baseline(cmd)
-
-                    plot_script = project_root / "analysis" / "plot_csk_single_dual.py"
-                    if plot_script.exists():
-                        _exec_baseline([sys.executable, "-u", str(plot_script)])
-                    else:
-                        print("??  CSK baseline plot script not found; skipping plot step")
-
+                has_csk_mode = any(m.upper() == "CSK" for m in mode_list)
+                if not has_csk_mode:
+                    print("\n?? CSK baseline sweeps skipped (CSK mode not requested).")
                     _mark_done(state, "csk_baselines")
+                    sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
+                else:
+                    if master_cancelled.is_set():
+                        _safe_close_progress(pm, overall, sub)
+                        print("?? Master pipeline stopped by user")
+                        sys.exit(130)
 
-                sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
+                    if not (args.resume and state.get("csk_baselines", {}).get("done")):
+                        print("\n?? Running CSK baseline sweeps (single vs dual)...")
 
+                        def _exec_baseline(cmd: List[str]) -> None:
+                            print(f"  $ {' '.join(cmd)}")
+                            rc = _run_tracked(cmd)
+                            if rc == 130:
+                                _safe_close_progress(pm, overall, sub, "csk_baselines")
+                                print("?? Master pipeline stopped by user")
+                                sys.exit(130)
+                            elif rc != 0:
+                                _safe_close_progress(pm, overall, sub, "csk_baselines")
+                                sys.exit(rc)
+
+                        ser_baselines = [
+                            (False, ["--variant", "single_DA_noctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                            (False, ["--variant", "single_SERO_noctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                            (False, ["--variant", "dual_noctrl", "--csk-dual", "on"]),
+                        ]
+                        for use_ctrl, extra in ser_baselines:
+                            cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                            cmd.extend(extra)
+                            _exec_baseline(cmd)
+
+                        lod_baselines = [
+                            (True, ["--variant", "single_DA_ctrl", "--csk-target", "DA", "--csk-dual", "off"]),
+                            (True, ["--variant", "single_SERO_ctrl", "--csk-target", "SERO", "--csk-dual", "off"]),
+                            (True, ["--variant", "dual_ctrl", "--csk-dual", "on"]),
+                        ]
+                        for use_ctrl, extra in lod_baselines:
+                            cmd = _build_run_final_cmd_for_mode(args, "CSK", use_ctrl, concurrent_modes=1)
+                            cmd.extend(extra)
+                            _exec_baseline(cmd)
+
+                        plot_script = project_root / "analysis" / "plot_csk_single_dual.py"
+                        if plot_script.exists():
+                            _exec_baseline([sys.executable, "-u", str(plot_script)])
+                        else:
+                            print("??  CSK baseline plot script not found; skipping plot step")
+
+                        _mark_done(state, "csk_baselines")
+
+                    sub["csk_baselines"].update(1); sub["csk_baselines"].close(); overall.update(1)
             if args.channel_suite:
                 if master_cancelled.is_set():
                     _safe_close_progress(pm, overall, sub)
