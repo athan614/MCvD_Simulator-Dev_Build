@@ -2251,7 +2251,11 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
             if not (args.resume and state.get(key, {}).get("done")):
                 print()
                 print("[study] Running capacity analysis...")
-                rc = _run_tracked([sys.executable, "-u", "analysis/capacity_analysis.py", "--progress", args.progress])
+                capacity_cmd = [sys.executable, "-u", "analysis/capacity_analysis.py", "--progress", args.progress]
+                modes_arg = getattr(args, "modes", None)
+                if modes_arg:
+                    capacity_cmd.extend(["--modes", modes_arg])
+                rc = _run_tracked(capacity_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)
                     print("[stop] Master pipeline stopped by user")
@@ -2292,6 +2296,8 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 print()
                 print("[study] Running organoid sensitivity sweeps...")
                 organoid_cmd = [sys.executable, "-u", "analysis/organoid_sensitivity.py"]
+                if args.recalibrate:
+                    organoid_cmd.append("--recalibrate")
                 rc = _run_tracked(organoid_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)

@@ -26,6 +26,11 @@ import pandas as pd
 import yaml
 import math
 
+from analysis.run_final_analysis import (
+    calibrate_thresholds_cached,
+    _apply_thresholds_into_cfg,
+    _thresholds_filename,
+)
 from src.config_utils import preprocess_config
 from src.pipeline import run_sequence
 
@@ -35,6 +40,49 @@ class SweepConfig:
     values: Sequence[float]
     label: str
     param_path: Tuple[str, ...]
+
+
+_THRESHOLD_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _calibration_key(cfg: Dict[str, Any]) -> str:
+    """
+    Build a deterministic cache key that matches the threshold filename logic so
+    cached calibrations line up with on-disk JSON artifacts.
+    """
+    cfg_copy = deepcopy(cfg)
+    return str(_thresholds_filename(cfg_copy))
+
+
+def _resolve_calibration_seeds(seeds: Sequence[int]) -> List[int]:
+    resolved: List[int] = []
+    for idx, seed in enumerate(seeds):
+        try:
+            resolved.append(int(seed))
+        except Exception:
+            resolved.append(idx)
+    if not resolved:
+        resolved = list(range(6))
+    return resolved
+
+
+def _get_thresholds_for_cfg(cfg: Dict[str, Any],
+                            seeds: Sequence[int],
+                            recalibrate: bool) -> Dict[str, Any]:
+    """
+    Calibrate (or reuse) thresholds for the provided configuration.
+    """
+    key = _calibration_key(cfg)
+    if recalibrate:
+        _THRESHOLD_CACHE.pop(key, None)
+
+    thresholds = _THRESHOLD_CACHE.get(key)
+    if thresholds is None:
+        cfg_cal = deepcopy(cfg)
+        cal_seeds = _resolve_calibration_seeds(seeds)
+        thresholds = calibrate_thresholds_cached(cfg_cal, cal_seeds, recalibrate=recalibrate)
+        _THRESHOLD_CACHE[key] = deepcopy(thresholds)
+    return deepcopy(thresholds)
 
 
 def _ensure_dir(path: Path) -> None:
@@ -152,12 +200,18 @@ def _aggregate_run(results: List[Dict[str, Any]]) -> Dict[str, float]:
     }
 
 
-def run_monte_carlo(cfg: Dict[str, Any], seeds: Sequence[int], sequence_length: int) -> Dict[str, float]:
+def run_monte_carlo(cfg: Dict[str, Any],
+                    seeds: Sequence[int],
+                    sequence_length: int,
+                    recalibrate: bool) -> Dict[str, float]:
+    thresholds = _get_thresholds_for_cfg(cfg, seeds, recalibrate)
     results: List[Dict[str, Any]] = []
     for seed in seeds:
         cfg_seed = deepcopy(cfg)
-        cfg_seed['pipeline']['random_seed'] = int(seed)
-        cfg_seed['pipeline']['sequence_length'] = sequence_length
+        _apply_thresholds_into_cfg(cfg_seed, thresholds)
+        pipe = cfg_seed.setdefault('pipeline', {})
+        pipe['random_seed'] = int(seed)
+        pipe['sequence_length'] = sequence_length
         cfg_seed['disable_progress'] = True
         res = run_sequence(cfg_seed)
         results.append(res)
@@ -186,10 +240,14 @@ def _average_psd(payloads: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return averaged
 
 
-def capture_noise_psd(cfg: Dict[str, Any], seeds: Sequence[int]) -> Optional[Dict[str, Any]]:
+def capture_noise_psd(cfg: Dict[str, Any],
+                      seeds: Sequence[int],
+                      recalibrate: bool) -> Optional[Dict[str, Any]]:
     payloads: List[Dict[str, Any]] = []
+    thresholds = _get_thresholds_for_cfg(cfg, seeds, recalibrate)
     for seed in seeds:
         cfg_noise = deepcopy(cfg)
+        _apply_thresholds_into_cfg(cfg_noise, thresholds)
         pipe = cfg_noise.setdefault("pipeline", {})
         pipe["_noise_only_run"] = True
         pipe["_collect_noise_components"] = True
@@ -290,14 +348,14 @@ def run_alpha_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpar
             cfg = deepcopy(base_cfg)
             cfg['noise']['alpha_H'] = float(alpha)
             cfg['pipeline']['Nm_per_symbol'] = int(nm)
-            agg = run_monte_carlo(cfg, seeds, args.sequence_length)
+            agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
             agg.update({"alpha_H": float(alpha), "Nm_per_symbol": int(nm)})
             rows.append(agg)
 
         psd_cfg = deepcopy(base_cfg)
         psd_cfg['noise']['alpha_H'] = float(alpha)
         psd_cfg['pipeline']['Nm_per_symbol'] = int(nm_values[0]) if nm_values else base_cfg['pipeline'].get('Nm_per_symbol', 1000)
-        psd = capture_noise_psd(psd_cfg, seeds)
+        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
         if psd:
             psd_frames.append(psd_to_dataframe(psd, "alpha_H", float(alpha)))
 
@@ -336,7 +394,7 @@ def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
         cfg['oect']['gm_S'] = gm_scaled
 
         cfg['pipeline']['Nm_per_symbol'] = args.bias_nm
-        agg = run_monte_carlo(cfg, seeds, args.sequence_length)
+        agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
         agg.update({
             "I_dc_A": bias_val,
             "gm_S": gm_scaled,
@@ -348,7 +406,7 @@ def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
         psd_cfg['oect']['I_dc_A'] = bias_val
         psd_cfg['oect']['gm_S'] = gm_scaled
         psd_cfg['pipeline']['Nm_per_symbol'] = args.bias_nm
-        psd = capture_noise_psd(psd_cfg, seeds)
+        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
         if psd:
             frame = psd_to_dataframe(psd, "I_dc_A", float(bias))
             frame["gm_S"] = gm_scaled
@@ -373,12 +431,12 @@ def run_qeff_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
         cfg['neurotransmitters']['SERO']['q_eff_e'] = base_q_sero * float(scale)
         cfg['pipeline']['Nm_per_symbol'] = args.qeff_nm
 
-        agg = run_monte_carlo(cfg, seeds, args.sequence_length)
+        agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
         agg.update({"q_eff_scale": float(scale)})
         rows.append(agg)
 
         psd_cfg = deepcopy(cfg)
-        psd = capture_noise_psd(psd_cfg, seeds)
+        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
         if psd:
             psd_frames.append(psd_to_dataframe(psd, "q_eff_scale", float(scale)))
 
@@ -405,6 +463,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qeff-nm", type=int, default=2000, help="Nm per symbol for q_eff sweep.")
     parser.add_argument("--nm-grid", type=int, nargs="+", default=None, help="Optional Nm values for alpha sweep.")
     parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory for outputs.")
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Force threshold recalibration (ignore cached JSON files).",
+    )
     return parser.parse_args()
 
 

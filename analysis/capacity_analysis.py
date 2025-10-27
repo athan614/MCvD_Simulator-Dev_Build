@@ -37,6 +37,8 @@ from analysis.run_final_analysis import (
     canonical_value_key,
 )
 
+ALL_MODES: Tuple[str, ...] = ("MoSK", "CSK", "Hybrid")
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Estimate capacity bounds for MoSK, CSK, and Hybrid modes.")
@@ -45,7 +47,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mc", type=int, default=5000, help="Monte Carlo samples for MI estimation (default: 5000).")
     parser.add_argument("--force", action="store_true", help="Ignore existing CSV and recompute.")
     parser.add_argument("--progress", default="none", help="Placeholder for run_master compatibility.")
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default="all",
+        help="Comma-separated list of modes (MoSK,CSK,Hybrid) or 'all' (default).",
+    )
     return parser.parse_args()
+
+
+def _resolve_modes(spec: Optional[str]) -> List[str]:
+    if not spec:
+        return list(ALL_MODES)
+    tokens = [tok.strip() for tok in spec.split(",") if tok.strip()]
+    if not tokens:
+        return list(ALL_MODES)
+    if len(tokens) == 1 and tokens[0].lower() == "all":
+        return list(ALL_MODES)
+    resolved: List[str] = []
+    for token in tokens:
+        token_upper = token.upper()
+        if token_upper == "MOSK":
+            resolved.append("MoSK")
+        elif token_upper == "CSK":
+            resolved.append("CSK")
+        elif token_upper == "HYBRID":
+            resolved.append("Hybrid")
+        else:
+            raise ValueError(f"Unsupported mode '{token}'. Expected MoSK, CSK, Hybrid, or 'all'.")
+    # Preserve order but remove duplicates while keeping first occurrence
+    deduped: List[str] = []
+    for mode in resolved:
+        if mode not in deduped:
+            deduped.append(mode)
+    return deduped
 
 
 def _load_cfg() -> Dict[str, Any]:
@@ -388,10 +423,9 @@ def _plot_capacity(df_mode: pd.DataFrame, mode: str) -> None:
     print(f"[saved] {out_png}")
 
 
-def _plot_capacity_dashboard(df: pd.DataFrame) -> None:
-    if df.empty:
+def _plot_capacity_dashboard(df: pd.DataFrame, modes: Sequence[str]) -> None:
+    if df.empty or not modes:
         return
-    modes = ["MoSK", "CSK", "Hybrid"]
     data = [(m, df[df["mode"] == m].sort_values("distance_um")) for m in modes]
     if not any(not d.empty for _, d in data):
         return
@@ -429,10 +463,9 @@ def _plot_capacity_dashboard(df: pd.DataFrame) -> None:
     print(f"[saved] {out_png}")
 
 
-def _write_capacity_table(df: pd.DataFrame) -> None:
-    if df.empty:
+def _write_capacity_table(df: pd.DataFrame, modes: Sequence[str]) -> None:
+    if df.empty or not modes:
         return
-    modes = ["MoSK", "CSK", "Hybrid"]
     rows = []
     for mode in modes:
         df_mode = df[df["mode"] == mode]
@@ -476,12 +509,16 @@ def main() -> None:
     if args.samples <= 0 or args.mc <= 0:
         raise ValueError("--samples and --mc must be positive integers")
 
+    selected_modes = _resolve_modes(args.modes)
+    if not selected_modes:
+        selected_modes = list(ALL_MODES)
+
     cfg = _load_cfg()
     data_dir = project_root / "results" / "data"
 
     records: List[Dict[str, Any]] = []
 
-    for mode in ("MoSK", "CSK", "Hybrid"):
+    for mode in selected_modes:
         ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"
         nm = None
         distance = None
@@ -517,6 +554,8 @@ def main() -> None:
             nm = fallback_nm if (fallback_nm is not None and math.isfinite(fallback_nm)) else 1e4
         if use_ctrl is None:
             use_ctrl = bool(cfg["pipeline"].get("use_control_channel", True))
+        if mode == "MoSK":
+            use_ctrl = False
 
         print(f"[info] {mode}: distance={distance:.1f} um, Nm={nm:.3g}, use_ctrl={use_ctrl}")
 
@@ -552,12 +591,12 @@ def main() -> None:
     os.replace(tmp, out_csv)
     print(f"[saved] {out_csv}")
 
-    for mode in df_out["mode"].unique():
+    for mode in selected_modes:
         df_mode = df_out[df_out["mode"] == mode]
         _plot_capacity(df_mode, mode)
 
-    _plot_capacity_dashboard(df_out)
-    _write_capacity_table(df_out)
+    _plot_capacity_dashboard(df_out, selected_modes)
+    _write_capacity_table(df_out, selected_modes)
 
     print("[done] Capacity analysis complete.")
 

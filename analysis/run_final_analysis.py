@@ -530,7 +530,7 @@ if I9_13950HX_DETECTED or I9_14900KS_DETECTED or I9_14900K_DETECTED:
     else:
         # Fallback to generic detection if specific model isn't found in processor string
         CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]  # Use as default for this topology
-        print("🔥 Intel 13th/14th gen hybrid CPU detected! P-core optimization available.")
+        print("?? Intel 13th/14th gen hybrid CPU detected! P-core optimization available.")
 
 def get_optimal_workers(mode: str = "optimal") -> int:
     if not CPU_CONFIG:
