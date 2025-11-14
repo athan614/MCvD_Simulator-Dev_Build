@@ -30,6 +30,7 @@ import queue as pyqueue
 import signal
 import subprocess
 import logging
+from collections import defaultdict
 from statistics import NormalDist
 
 _SYNTHETIC_NOISE_WARNING_SHOWN = False
@@ -481,6 +482,10 @@ PHYSICAL_CORES = psutil.cpu_count(logical=False) or 1
 I9_13950HX_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24
 I9_14900KS_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24  # Same topology as 13950HX
 I9_14900K_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24   # Same topology as 13950HX/14900KS
+
+# Timeout governance for hung seeds (configurable via run_master CLI)
+DEFAULT_SEED_TIMEOUT_RETRIES = 2
+DEFAULT_SEED_RESTART_LIMIT = 2
 
 HYBRID_CPU_CONFIGS: Dict[str, CPUConfig] = {
     "i9-13950HX": {
@@ -3200,6 +3205,10 @@ def parse_arguments() -> argparse.Namespace:
                         help="Soft timeout for seed completion before retry hint (default: 1800s/30min)")
     parser.add_argument("--nonlod-watchdog-secs", type=int, default=3600,
                         help="Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.); <=0 disables.")
+    parser.add_argument("--seed-timeout-retries", type=int, default=DEFAULT_SEED_TIMEOUT_RETRIES,
+                        help="Watchdog expirations for a single seed before restarting the worker pool.")
+    parser.add_argument("--seed-timeout-restarts", type=int, default=DEFAULT_SEED_RESTART_LIMIT,
+                        help="Maximum pool restarts triggered by one seed before aborting the sweep.")
     parser.add_argument("--guard-max-ts", type=float, default=0.0,
                         help="Cap guard-factor sweeps when symbol period exceeds this many seconds (0 disables).")
     parser.add_argument("--target-ci", type=float, default=0.004,
@@ -4586,6 +4595,22 @@ def run_sweep(cfg: Dict[str, Any],
             free_slots = deque(range(slot_count))
             fut_slot: Dict[Any, int] = {}
             fut_seed: Dict[Any, int] = {}  # NEW: Track which seed each future handles
+            max_seed_timeouts = max(1, int(cfg.get('_seed_timeout_retry_budget', DEFAULT_SEED_TIMEOUT_RETRIES)))
+            max_seed_restarts = max(1, int(cfg.get('_seed_restart_limit', DEFAULT_SEED_RESTART_LIMIT)))
+            seed_timeout_counts: Dict[int, int] = defaultdict(int)
+            seed_restart_counts: Dict[int, int] = defaultdict(int)
+
+            def _drain_pending_futures() -> List[int]:
+                stalled: List[int] = []
+                for stale_fut in list(pending):
+                    pending.remove(stale_fut)
+                    seed_s = fut_seed.pop(stale_fut, None)
+                    slot_s = fut_slot.pop(stale_fut, -1)
+                    if slot_s >= 0 and pm and hasattr(pm, "worker_update"):
+                        pm.worker_update(slot_s, "idle")
+                    if seed_s is not None:
+                        stalled.append(seed_s)
+                return sorted(stalled)
             
             while (idx < len(seeds_to_run) or pending) and not CANCEL.is_set():
                 # top-up
@@ -4652,16 +4677,61 @@ def run_sweep(cfg: Dict[str, Any],
                                 print(f"        ? Cancelled stale future for seed {seed_r}")
                                 pending.remove(to_retry)
                                 fut_seed.pop(to_retry, None)
+                                slot = fut_slot.pop(to_retry, -1)
+                                if slot >= 0:
+                                    if pm and hasattr(pm, "worker_update"):
+                                        pm.worker_update(slot, "idle")
+                                    free_slots.append(slot)
+                                print(f"        ?? Retrying seed {seed_r} for {sweep_param}={v}")
+                                retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
+                                retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
+                                                        debug_calibration, thresholds_override,
+                                                        sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate,
+                                                        freeze_snapshot=freeze_snapshot)
+                                pending.add(retry_fut)
+                                fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
                             else:
-                                print(f"        ??  Could not cancel running future for seed {seed_r}")
-                            print(f"        ?? Retrying seed {seed_r} for {sweep_param}={v}")
-                            retry_tag = f"{cache_tag}_retry" if cache_tag else "retry"
-                            retry_fut = pool.submit(run_param_seed_combo, cfg, sweep_param, v, seed_r,
-                                                    debug_calibration, thresholds_override,
-                                                    sweep_name=sweep_folder, cache_tag=retry_tag, recalibrate=recalibrate,
-                                                    freeze_snapshot=freeze_snapshot)
-                            pending.add(retry_fut)
-                            fut_seed[retry_fut] = seed_r  # NEW: Track retry future too
+                                print(f"        ??  Could not cancel running future for seed {seed_r}; waiting for completion without spawning a duplicate")
+                                seed_timeout_counts[seed_r] += 1
+                                used_budget = seed_timeout_counts[seed_r]
+                                if used_budget >= max_seed_timeouts:
+                                    seed_restart_counts[seed_r] += 1
+                                    restart_attempt = seed_restart_counts[seed_r]
+                                    print(f"        ??  Seed {seed_r} exceeded timeout budget ({used_budget}/{max_seed_timeouts}); restarting worker pool (attempt {restart_attempt}/{max_seed_restarts})")
+                                    stalled_seeds = _drain_pending_futures()
+                                    try:
+                                        global_pool.force_kill()
+                                    except Exception as kill_err:
+                                        print(f"        ??  Worker termination raised {kill_err!r}; continuing with restart")
+                                    resolved_workers = getattr(global_pool, "_max_workers", None)
+                                    new_max = resolved_workers or max_workers
+                                    pool = global_pool.get_pool(max_workers=new_max)
+                                    max_workers = new_max
+                                    slot_count = max(1, getattr(global_pool, "_max_workers", CPU_COUNT or 4))
+                                    free_slots = deque(range(slot_count))
+                                    fut_seed.clear()
+                                    fut_slot.clear()
+                                    pending.clear()
+                                    seed_timeout_counts[seed_r] = 0
+                                    for stalled_seed in stalled_seeds:
+                                        if stalled_seed != seed_r:
+                                            seed_timeout_counts.pop(stalled_seed, None)
+                                    if restart_attempt > max_seed_restarts:
+                                        raise RuntimeError(f"Seed {seed_r} for {sweep_param}={v} exceeded restart limit ({max_seed_restarts}); aborting sweep.")
+                                    requeue: List[int] = []
+                                    seen: Set[int] = set()
+                                    for s in [seed_r] + stalled_seeds:
+                                        if s is None or s in seen:
+                                            continue
+                                        seen.add(s)
+                                        requeue.append(s)
+                                    if requeue:
+                                        seeds_to_run[idx:idx] = requeue
+                                    remaining = len(seeds_to_run) - idx
+                                    batch_size = max(1, min(remaining if remaining > 0 else max_workers, max_workers))
+                                    continue
+                                else:
+                                    print(f"        ??  Timeout budget used for seed {seed_r}: {used_budget}/{max_seed_timeouts}")
                         continue  # NEW: Skip to next iteration after timeout handling
                     # adaptive early-stop when enough seeds and CI small enough
                     if target_ci > 0.0 and len(results) >= min_ci_seeds:
@@ -8396,6 +8466,8 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_stage13_lod_delta'] = float(args.lod_screen_delta)
     cfg['_watchdog_secs'] = int(args.watchdog_secs)
     cfg['_nonlod_watchdog_secs'] = int(args.nonlod_watchdog_secs)
+    cfg['_seed_timeout_retry_budget'] = int(args.seed_timeout_retries)
+    cfg['_seed_restart_limit'] = int(args.seed_timeout_restarts)
     cfg['_guard_max_ts'] = float(args.guard_max_ts)
     guard_cap_cfg = (cfg.get('analysis', {}) or {}).get('guard_samples_cap', DEFAULT_GUARD_SAMPLES_CAP)
     try:

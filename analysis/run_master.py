@@ -126,6 +126,9 @@ def _extend_nm_grid_flags(cmd: List[str], args: argparse.Namespace) -> None:
 
 
 DEFAULT_CONFIG_PATH = project_root / "config" / "default.yaml"
+DEFAULT_NONLOD_WATCHDOG_SECS = 4 * 3600  # Hybrid sweeps routinely exceed one hour
+DEFAULT_SEED_TIMEOUT_RETRIES = 2
+DEFAULT_SEED_TIMEOUT_RESTARTS = 2
 
 
 @lru_cache(maxsize=1)
@@ -548,8 +551,12 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--ts-warn-only")
     if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
-    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != 3600:
+    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != DEFAULT_NONLOD_WATCHDOG_SECS:
         cmd.extend(["--nonlod-watchdog-secs", str(args.nonlod_watchdog_secs)])
+    if hasattr(args, 'seed_timeout_retries') and args.seed_timeout_retries != DEFAULT_SEED_TIMEOUT_RETRIES:
+        cmd.extend(["--seed-timeout-retries", str(args.seed_timeout_retries)])
+    if hasattr(args, 'seed_timeout_restarts') and args.seed_timeout_restarts != DEFAULT_SEED_TIMEOUT_RESTARTS:
+        cmd.extend(["--seed-timeout-restarts", str(args.seed_timeout_restarts)])
     if hasattr(args, 'guard_max_ts') and args.guard_max_ts != 0.0:
         cmd.extend(["--guard-max-ts", str(args.guard_max_ts)])
     if getattr(args, 'lod_max_nm', None) is not None:
@@ -688,8 +695,12 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.append("--ts-warn-only")
     if hasattr(args, 'watchdog_secs') and args.watchdog_secs != 1800:
         cmd.extend(["--watchdog-secs", str(args.watchdog_secs)])
-    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != 3600:
+    if hasattr(args, 'nonlod_watchdog_secs') and args.nonlod_watchdog_secs != DEFAULT_NONLOD_WATCHDOG_SECS:
         cmd.extend(["--nonlod-watchdog-secs", str(args.nonlod_watchdog_secs)])
+    if hasattr(args, 'seed_timeout_retries') and args.seed_timeout_retries != DEFAULT_SEED_TIMEOUT_RETRIES:
+        cmd.extend(["--seed-timeout-retries", str(args.seed_timeout_retries)])
+    if hasattr(args, 'seed_timeout_restarts') and args.seed_timeout_restarts != DEFAULT_SEED_TIMEOUT_RESTARTS:
+        cmd.extend(["--seed-timeout-restarts", str(args.seed_timeout_restarts)])
     if hasattr(args, 'guard_max_ts') and args.guard_max_ts != 0.0:
         cmd.extend(["--guard-max-ts", str(args.guard_max_ts)])
     if getattr(args, 'lod_max_nm', None) is not None:
@@ -938,8 +949,12 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 help="Issue warnings for long Ts instead of skipping (overrides all Ts limits; pass-through)")
     p.add_argument("--watchdog-secs", type=int, default=1800,
                    help="Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through)")
-    p.add_argument("--nonlod-watchdog-secs", type=int, default=3600,
-                   help="Timeout for non-LoD sweeps (pass-through).")
+    p.add_argument("--nonlod-watchdog-secs", type=int, default=DEFAULT_NONLOD_WATCHDOG_SECS,
+                   help="Timeout for non-LoD sweeps (default: 14400s/4h; pass-through).")
+    p.add_argument("--seed-timeout-retries", type=int, default=DEFAULT_SEED_TIMEOUT_RETRIES,
+                   help="Watchdog expirations for a seed before restarting the worker pool (pass-through).")
+    p.add_argument("--seed-timeout-restarts", type=int, default=DEFAULT_SEED_TIMEOUT_RESTARTS,
+                   help="Maximum pool restarts triggered by a single seed before aborting (pass-through).")
     p.add_argument("--guard-max-ts", type=float, default=0.0,
                    help="Cap guard-factor sweeps when symbol period exceeds this many seconds (0 disables; pass-through).")
     p.add_argument("--lod-max-nm", type=int, default=1000000,
@@ -1138,7 +1153,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
             _set_if_default("sequence_length", 2000)
             _set_if_default("target_ci", 0.004)       # Updated: align with new default (0.4%)
             _set_if_default("lod_screen_delta", 1e-3)  # Stronger Hoeffding screen
-            _set_if_default("nonlod_watchdog_secs", 3600)
+            _set_if_default("nonlod_watchdog_secs", DEFAULT_NONLOD_WATCHDOG_SECS)
 
             # NEW: LoD search accelerators (search uses fewer resources, validation uses full)
             _set_if_default("lod_num_seeds", "<=100:6,<=150:8,>150:10")  # distance-aware schedule
@@ -1208,7 +1223,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
             _set_if_default("allow_ts_exceed", True)
             _set_if_default("lod_distance_timeout_s", 0.0)
             _set_if_default("watchdog_secs", 0)
-            _set_if_default("nonlod_watchdog_secs", 3600)
+            _set_if_default("nonlod_watchdog_secs", DEFAULT_NONLOD_WATCHDOG_SECS)
             _set_if_default("ts_warn_only", True)
             _set_if_default("lod_max_nm", 1000000)
         _set_if_default("lod_seq_len", 600)
@@ -1630,7 +1645,9 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                                 'extreme_mode': getattr(args, 'extreme_mode', False),
                                 'resume': getattr(args, 'resume', False),
                                 'watchdog_secs': getattr(args, 'watchdog_secs', 1800),
-                                'nonlod_watchdog_secs': getattr(args, 'nonlod_watchdog_secs', 3600),
+                                'nonlod_watchdog_secs': getattr(args, 'nonlod_watchdog_secs', DEFAULT_NONLOD_WATCHDOG_SECS),
+                                'seed_timeout_retries': getattr(args, 'seed_timeout_retries', DEFAULT_SEED_TIMEOUT_RETRIES),
+                                'seed_timeout_restarts': getattr(args, 'seed_timeout_restarts', DEFAULT_SEED_TIMEOUT_RESTARTS),
                                 'guard_max_ts': getattr(args, 'guard_max_ts', 0.0),
                                 'target_ci': getattr(args, 'target_ci', 0.004),
                                 'min_ci_seeds': getattr(args, 'min_ci_seeds', 8),
