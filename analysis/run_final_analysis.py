@@ -486,6 +486,7 @@ I9_14900K_DETECTED = CPU_COUNT == 32 and PHYSICAL_CORES == 24   # Same topology 
 # Timeout governance for hung seeds (configurable via run_master CLI)
 DEFAULT_SEED_TIMEOUT_RETRIES = 2
 DEFAULT_SEED_RESTART_LIMIT = 2
+DEFAULT_NONLOD_WATCHDOG_SECS = 4 * 3600  # Align with run_master default (4h buffer)
 
 HYBRID_CPU_CONFIGS: Dict[str, CPUConfig] = {
     "i9-13950HX": {
@@ -3203,8 +3204,8 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--watchdog-secs", type=int, default=1800,
                         help="Soft timeout for seed completion before retry hint (default: 1800s/30min)")
-    parser.add_argument("--nonlod-watchdog-secs", type=int, default=3600,
-                        help="Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.); <=0 disables.")
+    parser.add_argument("--nonlod-watchdog-secs", type=int, default=DEFAULT_NONLOD_WATCHDOG_SECS,
+                        help="Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.; default: 14400s/4h). <=0 disables.")
     parser.add_argument("--seed-timeout-retries", type=int, default=DEFAULT_SEED_TIMEOUT_RETRIES,
                         help="Watchdog expirations for a single seed before restarting the worker pool.")
     parser.add_argument("--seed-timeout-restarts", type=int, default=DEFAULT_SEED_RESTART_LIMIT,
@@ -8560,7 +8561,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
 
     do_isi = False
     if args.isi_sweep == "always":
-        do_isi = not args.disable_isi
+        do_isi = True  # Force Stage 3 even when baseline ISI is disabled
     elif args.isi_sweep == "auto":
         do_isi = bool(cfg['pipeline'].get('enable_isi', False))
     else:
