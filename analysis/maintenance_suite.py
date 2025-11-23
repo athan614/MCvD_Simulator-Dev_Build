@@ -40,6 +40,10 @@ class StageDefinition:
 #   Stage 5 - Main/publication figures
 #   Stage 6 - Supplementary figures
 #   Stage 7 - Tables and summary sheets
+#   Stage 8 - Sensitivity sweeps (temp/diffusion/binding/device/correlation)
+#   Stage 9 - Organoid sensitivity (alpha/bias/q_eff) sweeps
+#   Stage 10 - Symbol-period (Ts) sweeps
+#   Stage 11 - Capacity analysis exports
 
 STAGE_REGISTRY: Dict[str, StageDefinition] = {
     "1": StageDefinition(
@@ -140,6 +144,60 @@ STAGE_REGISTRY: Dict[str, StageDefinition] = {
             "results/tables/**/*.md",
         ),
     ),
+    "8": StageDefinition(
+        id="8",
+        name="Sensitivity sweeps",
+        description="Parameter sensitivity sweeps (T, D, binding, device gm/C, correlation).",
+        csv_patterns=(
+            "results/data/sensitivity_T_*.csv",
+            "results/data/sensitivity_D_*.csv",
+            "results/data/sensitivity_binding*.csv",
+            "results/data/sensitivity_device*.csv",
+            "results/data/sensitivity_corr*.csv",
+        ),
+        cache_patterns=(),
+        extra_patterns=(
+            "results/figures/fig_sensitivity_*.png",
+        ),
+    ),
+    "9": StageDefinition(
+        id="9",
+        name="Organoid sensitivity sweeps",
+        description="Organoid noise/ser/snr sweeps over alpha, bias, q_eff.",
+        csv_patterns=(
+            "results/data/organoid_*_sensitivity*.csv",
+        ),
+        cache_patterns=(),
+        extra_patterns=(
+            "results/figures/organoid_*.png",
+        ),
+    ),
+    "10": StageDefinition(
+        id="10",
+        name="Ts sweeps",
+        description="SNR/SER versus symbol-period sweeps.",
+        csv_patterns=(
+            "results/data/snr_vs_ts_*.csv",
+        ),
+        cache_patterns=(),
+        extra_patterns=(
+            "results/figures/fig_snr_vs_ts*.png",
+            "results/figures/fig_snr_panels*.png",
+        ),
+    ),
+    "11": StageDefinition(
+        id="11",
+        name="Capacity analysis",
+        description="Capacity bounds/table and capacity figures.",
+        csv_patterns=(
+            "results/data/capacity_bounds*.csv",
+        ),
+        cache_patterns=(),
+        extra_patterns=(
+            "results/data/capacity_bounds_table.tex",
+            "results/figures/fig_capacity_*.png",
+        ),
+    ),
 }
 
 STAGE_ALIASES: Dict[str, str] = {
@@ -160,6 +218,14 @@ STAGE_ALIASES: Dict[str, str] = {
     "supp": "6",
     "tables": "7",
     "table": "7",
+    "sensitivity": "8",
+    "sensitivity_sweeps": "8",
+    "organoid": "9",
+    "organoid_sensitivity": "9",
+    "ts": "10",
+    "snr_vs_ts": "10",
+    "capacity": "11",
+    "capacity_analysis": "11",
 }
 
 TREE_CATEGORIES: Dict[str, Tuple[str, int]] = {

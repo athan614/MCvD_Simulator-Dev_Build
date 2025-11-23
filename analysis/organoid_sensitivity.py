@@ -17,7 +17,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 from numbers import Real
 
 import matplotlib.pyplot as plt
@@ -87,6 +87,22 @@ def _get_thresholds_for_cfg(cfg: Dict[str, Any],
 
 def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _load_existing(path: Path, key_cols: Sequence[str]) -> Tuple[pd.DataFrame, set[tuple]]:
+    if not path.exists():
+        return pd.DataFrame(), set()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(), set()
+    keys: set[tuple] = set()
+    for _, row in df.iterrows():
+        try:
+            keys.add(tuple(row.get(col) for col in key_cols))
+        except Exception:
+            continue
+    return df, keys
 
 
 def _load_base_config(path: Path) -> Dict[str, Any]:
@@ -338,13 +354,30 @@ def plot_psd(df: pd.DataFrame, sweep_label: str, spectra_filter: Sequence[str], 
     plt.close(fig)
 
 
-def run_alpha_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def run_alpha_sweep(
+    base_cfg: Dict[str, Any],
+    seeds: Sequence[int],
+    args: argparse.Namespace,
+    existing_ser: Optional[pd.DataFrame] = None,
+    existing_psd: Optional[pd.DataFrame] = None,
+    resume: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     nm_values = args.nm_grid if args.nm_grid else base_cfg.get("Nm_range", {}).get("MoSK", [200, 350, 650, 1100, 1750])
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
+    done_ser: set[tuple] = set()
+    done_psd: set[float] = set()
+    if resume and existing_ser is not None:
+        done_ser = {(float(r["alpha_H"]), float(r["Nm_per_symbol"])) for _, r in existing_ser.iterrows() if "alpha_H" in r and "Nm_per_symbol" in r}
+    if resume and existing_psd is not None:
+        done_psd = {float(r["alpha_H"]) for _, r in existing_psd.iterrows() if "alpha_H" in r}
+        psd_frames.append(existing_psd)
 
     for alpha in args.alpha_values:
         for nm in nm_values:
+            key = (float(alpha), float(nm))
+            if resume and key in done_ser:
+                continue
             cfg = deepcopy(base_cfg)
             cfg['noise']['alpha_H'] = float(alpha)
             cfg['pipeline']['Nm_per_symbol'] = int(nm)
@@ -352,6 +385,8 @@ def run_alpha_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpar
             agg.update({"alpha_H": float(alpha), "Nm_per_symbol": int(nm)})
             rows.append(agg)
 
+        if resume and float(alpha) in done_psd:
+            continue
         psd_cfg = deepcopy(base_cfg)
         psd_cfg['noise']['alpha_H'] = float(alpha)
         psd_cfg['pipeline']['Nm_per_symbol'] = int(nm_values[0]) if nm_values else base_cfg['pipeline'].get('Nm_per_symbol', 1000)
@@ -360,13 +395,28 @@ def run_alpha_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpar
             psd_frames.append(psd_to_dataframe(psd, "alpha_H", float(alpha)))
 
     df_ser = pd.DataFrame(rows)
+    df_ser = df_ser.drop_duplicates(subset=["alpha_H", "Nm_per_symbol"]) if not df_ser.empty else df_ser
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
     return df_ser, df_psd
 
 
-def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows: List[Dict[str, float]] = []
+def run_bias_sweep(
+    base_cfg: Dict[str, Any],
+    seeds: Sequence[int],
+    args: argparse.Namespace,
+    existing_ser: Optional[pd.DataFrame] = None,
+    existing_psd: Optional[pd.DataFrame] = None,
+    resume: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
+    done_ser: set[float] = set()
+    done_psd: set[float] = set()
+    if resume and existing_ser is not None:
+        done_ser = {float(r["I_dc_A"]) for _, r in existing_ser.iterrows() if "I_dc_A" in r}
+    if resume and existing_psd is not None:
+        done_psd = {float(r["I_dc_A"]) for _, r in existing_psd.iterrows() if "I_dc_A" in r}
+        psd_frames.append(existing_psd)
 
     oect_cfg = base_cfg.get('oect', {})
     base_i_dc = float(oect_cfg.get('I_dc_A', 1.0e-4) or 1.0e-4)
@@ -381,6 +431,8 @@ def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
     for bias in args.bias_values:
         cfg = deepcopy(base_cfg)
         bias_val = float(bias)
+        if resume and bias_val in done_ser:
+            continue
         cfg['oect']['I_dc_A'] = bias_val
 
         gm_scale = 1.0
@@ -402,6 +454,8 @@ def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
         })
         rows.append(agg)
 
+        if resume and bias_val in done_psd:
+            continue
         psd_cfg = deepcopy(base_cfg)
         psd_cfg['oect']['I_dc_A'] = bias_val
         psd_cfg['oect']['gm_S'] = gm_scaled
@@ -414,19 +468,37 @@ def run_bias_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
             psd_frames.append(frame)
 
     df_bias = pd.DataFrame(rows)
+    if not df_bias.empty:
+        df_bias = df_bias.drop_duplicates(subset=["I_dc_A"])
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
     return df_bias, df_psd
 
 
-def run_qeff_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows: List[Dict[str, float]] = []
+def run_qeff_sweep(
+    base_cfg: Dict[str, Any],
+    seeds: Sequence[int],
+    args: argparse.Namespace,
+    existing_ser: Optional[pd.DataFrame] = None,
+    existing_psd: Optional[pd.DataFrame] = None,
+    resume: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
+    done_ser: set[float] = set()
+    done_psd: set[float] = set()
+    if resume and existing_ser is not None:
+        done_ser = {float(r["q_eff_scale"]) for _, r in existing_ser.iterrows() if "q_eff_scale" in r}
+    if resume and existing_psd is not None:
+        done_psd = {float(r["q_eff_scale"]) for _, r in existing_psd.iterrows() if "q_eff_scale" in r}
+        psd_frames.append(existing_psd)
 
     base_q_da = float(base_cfg['neurotransmitters']['DA']['q_eff_e'])
     base_q_sero = float(base_cfg['neurotransmitters']['SERO']['q_eff_e'])
 
     for scale in args.qeff_scales:
         cfg = deepcopy(base_cfg)
+        if resume and float(scale) in done_ser:
+            continue
         cfg['neurotransmitters']['DA']['q_eff_e'] = base_q_da * float(scale)
         cfg['neurotransmitters']['SERO']['q_eff_e'] = base_q_sero * float(scale)
         cfg['pipeline']['Nm_per_symbol'] = args.qeff_nm
@@ -435,12 +507,16 @@ def run_qeff_sweep(base_cfg: Dict[str, Any], seeds: Sequence[int], args: argpars
         agg.update({"q_eff_scale": float(scale)})
         rows.append(agg)
 
+        if resume and float(scale) in done_psd:
+            continue
         psd_cfg = deepcopy(cfg)
         psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
         if psd:
             psd_frames.append(psd_to_dataframe(psd, "q_eff_scale", float(scale)))
 
     df_qeff = pd.DataFrame(rows)
+    if not df_qeff.empty:
+        df_qeff = df_qeff.drop_duplicates(subset=["q_eff_scale"])
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
     return df_qeff, df_psd
 
@@ -450,8 +526,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"), help="Configuration YAML.")
     parser.add_argument("--sequence-length", type=int, default=400, help="Symbols per Monte-Carlo run.")
     parser.add_argument("--seeds", type=int, default=6, help="Number of random seeds per sweep point.")
-    parser.add_argument("--alpha-values", type=float, nargs="+", default=[5e-4, 1e-3, 2e-3, 4e-3], dest="alpha_values")
-    parser.add_argument("--bias-values", type=float, nargs="+", default=[5e-5, 1e-4, 2e-4, 4e-4], dest="bias_values")
+    parser.add_argument(
+        "--alpha-values",
+        type=float,
+        nargs="+",
+        default=[3e-4, 4e-4, 5e-4, 7e-4, 1e-3, 1.4e-3, 2e-3, 2.8e-3, 4e-3, 5.6e-3],
+        dest="alpha_values",
+    )
+    parser.add_argument(
+        "--bias-values",
+        type=float,
+        nargs="+",
+        default=[4e-5, 6e-5, 8e-5, 1.0e-4, 1.3e-4, 1.7e-4, 2.3e-4, 3.0e-4, 4.0e-4, 5.5e-4],
+        dest="bias_values",
+    )
     parser.add_argument("--bias-nm", type=int, default=2000, help="Nm per symbol for bias sweep.")
     parser.add_argument(
         "--bias-gm-scaling",
@@ -459,7 +547,13 @@ def parse_args() -> argparse.Namespace:
         default="sqrt",
         help="How to remap gm when sweeping I_dc (default sqrt scaling).",
     )
-    parser.add_argument("--qeff-scales", type=float, nargs="+", default=[1.0, 0.75, 0.5, 0.25], dest="qeff_scales")
+    parser.add_argument(
+        "--qeff-scales",
+        type=float,
+        nargs="+",
+        default=[1.25, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+        dest="qeff_scales",
+    )
     parser.add_argument("--qeff-nm", type=int, default=2000, help="Nm per symbol for q_eff sweep.")
     parser.add_argument("--nm-grid", type=int, nargs="+", default=None, help="Optional Nm values for alpha sweep.")
     parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory for outputs.")
@@ -467,6 +561,11 @@ def parse_args() -> argparse.Namespace:
         "--recalibrate",
         action="store_true",
         help="Force threshold recalibration (ignore cached JSON files).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip sweep points already present in the output CSVs.",
     )
     return parser.parse_args()
 
@@ -478,10 +577,34 @@ def main() -> None:
 
     out_data = args.output_root / "data"
     out_fig = args.output_root / "figures"
+    # Preload existing data for resume
+    alpha_csv = out_data / "organoid_alpha_sensitivity_ser.csv"
+    alpha_psd_csv = out_data / "organoid_alpha_sensitivity_psd.csv"
+    bias_csv = out_data / "organoid_bias_sensitivity.csv"
+    bias_psd_csv = out_data / "organoid_bias_sensitivity_psd.csv"
+    qeff_csv = out_data / "organoid_qeff_sensitivity.csv"
+    qeff_psd_csv = out_data / "organoid_qeff_sensitivity_psd.csv"
+
+    alpha_existing, alpha_psd_existing = (pd.DataFrame(), pd.DataFrame())
+    bias_existing, bias_psd_existing = (pd.DataFrame(), pd.DataFrame())
+    qeff_existing, qeff_psd_existing = (pd.DataFrame(), pd.DataFrame())
+    if args.resume:
+        alpha_existing, _ = _load_existing(alpha_csv, ["alpha_H", "Nm_per_symbol"])
+        alpha_psd_existing, _ = _load_existing(alpha_psd_csv, ["alpha_H"])
+        bias_existing, _ = _load_existing(bias_csv, ["I_dc_A"])
+        bias_psd_existing, _ = _load_existing(bias_psd_csv, ["I_dc_A"])
+        qeff_existing, _ = _load_existing(qeff_csv, ["q_eff_scale"])
+        qeff_psd_existing, _ = _load_existing(qeff_psd_csv, ["q_eff_scale"])
 
     # --- Alpha (1/f noise) sweep ---
-    df_alpha, df_alpha_psd = run_alpha_sweep(base_cfg, seeds, args)
-    alpha_csv = out_data / "organoid_alpha_sensitivity_ser.csv"
+    df_alpha, df_alpha_psd = run_alpha_sweep(
+        base_cfg,
+        seeds,
+        args,
+        existing_ser=alpha_existing,
+        existing_psd=alpha_psd_existing,
+        resume=args.resume,
+    )
     _ensure_dir(alpha_csv)
     df_alpha.to_csv(alpha_csv, index=False)
     if not df_alpha.empty:
@@ -489,14 +612,19 @@ def main() -> None:
         df_alpha_snr = df_alpha.groupby("alpha_H", as_index=False).agg({"snr_i_db_median": "mean"})
         plot_metric_vs_param(df_alpha_snr, "alpha_H", "snr_i_db_median", "SNR (dB)", out_fig / "organoid_alpha_snr.png")
     if not df_alpha_psd.empty:
-        psd_csv = out_data / "organoid_alpha_sensitivity_psd.csv"
-        _ensure_dir(psd_csv)
-        df_alpha_psd.to_csv(psd_csv, index=False)
+        _ensure_dir(alpha_psd_csv)
+        df_alpha_psd.to_csv(alpha_psd_csv, index=False)
         plot_psd(df_alpha_psd, "alpha_H", ["total_diff", "flicker_diff"], out_fig / "organoid_alpha_psd.png")
 
     # --- Bias sweep ---
-    df_bias, df_bias_psd = run_bias_sweep(base_cfg, seeds, args)
-    bias_csv = out_data / "organoid_bias_sensitivity.csv"
+    df_bias, df_bias_psd = run_bias_sweep(
+        base_cfg,
+        seeds,
+        args,
+        existing_ser=bias_existing,
+        existing_psd=bias_psd_existing,
+        resume=args.resume,
+    )
     _ensure_dir(bias_csv)
     df_bias.to_csv(bias_csv, index=False)
     if not df_bias.empty:
@@ -504,14 +632,19 @@ def main() -> None:
         df_bias_snr = df_bias.groupby("I_dc_A", as_index=False).agg({"snr_i_db_median": "mean"})
         plot_metric_vs_param(df_bias_snr, "I_dc_A", "snr_i_db_median", "SNR (dB)", out_fig / "organoid_bias_snr.png")
     if not df_bias_psd.empty:
-        psd_csv = out_data / "organoid_bias_sensitivity_psd.csv"
-        _ensure_dir(psd_csv)
-        df_bias_psd.to_csv(psd_csv, index=False)
+        _ensure_dir(bias_psd_csv)
+        df_bias_psd.to_csv(bias_psd_csv, index=False)
         plot_psd(df_bias_psd, "I_dc_A", ["total_diff", "thermal_diff"], out_fig / "organoid_bias_psd.png")
 
     # --- q_eff (ionic strength) sweep ---
-    df_qeff, df_qeff_psd = run_qeff_sweep(base_cfg, seeds, args)
-    qeff_csv = out_data / "organoid_qeff_sensitivity.csv"
+    df_qeff, df_qeff_psd = run_qeff_sweep(
+        base_cfg,
+        seeds,
+        args,
+        existing_ser=qeff_existing,
+        existing_psd=qeff_psd_existing,
+        resume=args.resume,
+    )
     _ensure_dir(qeff_csv)
     df_qeff.to_csv(qeff_csv, index=False)
     if not df_qeff.empty:
@@ -519,9 +652,8 @@ def main() -> None:
         df_qeff_snr = df_qeff.groupby("q_eff_scale", as_index=False).agg({"snr_i_db_median": "mean"})
         plot_metric_vs_param(df_qeff_snr, "q_eff_scale", "snr_i_db_median", "SNR (dB)", out_fig / "organoid_qeff_snr.png")
     if not df_qeff_psd.empty:
-        psd_csv = out_data / "organoid_qeff_sensitivity_psd.csv"
-        _ensure_dir(psd_csv)
-        df_qeff_psd.to_csv(psd_csv, index=False)
+        _ensure_dir(qeff_psd_csv)
+        df_qeff_psd.to_csv(qeff_psd_csv, index=False)
         plot_psd(df_qeff_psd, "q_eff_scale", ["total_diff"], out_fig / "organoid_qeff_psd.png")
 
     summary = {

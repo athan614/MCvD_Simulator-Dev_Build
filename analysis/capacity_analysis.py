@@ -18,7 +18,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,6 +46,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=800, help="Calibration symbols per class (default: 800).")
     parser.add_argument("--mc", type=int, default=5000, help="Monte Carlo samples for MI estimation (default: 5000).")
     parser.add_argument("--force", action="store_true", help="Ignore existing CSV and recompute.")
+    parser.add_argument("--resume", action="store_true", help="Reuse existing rows and only compute missing mode/grid points.")
     parser.add_argument("--progress", default="none", help="Placeholder for run_master compatibility.")
     parser.add_argument(
         "--modes",
@@ -216,6 +217,92 @@ def _select_operating_point(df: pd.DataFrame, target_ser: float) -> Tuple[Option
         elif isinstance(ctrl_val, (int, float, np.integer, np.floating)):
             use_ctrl = bool(ctrl_val)
     return nm, distance, use_ctrl
+
+
+def _select_operating_grid(
+    df: pd.DataFrame,
+    target_ser: float,
+    desired_ctrl: Optional[bool],
+    max_points: int = 10,
+) -> List[Tuple[float, float, Optional[bool]]]:
+    nm_col = _nm_column(df)
+    if nm_col is None or "ser" not in df.columns or "distance_um" not in df.columns:
+        return []
+    work = df.copy()
+    work["distance_um"] = pd.to_numeric(work["distance_um"], errors="coerce")
+    work["ser"] = pd.to_numeric(work["ser"], errors="coerce")
+    work[nm_col] = pd.to_numeric(work[nm_col], errors="coerce")
+    work = work.dropna(subset=["distance_um", "ser", nm_col])
+    if work.empty:
+        return []
+    if desired_ctrl is not None and "use_ctrl" in work.columns:
+        work = work[work["use_ctrl"] == bool(desired_ctrl)]
+    if work.empty:
+        return []
+    distances = sorted(work["distance_um"].unique().tolist())
+    combos: List[Tuple[float, float, Optional[bool]]] = []
+    for dist in distances:
+        subset = work[np.isclose(work["distance_um"], dist)]
+        if subset.empty:
+            continue
+        idx = (subset["ser"] - target_ser).abs().idxmin()
+        row = subset.loc[idx]
+        nm_scalar = _coerce_float(row.get(nm_col))
+        if nm_scalar is None or not math.isfinite(nm_scalar):
+            continue
+        nm_val = float(nm_scalar)
+        ctrl_val: Optional[bool] = None
+        ctrl_raw = row.get("use_ctrl")
+        if isinstance(ctrl_raw, (bool, np.bool_)):
+            ctrl_val = bool(ctrl_raw)
+        elif isinstance(ctrl_raw, (int, float, np.integer, np.floating)):
+            val = float(ctrl_raw)
+            if math.isfinite(val):
+                ctrl_val = bool(val)
+        combos.append((nm_val, float(dist), ctrl_val if ctrl_val is not None else desired_ctrl))
+        if len(combos) >= max_points:
+            break
+    return combos
+
+
+def _augment_with_lod(
+    df_lod: pd.DataFrame,
+    desired_ctrl: Optional[bool],
+    combos: List[Tuple[float, float, Optional[bool]]],
+    max_points: int = 10,
+) -> List[Tuple[float, float, Optional[bool]]]:
+    if df_lod is None or df_lod.empty or len(combos) >= max_points:
+        return combos
+    work = df_lod.copy()
+    work["distance_um"] = pd.to_numeric(work["distance_um"], errors="coerce")
+    work["lod_nm"] = pd.to_numeric(work["lod_nm"], errors="coerce")
+    work = work.dropna(subset=["distance_um", "lod_nm"])
+    if work.empty:
+        return combos
+    if desired_ctrl is not None and "use_ctrl" in work.columns:
+        work = work[work["use_ctrl"] == bool(desired_ctrl)]
+    if work.empty:
+        return combos
+    seen = {round(float(dist), 6) for _, dist, _ in combos}
+    for dist in sorted(work["distance_um"].unique().tolist()):
+        if len(combos) >= max_points:
+            break
+        key = round(float(dist), 6)
+        if key in seen:
+            continue
+        subset = work[np.isclose(work["distance_um"], dist)]
+        if subset.empty:
+            continue
+        nm_vals = pd.to_numeric(subset["lod_nm"], errors="coerce").dropna()
+        if nm_vals.empty:
+            continue
+        nm_candidate = float(nm_vals.iloc[-1])
+        ctrl_val: Optional[bool] = None
+        if "use_ctrl" in subset.columns and subset["use_ctrl"].notna().any():
+            ctrl_val = bool(subset["use_ctrl"].iloc[-1])
+        combos.append((nm_candidate, float(dist), ctrl_val if ctrl_val is not None else desired_ctrl))
+        seen.add(key)
+    return combos
 
 
 def _iter_ser_segments(mode: str) -> List[Path]:
@@ -516,75 +603,119 @@ def main() -> None:
     cfg = _load_cfg()
     data_dir = project_root / "results" / "data"
 
-    records: List[Dict[str, Any]] = []
+    out_csv = project_root / "results" / "data" / "capacity_bounds.csv"
+    existing_df = pd.DataFrame()
+    existing_keys: set[tuple] = set()
+    if args.resume and not args.force and out_csv.exists():
+        try:
+            existing_df = pd.read_csv(out_csv)
+            for _, row in existing_df.iterrows():
+                existing_keys.add(
+                    (
+                        str(row.get("mode", "")).strip(),
+                        float(row.get("distance_um", float("nan"))),
+                        float(row.get("Nm", float("nan"))),
+                        bool(row.get("use_ctrl", True)),
+                    )
+                )
+            print(f"[resume] Loaded {len(existing_df)} existing capacity rows from {out_csv}")
+        except Exception as exc:
+            print(f"[resume] Failed to load existing capacity CSV ({exc}); recomputing.")
+            existing_df = pd.DataFrame()
+            existing_keys = set()
+
+    records: List[Dict[str, Any]] = cast(List[Dict[str, Any]], existing_df.to_dict("records")) if not existing_df.empty else []
 
     for mode in selected_modes:
         ser_csv = data_dir / f"ser_vs_nm_{mode.lower()}.csv"
-        nm = None
-        distance = None
-        use_ctrl = None
+        desired_ctrl = bool(cfg["pipeline"].get("use_control_channel", True))
+        if mode == "MoSK":
+            desired_ctrl = False
+
+        combos: List[Tuple[float, float, Optional[bool]]] = []
+        nm_hint: Optional[float] = None
+        distance_hint: Optional[float] = None
+        ctrl_hint: Optional[bool] = None
+        df_ser = pd.DataFrame()
 
         if ser_csv.exists():
             try:
                 df_ser = pd.read_csv(ser_csv)
-                nm, distance, use_ctrl = _select_operating_point(df_ser, args.target_ser)
+                nm_hint, distance_hint, ctrl_hint = _select_operating_point(df_ser, args.target_ser)
+                combos = _select_operating_grid(df_ser, args.target_ser, desired_ctrl)
             except Exception:
-                nm, distance, use_ctrl = None, None, None
+                df_ser = pd.DataFrame()
+                nm_hint, distance_hint, ctrl_hint = None, None, None
 
         lod_csv = data_dir / f"lod_vs_distance_{mode.lower()}.csv"
-        if (distance is None or not math.isfinite(distance)) and lod_csv.exists():
+        df_lod = pd.DataFrame()
+        if lod_csv.exists():
             try:
                 df_lod = pd.read_csv(lod_csv)
             except Exception:
                 df_lod = pd.DataFrame()
-            if not df_lod.empty and "distance_um" in df_lod.columns:
-                dist_vals = pd.to_numeric(df_lod["distance_um"], errors="coerce").dropna()
-                if not dist_vals.empty:
-                    distance = float(np.median(dist_vals))
-                    if (nm is None or not math.isfinite(nm)) and "lod_nm" in df_lod.columns:
-                        match = df_lod.loc[dist_vals.astype(int) == int(distance), "lod_nm"]
-                        if not match.empty:
-                            nm = float(match.iloc[-1])
+        combos = _augment_with_lod(df_lod, desired_ctrl, combos)
 
-        if distance is None or not isinstance(distance, float) or not math.isfinite(distance):
+        distance_fallback = distance_hint if (distance_hint is not None and math.isfinite(distance_hint)) else None
+        nm_fallback = nm_hint if (nm_hint is not None and math.isfinite(nm_hint)) else None
+
+        if (distance_fallback is None or nm_fallback is None) and not df_lod.empty and "distance_um" in df_lod.columns:
+            dist_vals = pd.to_numeric(df_lod["distance_um"], errors="coerce").dropna()
+            if not dist_vals.empty:
+                distance_fallback = float(np.median(dist_vals))
+                if (nm_fallback is None or not math.isfinite(nm_fallback)) and "lod_nm" in df_lod.columns:
+                    match = df_lod.loc[np.isclose(dist_vals, distance_fallback), "lod_nm"]
+                    match = pd.to_numeric(match, errors="coerce").dropna()
+                    if not match.empty:
+                        nm_fallback = float(match.iloc[-1])
+
+        if distance_fallback is None or not math.isfinite(distance_fallback):
             fallback_distance = _coerce_float(cfg["pipeline"].get("distance_um", 50.0))
-            distance = fallback_distance if (fallback_distance is not None and math.isfinite(fallback_distance)) else 50.0
-        if nm is None or not isinstance(nm, float) or not math.isfinite(nm):
+            distance_fallback = fallback_distance if (fallback_distance is not None and math.isfinite(fallback_distance)) else 50.0
+        if nm_fallback is None or not math.isfinite(nm_fallback):
             fallback_nm = _coerce_float(cfg["pipeline"].get("Nm_per_symbol", 1e4))
-            nm = fallback_nm if (fallback_nm is not None and math.isfinite(fallback_nm)) else 1e4
-        if use_ctrl is None:
-            use_ctrl = bool(cfg["pipeline"].get("use_control_channel", True))
-        if mode == "MoSK":
-            use_ctrl = False
+            nm_fallback = fallback_nm if (fallback_nm is not None and math.isfinite(fallback_nm)) else 1e4
+        ctrl_fallback = ctrl_hint if isinstance(ctrl_hint, (bool, np.bool_)) else desired_ctrl
 
-        print(f"[info] {mode}: distance={distance:.1f} um, Nm={nm:.3g}, use_ctrl={use_ctrl}")
+        if not combos:
+            combos.append((float(nm_fallback), float(distance_fallback), ctrl_fallback))
 
-        confusion, nm_cache, total_samples = _collect_confusion_from_cache(mode, nm, use_ctrl)
-        nm_cache_val = _coerce_float(nm_cache)
-        nm_eff = nm_cache_val if (nm_cache_val is not None and math.isfinite(nm_cache_val)) else nm
+        combos = combos[:10]
 
-        ser_cache = float("nan")
-        if total_samples > 0:
-            ser_cache = 1.0 - (np.trace(confusion) / total_samples)
+        for point_idx, (nm_value, distance_value, ctrl_value) in enumerate(combos, start=1):
+            use_ctrl = desired_ctrl if ctrl_value is None else bool(ctrl_value)
+            key = (mode, float(distance_value), float(nm_value), bool(use_ctrl))
+            if args.resume and key in existing_keys:
+                print(f"[resume] Skipping {mode} distance={distance_value} Nm={nm_value} use_ctrl={use_ctrl} (cached)")
+                continue
+            print(f"[info] {mode}: point {point_idx:02d} distance={distance_value:.1f} um, Nm={nm_value:.3g}, use_ctrl={use_ctrl}")
 
-        I_hd = hard_decision_mi_from_confusion(confusion) if total_samples > 0 else float("nan")
-        I_sym = symmetric_channel_ceiling(confusion.shape[0], ser_cache) if total_samples > 0 else float("nan")
-        I_soft = soft_mi_from_Q(cfg, mode, distance, nm_eff, args.samples, args.mc, use_ctrl)
+            confusion, nm_cache, total_samples = _collect_confusion_from_cache(mode, nm_value, use_ctrl)
+            nm_cache_val = _coerce_float(nm_cache)
+            nm_eff = nm_cache_val if (nm_cache_val is not None and math.isfinite(nm_cache_val)) else nm_value
 
-        records.append({
-            "mode": mode,
-            "distance_um": distance,
-            "Nm": nm_eff,
-            "use_ctrl": use_ctrl,
-            "total_samples": total_samples,
-            "ser_from_cache": ser_cache,
-            "I_hd_bits": I_hd,
-            "I_sym_ceiling_bits": I_sym,
-            "I_soft_bits": I_soft,
-        })
+            ser_cache = float("nan")
+            if total_samples > 0:
+                ser_cache = 1.0 - (np.trace(confusion) / total_samples)
+
+            I_hd = hard_decision_mi_from_confusion(confusion) if total_samples > 0 else float("nan")
+            I_sym = symmetric_channel_ceiling(confusion.shape[0], ser_cache) if total_samples > 0 else float("nan")
+            I_soft = soft_mi_from_Q(cfg, mode, distance_value, nm_eff, args.samples, args.mc, use_ctrl)
+
+            records.append({
+                "mode": mode,
+                "distance_um": distance_value,
+                "Nm": nm_eff,
+                "use_ctrl": use_ctrl,
+                "total_samples": total_samples,
+                "ser_from_cache": ser_cache,
+                "I_hd_bits": I_hd,
+                "I_sym_ceiling_bits": I_sym,
+                "I_soft_bits": I_soft,
+                "point_index": point_idx,
+            })
 
     df_out = pd.DataFrame(records)
-    out_csv = project_root / "results" / "data" / "capacity_bounds.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_csv.with_suffix(out_csv.suffix + ".tmp")
     df_out.to_csv(tmp, index=False)

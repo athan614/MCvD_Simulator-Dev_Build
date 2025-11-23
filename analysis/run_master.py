@@ -2016,6 +2016,8 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 snr_modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
                 for mode in snr_modes:
                     ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
+                    if args.resume and not args.reset:
+                        ts_cmd.append("--resume")
                     rc = _run_tracked(ts_cmd)
                     if rc == 130:
                         _safe_close_progress(pm, overall, sub, "snr_ts")
@@ -2248,7 +2250,12 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
             if not (args.resume and state.get(key, {}).get("done")):
                 print()
                 print("[study] Running parameter sensitivity sweeps...")
-                rc = _run_tracked([sys.executable, "-u", "analysis/sensitivity_study.py", "--progress", args.progress])
+                sens_cmd = [sys.executable, "-u", "analysis/sensitivity_study.py", "--progress", args.progress]
+                if args.resume and not args.reset:
+                    sens_cmd.append("--resume")
+                if args.recalibrate:
+                    sens_cmd.append("--force")  # recalibration implies regenerate
+                rc = _run_tracked(sens_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)
                     print("[stop] Master pipeline stopped by user")
@@ -2272,6 +2279,8 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 modes_arg = getattr(args, "modes", None)
                 if modes_arg:
                     capacity_cmd.extend(["--modes", modes_arg])
+                if args.resume and not args.reset:
+                    capacity_cmd.append("--resume")
                 rc = _run_tracked(capacity_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)
@@ -2315,6 +2324,8 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 organoid_cmd = [sys.executable, "-u", "analysis/organoid_sensitivity.py"]
                 if args.recalibrate:
                     organoid_cmd.append("--recalibrate")
+                if args.resume and not args.reset:
+                    organoid_cmd.append("--resume")
                 rc = _run_tracked(organoid_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)

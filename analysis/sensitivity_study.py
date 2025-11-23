@@ -26,7 +26,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -243,6 +243,11 @@ def _parse_args() -> argparse.Namespace:
         help="Recompute even if cached CSVs already exist.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue a partially computed sweep by skipping rows already present in CSV outputs.",
+    )
+    parser.add_argument(
         "--progress",
         default="none",
         help="Placeholder for run_master compatibility.",
@@ -293,6 +298,23 @@ def _save_csv_atomic(df: pd.DataFrame, dest: Path) -> None:
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     df.to_csv(tmp, index=False)
     os.replace(tmp, dest)
+
+
+def _load_existing_rows(dest: Path, key_cols: Sequence[str]) -> Tuple[List[Dict[str, Any]], Set[Tuple[Any, ...]]]:
+    if not dest.exists():
+        return [], set()
+    try:
+        df = pd.read_csv(dest)
+    except Exception:
+        return [], set()
+    rows = cast(List[Dict[str, Any]], df.to_dict("records"))
+    keys: Set[Tuple[Any, ...]] = set()
+    for _, r in df.iterrows():
+        try:
+            keys.add(tuple(r.get(col) for col in key_cols))
+        except Exception:
+            continue
+    return rows, keys
 
 
 def _resolve_detection_window(cfg: Dict[str, Any], Ts: float) -> float:
@@ -428,16 +450,19 @@ def run_sensitivity_T(
     freeze_calibration: bool,
     metric: str,
     force: bool = False,
+    resume: bool = False,
 ) -> pd.DataFrame:
     suffix = _metric_suffix(metric)
     out_csv = project_root / "results" / "data" / f"sensitivity_T{suffix}.csv"
     out_fig = project_root / "results" / "figures" / f"fig_sensitivity_T{suffix}.png"
-    if not force and out_csv.exists():
+    if not force and out_csv.exists() and not resume:
         df_cached = pd.read_csv(out_csv)
         _plot_param(df_cached, "T_K", out_fig, "Temperature (K)", metric, prefer="q")
         return df_cached
+    existing_rows, done = _load_existing_rows(out_csv, ["T_K"]) if (resume and not force) else ([], set())
 
-    T_grid = [297.0, 303.0, 310.0, 315.0]
+    # Ten-point temperature sweep centered on physiological 310 K
+    T_grid = [285.0, 290.0, 295.0, 300.0, 305.0, 310.0, 315.0, 320.0, 325.0, 330.0]
     D_refs = {
         nt: float(params["D_m2_s"])
         for nt, params in base_cfg["neurotransmitters"].items()
@@ -445,8 +470,11 @@ def run_sensitivity_T(
     }
     T_ref = float(base_cfg["sim"].get("temperature_K", 310.0))
 
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
     for T in T_grid:
+        if resume and (T,) in done:
+            print(f"[resume] skip T={T}K (cached)")
+            continue
         cfg_t = copy.deepcopy(base_cfg)
         _apply_sensitivity_overrides(cfg_t, detector_mode, freeze_calibration)
         cfg_t["sim"]["temperature_K"] = T
@@ -484,6 +512,8 @@ def run_sensitivity_T(
         rows.append(row)
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["T_K"])
     _save_csv_atomic(df, out_csv)
     _plot_param(df, "T_K", out_fig, "Temperature (K)", metric, prefer="q")
     return df
@@ -499,24 +529,30 @@ def run_sensitivity_D(
     freeze_calibration: bool,
     metric: str,
     force: bool = False,
+    resume: bool = False,
 ) -> pd.DataFrame:
     suffix = _metric_suffix(metric)
     out_csv = project_root / "results" / "data" / f"sensitivity_D{suffix}.csv"
     out_fig = project_root / "results" / "figures" / f"fig_sensitivity_D{suffix}.png"
-    if not force and out_csv.exists():
+    if not force and out_csv.exists() and not resume:
         df_cached = pd.read_csv(out_csv)
         _plot_param(df_cached, "D_scale", out_fig, "Diffusion scale (x)", metric, prefer="q")
         return df_cached
+    existing_rows, done = _load_existing_rows(out_csv, ["D_scale"]) if (resume and not force) else ([], set())
 
-    scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    # Log-friendly diffusion scaling factors (10 pts from 0.5x to 2x)
+    scales = [0.5, 0.65, 0.8, 0.95, 1.1, 1.25, 1.4, 1.55, 1.75, 2.0]
     D_refs = {
         nt: float(base_cfg["neurotransmitters"][nt]["D_m2_s"])
         for nt in ("DA", "SERO", "CTRL")
         if nt in base_cfg["neurotransmitters"] and "D_m2_s" in base_cfg["neurotransmitters"][nt]
     }
 
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
     for scale in scales:
+        if resume and (scale,) in done:
+            print(f"[resume] skip D_scale={scale} (cached)")
+            continue
         cfg_s = copy.deepcopy(base_cfg)
         _apply_sensitivity_overrides(cfg_s, detector_mode, freeze_calibration)
         for nt, D_ref in D_refs.items():
@@ -552,6 +588,8 @@ def run_sensitivity_D(
         rows.append(row)
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["D_scale"])
     _save_csv_atomic(df, out_csv)
     _plot_param(df, "D_scale", out_fig, "Diffusion scale (x)", metric, prefer="q")
     return df
@@ -566,11 +604,12 @@ def run_sensitivity_binding(
     freeze_calibration: bool,
     metric: str,
     force: bool = False,
+    resume: bool = False,
 ) -> pd.DataFrame:
     suffix = _metric_suffix(metric)
     out_csv = project_root / "results" / "data" / f"sensitivity_binding{suffix}.csv"
     fig_base = project_root / "results" / "figures"
-    if not force and out_csv.exists():
+    if not force and out_csv.exists() and not resume:
         df_cached = pd.read_csv(out_csv)
         for s_on in sorted(df_cached["kon_scale"].unique()):
             suffix_val = str(s_on).replace(".", "p")
@@ -578,8 +617,10 @@ def run_sensitivity_binding(
             subset = df_cached[df_cached["kon_scale"] == s_on]
             _plot_param(subset, "koff_scale", fig_path, f"koff scale (kon x {s_on:g})", metric, prefer="q")
         return df_cached
+    existing_rows, done = _load_existing_rows(out_csv, ["kon_scale", "koff_scale"]) if (resume and not force) else ([], set())
 
-    scales = [0.5, 1.0, 2.0]
+    # Ten-point on/off-rate multipliers to capture gradual kinetic changes
+    scales = [0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
     k_on_refs = {
         nt: float(params.get("k_on_M_s", 0.0))
         for nt, params in base_cfg["neurotransmitters"].items()
@@ -593,9 +634,11 @@ def run_sensitivity_binding(
         "k_off_s": float(base_cfg.get("binding", {}).get("k_off_s", 0.0)),
     }
 
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
     for s_on in scales:
         for s_off in scales:
+            if resume and (s_on, s_off) in done:
+                continue
             cfg_b = copy.deepcopy(base_cfg)
             _apply_sensitivity_overrides(cfg_b, detector_mode="raw", freeze_calibration=freeze_calibration)
             cfg_b["pipeline"]["use_control_channel"] = False
@@ -639,6 +682,8 @@ def run_sensitivity_binding(
             rows.append(row)
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["kon_scale", "koff_scale"])
     _save_csv_atomic(df, out_csv)
 
     for s_on in sorted(df["kon_scale"].unique()):
@@ -723,21 +768,26 @@ def run_sensitivity_device(
     freeze_calibration: bool,
     metric: str,
     force: bool = False,
+    resume: bool = False,
 ) -> pd.DataFrame:
     suffix = _metric_suffix(metric)
     out_csv = project_root / "results" / "data" / f"sensitivity_device{suffix}.csv"
     out_fig = project_root / "results" / "figures" / f"fig_sensitivity_device{suffix}.png"
-    if not force and out_csv.exists():
+    if not force and out_csv.exists() and not resume:
         df_cached = pd.read_csv(out_csv)
         _plot_device_curves(df_cached, out_fig, metric)
         return df_cached
+    existing_rows, done = _load_existing_rows(out_csv, ["gm_S", "C_tot_F"]) if (resume and not force) else ([], set())
 
-    gm_grid = [1e-3, 3e-3, 5e-3, 1e-2]
-    c_grid = [1e-8, 3e-8, 5e-8, 1e-7]
-    rows: list[dict[str, float]] = []
+    # Ten gm values (roughly log-spaced) and ten capacitances for smoother FoMs
+    gm_grid = [1.0e-3, 1.5e-3, 2.0e-3, 2.5e-3, 3.0e-3, 4.0e-3, 5.0e-3, 6.5e-3, 8.0e-3, 1.0e-2]
+    c_grid = [1.0e-8, 1.5e-8, 2.0e-8, 2.5e-8, 3.0e-8, 4.0e-8, 5.0e-8, 6.5e-8, 8.0e-8, 1.0e-7]
+    rows: list[dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
 
     for gm in gm_grid:
         for c_tot in c_grid:
+            if resume and (gm, c_tot) in done:
+                continue
             cfg_d = copy.deepcopy(base_cfg)
             _apply_sensitivity_overrides(cfg_d, detector_mode="raw", freeze_calibration=freeze_calibration)
             cfg_d.setdefault("oect", {})
@@ -770,6 +820,8 @@ def run_sensitivity_device(
             })
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["gm_S", "C_tot_F"])
     _save_csv_atomic(df, out_csv)
     _plot_device_curves(df, out_fig, metric)
     return df
@@ -785,21 +837,26 @@ def run_sensitivity_correlation(
     freeze_calibration: bool,
     metric: str,
     force: bool = False,
+    resume: bool = False,
 ) -> pd.DataFrame:
     suffix = _metric_suffix(metric)
     out_csv = project_root / "results" / "data" / f"sensitivity_corr{suffix}.csv"
     out_fig = project_root / "results" / "figures" / f"fig_sensitivity_corr{suffix}.png"
-    if not force and out_csv.exists():
+    if not force and out_csv.exists() and not resume:
         df_cached = pd.read_csv(out_csv)
         _plot_correlation_curves(df_cached, out_fig, metric)
         return df_cached
+    existing_rows, done = _load_existing_rows(out_csv, ["rho_corr", "rho_post"]) if (resume and not force) else ([], set())
 
-    rho_pre = [0.2, 0.5, 0.7, 0.9]
-    rho_post = [0.0, 0.2, 0.4, 0.6]
-    rows: list[dict[str, float]] = []
+    # Ten-point correlation grids (pre/post CTRL) for smoother capacity curves
+    rho_pre = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+    rho_post = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+    rows: list[dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
 
     for r0 in rho_pre:
         for r1 in rho_post:
+            if resume and (r0, r1) in done:
+                continue
             cfg_c = copy.deepcopy(base_cfg)
             _apply_sensitivity_overrides(cfg_c, detector_mode, freeze_calibration)
             cfg_c.setdefault("noise", {})
@@ -832,6 +889,8 @@ def run_sensitivity_correlation(
             })
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["rho_corr", "rho_post"])
     _save_csv_atomic(df, out_csv)
     _plot_correlation_curves(df, out_fig, metric)
     return df
@@ -868,6 +927,7 @@ def main() -> None:
         freeze_calibration=args.freeze_calibration,
         metric=args.metric,
         force=args.force,
+        resume=args.resume,
     )
     run_sensitivity_D(
         base_cfg,
@@ -879,6 +939,7 @@ def main() -> None:
         freeze_calibration=args.freeze_calibration,
         metric=args.metric,
         force=args.force,
+        resume=args.resume,
     )
     run_sensitivity_binding(
         base_cfg,
@@ -889,6 +950,7 @@ def main() -> None:
         freeze_calibration=True,
         metric=args.metric,
         force=args.force,
+        resume=args.resume,
     )
     run_sensitivity_device(
         base_cfg,
@@ -899,6 +961,7 @@ def main() -> None:
         freeze_calibration=True,
         metric=args.metric,
         force=args.force,
+        resume=args.resume,
     )
     run_sensitivity_correlation(
         base_cfg,
@@ -910,6 +973,7 @@ def main() -> None:
         freeze_calibration=args.freeze_calibration,
         metric=args.metric,
         force=args.force,
+        resume=args.resume,
     )
 
     print("[done] Parameter sensitivity sweeps completed.")

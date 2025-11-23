@@ -12,7 +12,7 @@ import argparse
 import copy
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -57,8 +57,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ts-grid",
         type=str,
-        default="0.25x,0.5x,1x,2x,4x",
-        help="Comma list of Ts multipliers (relative to dynamic Ts).",
+        default="0.25x,0.35x,0.5x,0.7x,1x,1.4x,2x,2.8x,4x,5.5x",
+        help="Comma-separated Ts multipliers (defaults to 10 log-ish samples from 0.25x to 5.5x).",
     )
     parser.add_argument(
         "--seeds",
@@ -88,6 +88,11 @@ def _parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Force recompute even if CSV already exists.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip Ts points already present in the output CSV.",
     )
     return parser.parse_args()
 
@@ -285,13 +290,27 @@ def main() -> None:
 
     csv_path = data_dir / f"{args.output_prefix}_{args.mode.lower()}{args.suffix}.csv"
     fig_path = fig_dir / f"fig_{args.output_prefix}_{args.mode.lower()}{args.suffix}.png"
-    if not args.force and csv_path.exists():
+    existing_rows: List[Dict[str, Any]] = []
+    done_multipliers: set[float] = set()
+    if args.resume and not args.force and csv_path.exists():
+        try:
+            df_prev = pd.read_csv(csv_path)
+            existing_rows = cast(List[Dict[str, Any]], df_prev.to_dict("records"))
+            done_multipliers = set(float(x) for x in df_prev.get("Ts_multiplier", []) if pd.notna(x))
+            print(f"[resume] Loaded {len(df_prev)} existing Ts points from {csv_path}")
+        except Exception as exc:
+            print(f"[resume] Failed to load existing CSV ({exc}); recomputing.")
+            existing_rows, done_multipliers = [], set()
+    elif not args.force and csv_path.exists():
         df_prev = pd.read_csv(csv_path)
         _plot_results(df_prev, args.mode, fig_path)
         return
 
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
     for mult in multipliers:
+        if args.resume and mult in done_multipliers:
+            print(f"[resume] skip Ts multiplier {mult} (cached)")
+            continue
         Ts = Ts_base * mult
         metrics = _collect_point(cfg, Ts, anchor_nm, seeds)
         metrics["Ts_multiplier"] = mult
@@ -300,6 +319,8 @@ def main() -> None:
         rows.append(metrics)
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Ts_multiplier"])
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_csv = csv_path.with_suffix(".tmp")
     df.to_csv(tmp_csv, index=False)

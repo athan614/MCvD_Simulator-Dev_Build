@@ -506,7 +506,10 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
                 ci = _get_ci_for_df(grp)
                 if ci is not None:
                     low, high = ci
-                    yerr = np.vstack([grp['ser'].to_numpy() - low, high - grp['ser'].to_numpy()])
+                    ser_vals = pd.to_numeric(grp['ser'], errors='coerce').to_numpy()
+                    lower_err = np.nan_to_num(np.maximum(ser_vals - low, 0.0))
+                    upper_err = np.nan_to_num(np.maximum(high - ser_vals, 0.0))
+                    yerr = np.vstack([lower_err, upper_err])
                     plt.errorbar(grp[nmcol], grp['ser'], yerr=yerr, fmt='none', 
                                alpha=0.25 if ctrl_state else 0.15, capsize=2)
         else:
@@ -516,7 +519,10 @@ def plot_nt_pairs_ser(data_dir: Path, save_path: Path) -> None:
             ci = _get_ci_for_df(df)
             if ci is not None:
                 low, high = ci
-                yerr = np.vstack([df['ser'].to_numpy() - low, high - df['ser'].to_numpy()])
+                ser_vals = pd.to_numeric(df['ser'], errors='coerce').to_numpy()
+                lower_err = np.nan_to_num(np.maximum(ser_vals - low, 0.0))
+                upper_err = np.nan_to_num(np.maximum(high - ser_vals, 0.0))
+                yerr = np.vstack([lower_err, upper_err])
                 plt.errorbar(df[nmcol], df['ser'], yerr=yerr, fmt='none', alpha=0.35, capsize=2)
 
     plt.xlabel('Number of Molecules per Symbol (Nm)')

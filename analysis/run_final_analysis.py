@@ -7708,8 +7708,8 @@ def _run_device_fom_sweeps(
         return
 
     desired_ctrl = bool(cfg_base['pipeline'].get('use_control_channel', True))
-    gm_grid = [1e-3, 3e-3, 5e-3, 1e-2]
-    c_grid = [1e-8, 3e-8, 5e-8, 1e-7]
+    gm_grid = [1.0e-3, 1.5e-3, 2.0e-3, 2.5e-3, 3.0e-3, 4.0e-3, 5.0e-3, 6.5e-3, 8.0e-3, 1.0e-2]
+    c_grid = [1.0e-8, 1.5e-8, 2.0e-8, 2.5e-8, 3.0e-8, 4.0e-8, 5.0e-8, 6.5e-8, 8.0e-8, 1.0e-7]
 
     device_csv = data_dir / f"device_fom_{mode.lower()}{suffix}.csv"
     try:
@@ -7899,13 +7899,26 @@ def _run_guard_frontier(
         bits_per_symbol = 2.0
 
     df_lod_ref = df_lod if df_lod is not None else pd.DataFrame()
-    distance_candidates: List[float] = []
+    combined_candidates: List[float] = []
+    if distances:
+        combined_candidates.extend(float(d) for d in distances)
     if not df_lod_ref.empty and 'distance_um' in df_lod_ref.columns:
         dist_vals = pd.to_numeric(df_lod_ref['distance_um'], errors='coerce').dropna()
         if not dist_vals.empty:
-            distance_candidates = sorted(dist_vals.unique().tolist())
-    if not distance_candidates:
-        distance_candidates = [float(d) for d in distances] if distances else []
+            combined_candidates.extend(float(v) for v in dist_vals.tolist())
+
+    def _dedupe_preserve(vals: List[float]) -> List[float]:
+        seen: set = set()
+        ordered: List[float] = []
+        for v in vals:
+            key = round(float(v), 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(float(v))
+        return ordered
+
+    distance_candidates = _dedupe_preserve(combined_candidates)
     if not distance_candidates:
         distance_candidates = [float(cfg_base['pipeline'].get('distance_um', 50.0))]
 
@@ -8543,7 +8556,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
             print(f"CFG default Nm_range[{canonical_mode}]: {raw_nm_values}")
     nm_values: List[Union[float, int]] = [cast(Union[float, int], int(v)) for v in raw_nm_values]
 
-    guard_values = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+    guard_values = [round(x, 2) for x in np.linspace(0.0, 1.0, 10)]
     ser_jobs = len(nm_values) * args.num_seeds
     lod_seed_cap = 10
     lod_jobs = len(lod_distance_grid) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
@@ -9420,7 +9433,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # ensure ISI ON during the sweep
         cfg['pipeline']['enable_isi'] = True
 
-        guard_values_candidates = [round(x, 1) for x in np.linspace(0.0, 1.0, 11)]
+        guard_values_candidates = [round(x, 2) for x in np.linspace(0.0, 1.0, 10)]
         guard_pairs = []
         for g in guard_values_candidates:
             cfg_probe = deepcopy(cfg)
@@ -9530,7 +9543,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         # NEW: Generate ISI-distance grid for Hybrid mode 2D visualization
         if mode.lower() == "hybrid":
             print("\n4. Generating Hybrid ISI-distance grid for 2D visualization…")
-            guard_grid = np.round(np.linspace(0.0, 1.0, 11), 2).tolist()
+            guard_grid = np.round(np.linspace(0.0, 1.0, 10), 2).tolist()
             dist_grid = [25.0, 50.0, 75.0, 100.0, 150.0, 200.0]
             isi_grid_csv = data_dir / "isi_grid_hybrid.csv"
             

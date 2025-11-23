@@ -29,7 +29,7 @@ This reference enumerates every command-line flag available in the scripted work
 | `--disable-isi` | flag | `false` | Disable ISI (runtime). Default is enabled. |
 | `--distance-sweep` | choice | `always` | Generate SER/SNR vs distance sweep: always (default), auto (only when distances available), or never. Choices: `always, auto, never`. |
 | `--distance-sweep-nm` | float | `None` | Override Nm_per_symbol used when sweeping distance (default: median LoD Nm or config baseline). |
-| `--distances` | value | `None` | Override LoD distance grid per mode. Example: --distances MoSK=25,35,45 --distances CSK=15,25. Use 'ALL=' to apply to all modes. |
+| `--distances` | list | `None` | Override LoD distance grid per mode. Example: --distances MoSK=25,35,45 --distances CSK=15,25. Use 'ALL=' to apply to all modes. |
 | `--extreme-mode` | flag | `false` | Max out workers according to CPU detection (no safety margin). |
 | `--force-noise-resample` | flag | `false` | Force rerunning zero-signal noise sweeps even if resume cache matches. |
 | `--freeze-calibration` | flag | `false` | Reuse baseline thresholds/sigmas during parameter sweeps. |
@@ -46,32 +46,30 @@ This reference enumerates every command-line flag available in the scripted work
 | `--lod-distance-concurrency` | int | `8` | How many distances to run concurrently in LoD sweep (default: 8). |
 | `--lod-distance-timeout-s` | float | `7200.0` | Per-distance time budget during LoD analysis. <=0 disables timeout. |
 | `--lod-max-nm` | int | `1000000` | Upper bound for Nm during LoD search (default: 1000000). |
-| `--lod-num-seeds` | str | `<=100:6,<=150:8,>150:10` | LoD seed schedule. Options:
-  N                 -> use fixed N seeds for LoD search
-  min,max           -> linearly scale from min at 25µm to max at 200µm
-  rules             -> e.g. '<=100:6,<=150:8,>150:10'
-Final LoD validation always uses the full seed set. |
+| `--lod-num-seeds` | str | `<=100:6,<=150:8,>150:10` | LoD seed schedule: `N` uses fixed seeds; `min,max` interpolates from min at 25um to max at 200um; rule lists like '<=100:6,<=150:8,>150:10' are supported. Final LoD validation always uses the full seed set. |
 | `--lod-screen-delta` | float | `0.0001` | Hoeffding screening significance (delta) for early-stop LoD tests. |
 | `--lod-seq-len` | int | `250` | If set, temporarily override sequence_length during LoD search only. |
 | `--lod-skip-retry` | flag | `false` | On resume, do not retry distances whose previous LoD attempt failed (keep NaN). |
 | `--lod-validate-seq-len` | int | `None` | If set, override sequence_length during final LoD validation only (not search). |
-| `--logdir` | value | `C:\Users\athan\Documents\GitHub\MCvD_Simulator\results\logs` | Directory for log files. |
+| `--logdir` | value | `results/logs` | Directory for log files. |
 | `--max-lod-validation-seeds` | int | `12` | Cap the number of seeds used for LoD validation (default: use all seeds). |
 | `--max-symbol-duration-s` | float | `None` | Skip LoD search at distances where symbol period exceeds this limit (seconds). |
 | `--max-ts-for-lod` | float | `None` | If set, skip LoD at distances whose dynamic Ts exceeds this (seconds). |
 | `--max-workers` | int | `None` | Override the ProcessPool worker count (auto-heuristic otherwise). |
 | `--merge-ablation-csvs` | flag | `false` | Merge per-ablation CSV branches into canonical outputs and exit. |
 | `--merge-data-dir` | str | `None` | Override the data directory for --merge-ablation-csvs (expects results/data path). |
-| `--merge-stages` | choice | `None` | Limit --merge-ablation-csvs to specific stages (ser,lod,dist,isi). Choices: `ser, lod, dist, isi`. |
+| `--merge-stages` | list | `None` | Limit --merge-ablation-csvs to specific stages (ser,lod,dist,isi). Choices: `ser, lod, dist, isi`. |
 | `--min-ci-seeds` | int | `8` | Minimum seeds required before adaptive CI stopping can trigger. |
 | `--min-decision-points` | int | `4` | Minimum time points for window guard (default: 4) |
-| `--mode` | choice | `None` | Force a single modulation mode; overrides the YAML pipeline modulation when set. Choices: `MoSK, CSK, Hybrid, ALL`. |
+| `--mode` | choice | `None` | Force a single modulation mode; defaults to MoSK when neither --mode nor --modes is provided. Choices: `MoSK, CSK, Hybrid, ALL`. |
 | `--modes` | choice | `None` | Compatibility alias for orchestrators; accepts the same choices as --mode (use 'all' for every modulation). Choices: `MoSK, CSK, Hybrid, all`. |
 | `--nm-grid` | str | `""` | Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). If not provided, uses cfg['Nm_range'] from YAML. |
 | `--no-log` | flag | `false` | Disable file logging. |
 | `--noise-only-seeds` | int | `8` | Number of seeds for noise-only sweeps (default: 8). |
 | `--noise-only-seq-len` | int | `200` | Sequence length for each noise-only run (default: 200). |
-| `--nonlod-watchdog-secs` | int | `3600` | Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.); <=0 disables. |
+| `--nonlod-watchdog-secs` | int | `14400` | Timeout for non-LoD sweeps (guard/frontier, SER vs Nm, etc.); <=0 disables (default: 4h). |
+| `--seed-timeout-retries` | int | `2` | Watchdog expirations allowed for a single seed before restarting the worker pool. |
+| `--seed-timeout-restarts` | int | `2` | Maximum worker-pool restarts triggered by one seed before aborting the sweep. |
 | `--nt-pairs` | str | `""` | CSV nt-pairs for CSK sweeps. |
 | `--num-seeds` | int | `20` | Monte Carlo seed count per Nm/distance combination. |
 | `--parallel-modes` | int | `1` | >1 to run MoSK/CSK/Hybrid concurrently (e.g., 3). |
@@ -121,18 +119,18 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--ctrl-snr-min-gain-db` | float | `0.0` | Minimum SNR gain for CTRL (pass-through) |
 | `--decision-window-frac` | float | `None` | Decision window fraction for fraction_of_Ts policy (0.1-1.0) |
 | `--decision-window-policy` | choice | `None` | Override decision window policy (default: use YAML config) Choices: `fixed, fraction_of_Ts, full_Ts`. |
-| `--distances` | value | `None` | Comma-separated distance grid in um for LoD (pass-through). Example: --distances MoSK=25,35,45 --distances CSK=15,25. |
+| `--distances` | list | `None` | Comma-separated distance grid in um for LoD (pass-through). Example: --distances MoSK=25,35,45 --distances CSK=15,25. |
 | `--extreme-mode` | flag | `false` | Pass through to run_final_analysis (max P-core threads) |
 | `--force-noise-resample` | flag | `false` | Force rerunning zero-signal noise sweeps even if resume cache exists. |
 | `--fsync-logs` | flag | `false` | Force fsync on each write. |
-| `--gain-step, --no-gain-step` | flag | `true` | Run the ΔI/ΔQ gain plot step (use --no-gain-step to skip). |
+| `--gain-step, --no-gain-step` | flag | `true` | Run the dI/dQ gain plot step (use --no-gain-step to skip). |
 | `--guard-factor` | float | `None` | Override guard factor for ISI calculations. |
 | `--guard-max-ts` | float | `0.0` | Cap guard-factor sweeps when symbol period exceeds this many seconds (0 disables; pass-through). |
 | `--guard-samples-cap` | float | `None` | Per-seed sample cap for guard sweeps (0 disables cap) |
 | `--inhibit-sleep` | flag | `false` | Prevent the OS from sleeping while the pipeline runs. |
 | `--isi-memory-cap` | int | `None` | ISI memory cap in symbols (0 = no cap) |
 | `--keep-display-on` | flag | `false` | Also keep the display awake (Windows/macOS) |
-| `--list-maintenance` | choice | `None` | List maintenance resources (choices: cache, cache-summary, data, device, figures, guard, lod, logs, overview, ser, stages, thresholds). Choices: `cache, cache-summary, data, device, figures, guard, lod, logs, overview, ser, stages, thresholds`. |
+| `--list-maintenance` | list | `None` | List maintenance resources (choices: cache, cache-summary, data, device, figures, guard, lod, logs, overview, ser, stages, thresholds). |
 | `--list-stages` | flag | `false` | Show maintenance stage numbering and descriptions. |
 | `--lod-debug` | flag | `false` | Enable verbose LoD diagnostics (writes debug logs) |
 | `--lod-distance-concurrency` | int | `8` | How many distances to run concurrently in LoD sweep (default: 8). |
@@ -143,9 +141,9 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--lod-seq-len` | int | `None` | Override sequence_length during LoD search only (pass-through) |
 | `--lod-skip-retry` | flag | `false` | On resume, do not retry LoD distances that previously failed (keep NaN). |
 | `--lod-validate-seq-len` | int | `None` | Override sequence_length during final LoD validation only (pass-through) |
-| `--logdir` | value | `C:\Users\athan\Documents\GitHub\MCvD_Simulator\results\logs` | Directory for log files. |
+| `--logdir` | value | `results/logs` | Directory for log files. |
 | `--maintenance-dry-run` | flag | `false` | Preview maintenance actions without deleting files. |
-| `--maintenance-log` | str | `None` | Path for maintenance log output (default: results/logs/maintenance.log). Use 'none' or '-' to disable logging. |
+| `--maintenance-log` | str | `None` | Optional maintenance log path (e.g., results/logs/maintenance.log). Use 'none' or '-' to disable logging. |
 | `--maintenance-only` | flag | `false` | Run maintenance actions then exit without executing the master workflow. |
 | `--max-lod-validation-seeds` | int | `None` | Cap #seeds for final LoD validation (pass-through) |
 | `--max-symbol-duration-s` | float | `None` | Skip LoD when dynamic Ts exceeds this (seconds; pass-through) |
@@ -159,7 +157,9 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--nm-grid-hybrid` | str | `""` | Nm grid override for Hybrid only. |
 | `--nm-grid-mosk` | str | `""` | Nm grid override for MoSK only. |
 | `--no-log` | flag | `false` | Disable file logging. |
-| `--nonlod-watchdog-secs` | int | `3600` | Timeout for non-LoD sweeps (pass-through). |
+| `--nonlod-watchdog-secs` | int | `14400` | Timeout for non-LoD sweeps (default: 4h; pass-through). |
+| `--seed-timeout-retries` | int | `2` | Watchdog expirations allowed for a seed before restarting the worker pool (pass-through). |
+| `--seed-timeout-restarts` | int | `2` | Maximum pool restarts triggered by a single seed before aborting (pass-through). |
 | `--nt-pairs` | str | `""` | Comma-separated NT pairs for CSK sweeps, e.g. DA-5HT,DA-DA. |
 | `--nuke-results` | flag | `false` | Delete the entire results/ directory before running the master workflow. |
 | `--num-seeds` | int | `20` | Default Monte Carlo seeds forwarded to run_final_analysis. |
@@ -168,8 +168,8 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--progress` | choice | `rich` | Progress UI backend for the master run (gui/rich/tqdm/none). Choices: `gui, rich, tqdm, none`. |
 | `--realistic-onsi` | flag | `false` | Use cached simulation noise for ONSI calculation in hybrid benchmarks. |
 | `--recalibrate` | flag | `false` | Force recalibration (ignore JSON cache) |
-| `--reset` | choice | `None` | Reset simulator state. 'cache' removes caches/state only; 'all' (default) removes results/*. Choices: `cache, all`. |
-| `--reset-stage` | list | `None` | Reset entire stages/sweeps by number or alias (1:SER vs Nm, 2:LoD vs distance, 3:Device FoM sweeps, 4:Guard frontier / ISI trade-off, 5:Main figures, 6:Supplementary figures, 7:Tables & summaries). |
+| `--reset` | choice | `None` | Reset simulator state. 'cache' removes caches/state only; 'all' clears results/* (applied when --reset is passed without a value). Choices: `cache, all`. |
+| `--reset-stage` | list | `None` | Reset entire stages/sweeps by number or alias (1:SER, 2:LoD, 3:Device FoM, 4:Guard/ISI, 5:Main figures, 6:Supplementary, 7:Tables, 8:Sensitivity, 9:Organoid, 10:Ts sweeps, 11:Capacity). |
 | `--resume` | flag | `false` | Resume completed steps. |
 | `--run-stages` | str | `all` | Comma-separated stage list (or 'all') to execute via run_final_analysis stages (default: all stages). |
 | `--sequence-length` | int | `1000` | Symbols per seed forwarded to run_final_analysis. |
