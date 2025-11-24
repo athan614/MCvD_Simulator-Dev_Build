@@ -1427,7 +1427,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     if run_stage7:
         steps.append('tables')
     if run_stage6 and args.supplementary:
-        steps.extend(['supplementary', 'appendix'])
+        steps.append('supplementary')
 
     pm = ProgressManager(mode=args.progress, gui_session_meta=session_meta)
     
@@ -2360,23 +2360,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                 _mark_done(state, "supplementary")
             sub["supplementary"].update(1); sub["supplementary"].close(); overall.update(1)
 
-        if "appendix" in sub:
-            if master_cancelled.is_set():
-                _safe_close_progress(pm, overall, sub)
-                print("🛑 Master pipeline stopped by user")
-                sys.exit(130)
-            if not (args.resume and state.get("appendix", {}).get("done")):
-                rc = _run_tracked([sys.executable, "-u", "analysis/diagnose_csk.py"])
-                if rc == 130:
-                    _safe_close_progress(pm, overall, sub, "appendix")
-                    print("🛑 Master pipeline stopped by user")
-                    sys.exit(130)
-                elif rc != 0:
-                    _safe_close_progress(pm, overall, sub, "appendix")
-                    sys.exit(rc)
-                _mark_done(state, "appendix")
-            sub["appendix"].update(1); sub["appendix"].close(); overall.update(1)
-
+        
     except KeyboardInterrupt:
         print("\n🛑 Master pipeline interrupted")
         _safe_close_progress(pm, overall, sub)

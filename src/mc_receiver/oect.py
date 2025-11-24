@@ -134,11 +134,13 @@ def oect_trio(bound_sites_trio: np.ndarray,
     alpha_H = float(alpha_H_raw) if isinstance(alpha_H_raw, str) else float(alpha_H_raw)
     K_d = float(K_d_raw) if isinstance(K_d_raw, str) else float(K_d_raw)
     N_c = float(N_c_raw) if isinstance(N_c_raw, str) else N_c_raw
-    T = cfg["sim"]["temperature_K"]
-    R_ch = cfg["oect"]["R_ch_Ohm"]
-    gm = cfg["oect"]["gm_S"]
-    C_tot = cfg["oect"]["C_tot_F"]
+    T = float(cfg["sim"]["temperature_K"])
+
+    # Robustly coerce device parameters to float to tolerate YAML strings
     o = cfg.get('oect', {})
+    gm = float(o.get("gm_S", cfg["oect"]["gm_S"]))
+    C_tot = float(o.get("C_tot_F", cfg["oect"]["C_tot_F"]))
+    R_ch = float(o.get("R_ch_Ohm", cfg["oect"]["R_ch_Ohm"]))
     I_DC_cfg_raw = o.get('I_dc_A', 0.0) or 0.0
     try:
         I_DC_cfg = float(I_DC_cfg_raw)

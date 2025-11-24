@@ -44,11 +44,21 @@ def _load_cfg() -> dict:
     if cfg_path.exists():
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-    # reasoned defaults to be safe
+
+    # Fill only missing keys; keep YAML authoritative so figures match pipeline sweeps
     cfg.setdefault("sim", {}).setdefault("dt_s", 0.01)
-    cfg.setdefault("oect", {}).update(oect_mod.default_params())
+
+    cfg.setdefault("oect", {})
+    for k, v in oect_mod.default_params().items():
+        cfg["oect"].setdefault(k, v)
+
     cfg.setdefault("noise", {})
+    # Respect aliases without overriding explicit YAML choices
+    if "rho_correlated" not in cfg["noise"] and "rho_corr" in cfg["noise"]:
+        cfg["noise"]["rho_correlated"] = cfg["noise"]["rho_corr"]
     cfg["noise"].setdefault("rho_correlated", 0.9)
+    cfg["noise"].setdefault("rho_corr", cfg["noise"]["rho_correlated"])
+
     cfg.setdefault("neurotransmitters", {
         "DA": {"q_eff_e": -1.0}, "SERO": {"q_eff_e": +1.0}, "CTRL": {"q_eff_e": 0.0}
     })

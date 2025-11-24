@@ -38,7 +38,9 @@ def _load_cfg() -> dict:
             cfg = yaml.safe_load(f) or {}
     cfg.setdefault("sim", {}).setdefault("dt_s", 0.01)
     cfg.setdefault("pipeline", {}).setdefault("symbol_period_s", 20.0)
-    cfg.setdefault("oect", {}).update(oect_mod.default_params())
+    cfg.setdefault("oect", {})
+    for k, v in oect_mod.default_params().items():
+        cfg["oect"].setdefault(k, v)
     # Minimum neurotransmitter params for DA
     cfg.setdefault("neurotransmitters", {}).setdefault("DA", {
         "k_on_M_s": 1e5, "k_off_s": 0.02, "q_eff_e": -1.0

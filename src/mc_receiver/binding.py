@@ -50,9 +50,11 @@ def bernoulli_binding(
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)
     
-    gm = cfg['oect']['gm_S']
-    C_tot = cfg['oect']['C_tot_F']
-    dt = cfg['sim']['dt_s']
+    # Robustly coerce config types to float (tolerate YAML strings)
+    oect_cfg = cfg.get('oect', {})
+    gm = float(oect_cfg.get('gm_S', cfg['oect']['gm_S']))
+    C_tot = float(oect_cfg.get('C_tot_F', cfg['oect']['C_tot_F']))
+    dt = float(cfg['sim']['dt_s'])
     
     # Check for deterministic mode
     if cfg.get('deterministic_mode', False):
@@ -272,8 +274,9 @@ def binding_noise_psd(
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)
     
-    gm = cfg['oect']['gm_S']
-    C_tot = cfg['oect']['C_tot_F']
+    oect_cfg = cfg.get('oect', {})
+    gm = float(oect_cfg.get('gm_S', cfg['oect']['gm_S']))
+    C_tot = float(oect_cfg.get('C_tot_F', cfg['oect']['C_tot_F']))
     
     # Calculate effective on-rate
     k_on_eff = calculate_effective_on_rate(k_on, damkohler)
@@ -318,8 +321,9 @@ def calculate_equilibrium_metrics(
         N_apt_raw = float(N_apt_raw.replace("_", ""))
     N_apt = int(N_apt_raw)
     
-    gm = cfg['oect']['gm_S']
-    C_tot = cfg['oect']['C_tot_F']
+    oect_cfg = cfg.get('oect', {})
+    gm = float(oect_cfg.get('gm_S', cfg['oect']['gm_S']))
+    C_tot = float(oect_cfg.get('C_tot_F', cfg['oect']['C_tot_F']))
     
     # Calculate effective on-rate
     k_on_eff = calculate_effective_on_rate(k_on, damkohler)
