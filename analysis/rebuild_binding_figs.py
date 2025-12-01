@@ -12,6 +12,10 @@ import sys, os
 from pathlib import Path
 from typing import Any
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.signal import welch  # type: ignore
 import yaml

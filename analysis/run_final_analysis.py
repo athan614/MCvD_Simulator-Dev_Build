@@ -10,6 +10,10 @@ import math
 from pathlib import Path
 import typing as t
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import yaml
 from copy import deepcopy
@@ -76,7 +80,12 @@ from src.config_utils import preprocess_config
 
 # Progress UI
 from analysis.ui_progress import ProgressManager
-from analysis.log_utils import setup_tee_logging
+from analysis.log_utils import setup_tee_logging, tee_logging_active
+from analysis.maintenance_suite import (
+    execute_maintenance_flags,
+    AVAILABLE_LIST_CATEGORIES,
+    STAGE_REGISTRY,
+)
 
 
 # NOTE: LoD debug instrumentation helper – remove when diagnostics complete
@@ -526,17 +535,15 @@ if I9_13950HX_DETECTED or I9_14900KS_DETECTED or I9_14900K_DETECTED:
     cpu_name = platform.processor().upper()
     if "14900KS" in cpu_name:
         CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-14900KS"]
-        print("🔥 i9-14900KS detected! P-core optimization available.")
     elif "14900K" in cpu_name:
         CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-14900K"]
-        print("🔥 i9-14900K detected! P-core optimization available.")
     elif "13950HX" in cpu_name:
         CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]
-        print("🔥 i9-13950HX detected! P-core optimization available.")
     else:
         # Fallback to generic detection if specific model isn't found in processor string
         CPU_CONFIG = HYBRID_CPU_CONFIGS["i9-13950HX"]  # Use as default for this topology
-        print("?? Intel 13th/14th gen hybrid CPU detected! P-core optimization available.")
+
+CPU_BANNER_ENV = "MCVD_CPU_BANNER_SHOWN"
 
 def get_optimal_workers(mode: str = "optimal") -> int:
     if not CPU_CONFIG:
@@ -553,6 +560,20 @@ def get_optimal_workers(mode: str = "optimal") -> int:
         return max(p_threads - 2, 1)
     else:
         return max(p_threads - 4, 1)
+
+def _maybe_print_cpu_banner(extreme_enabled: bool) -> None:
+    """
+    Emit the CPU/P-core optimization banner at most once per top-level run.
+    Guarded by an env var so multiple child processes don't spam the console.
+    """
+    if not extreme_enabled or not CPU_CONFIG:
+        return
+    if os.environ.get(CPU_BANNER_ENV):
+        return
+    cpu_name = next((name for name, cfg in HYBRID_CPU_CONFIGS.items() if cfg is CPU_CONFIG), "Hybrid CPU")
+    print(f"🔥 {cpu_name} detected — using P-core optimized worker allocation.")
+    print(f"   • P-core threads: {CPU_CONFIG['total_p_threads']}, default extreme workers: {CPU_CONFIG['total_p_threads']}")
+    os.environ[CPU_BANNER_ENV] = "1"
 
 def worker_init():
     global LOD_DEBUG_ENABLED
@@ -1856,6 +1877,46 @@ def _atomic_write_csv(csv_path: Path, df: pd.DataFrame) -> None:
 
     _with_file_lock(csv_path, _replace)
 
+def _robust_read_csv(path: Path, wait_lock_s: float = 1.0, **kwargs) -> pd.DataFrame:
+    """
+    Safely read CSVs that may be mid-write: briefly wait on a lock, prefer the
+    Python engine, and skip malformed lines instead of crashing.
+    """
+    if path is None:
+        return pd.DataFrame()
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+
+    lock = path.with_suffix(path.suffix + ".lock")
+    t0 = time.time()
+    while lock.exists() and (time.time() - t0) < wait_lock_s:
+        time.sleep(0.05)
+
+    read_kwargs: Dict[str, t.Any] = {"encoding_errors": "ignore"}
+    read_kwargs.update(kwargs)
+    bad_count = [0]
+
+    if "on_bad_lines" not in read_kwargs:
+        def _capture_bad_line(bad_line: t.List[str]) -> t.Optional[t.List[str]]:
+            bad_count[0] += 1
+            return None  # skip the malformed line
+        read_kwargs["on_bad_lines"] = _capture_bad_line
+        read_kwargs.setdefault("engine", "python")
+    elif callable(read_kwargs.get("on_bad_lines")) and "engine" not in read_kwargs:
+        read_kwargs["engine"] = "python"
+
+    try:
+        df = pd.read_csv(str(path), **read_kwargs)
+        if bad_count[0] > 0:
+            print(f"⚠️  Skipped {bad_count[0]} malformed row(s) in {path.name}; re-running affected values will regenerate them.")
+        return df
+    except Exception:
+        try:
+            return pd.read_csv(str(path), **read_kwargs)
+        except Exception:
+            return pd.DataFrame()
+
 
 _STAGE_CSV_BASENAMES = {
     "ser": "ser_vs_nm_{mode}",
@@ -2399,7 +2460,7 @@ def flush_staged_rows(csv_path: Path) -> None:
     pattern = f"{csv_path.stem}__*.csv"
     for shard in staging.glob(pattern):
         try:
-            shard_df = pd.read_csv(shard)
+            shard_df = _robust_read_csv(shard)
         except Exception:
             shard.unlink(missing_ok=True)
             continue
@@ -2410,7 +2471,7 @@ def flush_staged_rows(csv_path: Path) -> None:
         def _append_shard() -> None:
             if csv_path.exists():
                 try:
-                    existing = pd.read_csv(csv_path)
+                    existing = _robust_read_csv(csv_path)
                     combined = pd.concat([existing, shard_df], ignore_index=True)
                 except Exception:
                     combined = shard_df
@@ -2455,7 +2516,9 @@ def load_completed_values(csv_path: Path, key: str, use_ctrl: Optional[bool] = N
     if not csv_path.exists():
         return set()
     try:
-        df = pd.read_csv(csv_path)
+        df = _robust_read_csv(csv_path)
+        if df.empty:
+            return set()
         
         # Filter by CTRL state if specified
         if use_ctrl is not None and 'use_ctrl' in df.columns:
@@ -3179,8 +3242,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume: skip finished values and append results as we go")
     parser.add_argument("--with-ctrl", dest="use_ctrl", action="store_true", help="Use CTRL differential subtraction")
     parser.add_argument("--no-ctrl", dest="use_ctrl", action="store_false", help="Disable CTRL subtraction (ablation)")
-    parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none"], default="tqdm",
-                    help="Progress UI backend")
+    parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none", "inline"], default="tqdm",
+                    help="Progress UI backend (inline prints one-line per sweep value; good for concurrent runs)")
     parser.add_argument("--detector-mode", choices=["zscore", "raw", "whitened"], default="zscore",
                         help="Detector statistic normalisation (default: zscore).")
     parser.add_argument("--freeze-calibration", action="store_true",
@@ -3255,6 +3318,89 @@ def parse_arguments() -> argparse.Namespace:
                         help="Prevent the OS from sleeping while the pipeline runs")
     parser.add_argument("--keep-display-on", action="store_true",
                         help="Also keep the display awake (Windows/macOS)")
+
+    # Maintenance & cache management (mirror run_master so standalone use can clean up)
+    stage_help = ", ".join(f"{sid}:{info.name}" for sid, info in STAGE_REGISTRY.items())
+    list_help = ", ".join(AVAILABLE_LIST_CATEGORIES)
+    parser.add_argument(
+        "--maintenance-dry-run",
+        action="store_true",
+        help="Preview maintenance actions without deleting files.",
+    )
+    parser.add_argument(
+        "--maintenance-log",
+        type=str,
+        default=None,
+        help="Path for maintenance log output (default: results/logs/maintenance.log). Use 'none' or '-' to disable logging.",
+    )
+    parser.add_argument(
+        "--list-maintenance",
+        nargs="+",
+        choices=AVAILABLE_LIST_CATEGORIES,
+        metavar="CATEGORY",
+        help=f"List maintenance resources (choices: {list_help}).",
+    )
+    parser.add_argument(
+        "--list-stages",
+        action="store_true",
+        help="Show maintenance stage numbering and descriptions.",
+    )
+    parser.add_argument(
+        "--maintenance-only",
+        action="store_true",
+        help="Run maintenance actions then exit without executing analysis.",
+    )
+    parser.add_argument(
+        "--clear-threshold-cache",
+        nargs="*",
+        metavar="MODE",
+        default=None,
+        help="Clear cached threshold JSON files (optionally filtered by MODE).",
+    )
+    parser.add_argument(
+        "--clear-lod-state",
+        nargs="*",
+        metavar="SPEC",
+        default=None,
+        help="Clear LoD caches/state. SPEC formats: 'all', 'mode', 'mode:distance', 'distance'.",
+    )
+    parser.add_argument(
+        "--clear-seed-cache",
+        nargs="*",
+        metavar="SWEEP",
+        default=None,
+        help="Clear cached seed payloads (e.g., 'lod_search', 'ser_vs_nm'). Use without values to clear all sweeps.",
+    )
+    parser.add_argument(
+        "--clear-distance",
+        nargs="+",
+        type=float,
+        metavar="DIST",
+        help="Remove LoD results for the given distance(s) in micrometres.",
+    )
+    parser.add_argument(
+        "--clear-nm",
+        nargs="+",
+        type=float,
+        metavar="NM",
+        help="Remove SER vs Nm data for the specified molecule counts.",
+    )
+    parser.add_argument(
+        "--reset-stage",
+        nargs="+",
+        metavar="STAGE",
+        help=f"Reset entire stages/sweeps by number or alias ({stage_help}).",
+    )
+    parser.add_argument(
+        "--nuke-results",
+        action="store_true",
+        help="Delete the entire results/ directory before running analysis.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompts for destructive maintenance actions.",
+    )
     parser.add_argument("--max-ts-for-lod", type=float, default=None,
                         help="If set, skip LoD at distances whose dynamic Ts exceeds this (seconds).")
     parser.add_argument("--max-lod-validation-seeds", type=int, default=12,
@@ -4421,21 +4567,24 @@ def run_sweep(cfg: Dict[str, Any],
         flush_staged_rows(persist_csv)
 
     pool = global_pool.get_pool()
+    inline_mode = (progress_mode == "inline")
     # Use provided progress manager or create new one
-    local_pm = pm or ProgressManager(progress_mode)
-    if not pm:  # only create session meta if we're creating our own PM
+    local_pm = pm or ProgressManager("none" if inline_mode else progress_mode)
+    if not pm and not inline_mode:  # only create session meta if we're creating our own PM
         session_meta = {"progress": progress_mode, "resume": False}
         local_pm = ProgressManager(progress_mode, gui_session_meta=session_meta)
 
     # Resume: filter out done values (by their column in persisted CSV)
-    values_to_run = sweep_values
-    if resume and persist_csv is not None and persist_csv.exists():
-        key = 'pipeline_Nm_per_symbol' if sweep_param == 'pipeline.Nm_per_symbol' else sweep_param
-        desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-        done = load_completed_values(persist_csv, key, desired_ctrl)
-        values_to_run = [v for v in sweep_values if _value_key(v) not in done]
-        if done:
-            print(f"↩️  Resume: skipping {len(done)} already-completed values for use_ctrl={desired_ctrl}")
+    values_to_run = list(sweep_values)
+    key = 'pipeline_Nm_per_symbol' if sweep_param == 'pipeline.Nm_per_symbol' else sweep_param
+    desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+    completed_values = set()
+    if persist_csv is not None and persist_csv.exists():
+        completed_values = load_completed_values(persist_csv, key, desired_ctrl)
+        if resume:
+            values_to_run = [v for v in sweep_values if _value_key(v) not in completed_values]
+            if completed_values:
+                print(f"↩️  Resume: skipping {len(completed_values)} already-completed values for use_ctrl={desired_ctrl}")
 
     # Pre-calibrate thresholds once per sweep value (hoisted from per-seed)
     thresholds_map: Dict[Union[float, int], Dict[str, Union[float, List[float], str]]] = {}
@@ -4465,6 +4614,10 @@ def run_sweep(cfg: Dict[str, Any],
             thresholds_map[v] = calibrate_thresholds_cached(cfg_v, cal_seeds, recalibrate)
 
     job_bar: Optional[Any] = None
+    inline_total_jobs = 0
+    inline_done = 0
+    inline_total_jobs = len(sweep_values) * len(seeds)
+    inline_done = 0
     try:
         # Determine how many seed-jobs remain (for progress accounting)
         # --- NEW: resolve sweep folder early (for seed cache lookups) ---
@@ -4485,25 +4638,7 @@ def run_sweep(cfg: Dict[str, Any],
         done_jobs = 0
     
         def _value_done_in_csv(val) -> bool:
-            if persist_csv is None or not persist_csv.exists():
-                return False
-            try:
-                df = pd.read_csv(persist_csv)
-                if sweep_param == 'pipeline.Nm_per_symbol':
-                    csv_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df.columns else 'pipeline.Nm_per_symbol'
-                elif sweep_param == 'pipeline.guard_factor':
-                    csv_key = 'guard_factor' if 'guard_factor' in df.columns else 'pipeline.guard_factor'
-                else:
-                    csv_key = sweep_param
-                if csv_key not in df.columns:
-                    return False
-                df2 = df
-                if 'use_ctrl' in df2.columns:
-                    df2 = df2[df2['use_ctrl'] == use_ctrl]
-                vals = pd.to_numeric(df2[csv_key], errors='coerce').dropna().tolist()
-                return _value_key(val) in { _value_key(v) for v in vals }
-            except Exception:
-                return False
+            return _value_key(val) in completed_values
     
         # Count completed seed-jobs across ALL sweep values
         for v in sweep_values:
@@ -4522,16 +4657,19 @@ def run_sweep(cfg: Dict[str, Any],
     
         # --- Create/bind the bar with the FULL total, and prefill ---
         display_name = f"{cfg['pipeline']['modulation']} | {sweep_name} ({'CTRL' if use_ctrl else 'NoCtrl'})"
-        if sweep_key and pm:
+        inline_total_jobs = planned_total_jobs
+        if sweep_key and pm and not inline_mode:
             # Update totals for the already-created keyed row
             job_bar = pm.task(total=planned_total_jobs, description=display_name,
                             key=sweep_key, parent=parent_key, kind="sweep")
         else:
             job_bar = local_pm.task(total=planned_total_jobs, description=display_name)
-    
+
         if done_jobs > 0:
             # Jump the bar to reflect completed work
             job_bar.update(done_jobs)
+            inline_done = done_jobs
+            inline_done = done_jobs
     
         # Collect rows
         aggregated_rows: List[Dict[str, Any]] = []
@@ -4664,6 +4802,7 @@ def run_sweep(cfg: Dict[str, Any],
                                     pm.worker_update(slot, "idle")
                                 free_slots.append(slot)
                         job_bar.update(1)
+                        inline_done += 1
                     except TimeoutError:
                         timeout_desc = f"{timeout_s}s" if timeout_wait is not None else "inf"
                         print(f"        ??  Timeout ({timeout_desc}) for {sweep_param}={v}, {len(pending)} futures pending")
@@ -4744,6 +4883,7 @@ def run_sweep(cfg: Dict[str, Any],
                             remaining = remaining_not_submitted + still_pending
                             if remaining > 0:
                                 job_bar.update(remaining)
+                                inline_done += remaining
                             # Cancel remaining pending futures
                             for fut in pending:
                                 fut.cancel()
@@ -5397,6 +5537,9 @@ def run_sweep(cfg: Dict[str, Any],
                                   f"({total_reported_errors}) by >10% at {sweep_param}={v}")
     
             aggregated_rows.append(row)
+            if inline_mode:
+                inline_done = min(inline_total_jobs, inline_done)
+                print(f"[progress] {sweep_name}: {inline_done}/{inline_total_jobs} seed-jobs done (value={_value_key(v)})")
             
             # Append this value's aggregated row immediately (crash‑safe)
             if persist_csv is not None:
@@ -6080,7 +6223,12 @@ def find_lod_for_ser(cfg_base: Dict[str, Any], seeds: List[int],
                 })
 
     # NEW: warm-start bracket if provided with analytic intersection
-    warm = int(cfg_base.get('_warm_lod_guess', 0))
+    warm_raw = int(cfg_base.get('_warm_lod_guess', 0))
+    warm = warm_raw
+    # Guard against pathological warm guesses that exceed the configured ceiling
+    if warm > nm_ceiling:
+        print(f"    ⚠️  Warm-start guess {warm} exceeds LoD ceiling {nm_ceiling}; clamping to ceiling")
+        warm = nm_ceiling
     if warm > 0:
         # Simplified nm_min calculation (removes redundant max)
         nm_min = max(nm_min, int(warm * 0.5))
@@ -7881,11 +8029,11 @@ def _run_guard_frontier(
     frontier_csv = data_dir / f"guard_frontier_{mode.lower()}{suffix}.csv"
 
     try:
-        existing_tradeoff = pd.read_csv(tradeoff_csv)
+        existing_tradeoff = _robust_read_csv(tradeoff_csv)
     except Exception:
         existing_tradeoff = pd.DataFrame()
     try:
-        existing_frontier = pd.read_csv(frontier_csv)
+        existing_frontier = _robust_read_csv(frontier_csv)
     except Exception:
         existing_frontier = pd.DataFrame()
 
@@ -8376,8 +8524,9 @@ def _write_hybrid_isi_distance_grid(cfg_base: Dict[str, Any],
 def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     # Avoid double‑installing tee logging (it is already set in main())
     if not args.no_log:
-        root = logging.getLogger()
-        if not any(hasattr(h, "baseFilename") for h in root.handlers):
+        if tee_logging_active():
+            print("[log] File logging already active; skipping tee re-install")
+        else:
             setup_tee_logging(Path(args.logdir), prefix="run_final_analysis", fsync=args.fsync_logs)
     else:
         print("[log] File logging disabled by --no-log")
@@ -9612,6 +9761,13 @@ def main() -> None:
     _install_signal_handlers()
     
     args = parse_arguments()
+    _maybe_print_cpu_banner(bool(args.extreme_mode or getattr(args, "beast_mode", False)))
+    maintenance_performed = execute_maintenance_flags(args, project_root)
+    if getattr(args, "maintenance_only", False):
+        if not maintenance_performed:
+            print("Maintenance-only flag provided but no maintenance actions were executed.")
+        return
+
     global LOD_DEBUG_ENABLED
     if getattr(args, "lod_debug", False):
         os.environ[LOD_DEBUG_ENV_KEY] = "1"

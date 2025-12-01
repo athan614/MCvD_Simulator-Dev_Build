@@ -23,10 +23,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, cast
 
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 from analysis.ieee_plot_style import apply_ieee_style
 
 import math
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import yaml

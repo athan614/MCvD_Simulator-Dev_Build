@@ -18,6 +18,10 @@ import sys
 from typing import Dict, Optional
 import numpy as np
 import pandas as pd
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 
 project_root = Path(__file__).parent.parent

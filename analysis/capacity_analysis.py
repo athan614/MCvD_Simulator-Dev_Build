@@ -18,16 +18,23 @@ import math
 import os
 import sys
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
 from numbers import Real
+from analysis.ui_progress import ProgressManager
 
 project_root = Path(__file__).resolve().parents[1]
-sys.path.append(str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
 from analysis.run_final_analysis import (
@@ -47,7 +54,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mc", type=int, default=5000, help="Monte Carlo samples for MI estimation (default: 5000).")
     parser.add_argument("--force", action="store_true", help="Ignore existing CSV and recompute.")
     parser.add_argument("--resume", action="store_true", help="Reuse existing rows and only compute missing mode/grid points.")
-    parser.add_argument("--progress", default="none", help="Placeholder for run_master compatibility.")
+    parser.add_argument(
+        "--progress",
+        choices=["gui", "rich", "tqdm", "none"],
+        default="tqdm",
+        help="Progress backend (gui, rich, tqdm, none).",
+    )
     parser.add_argument(
         "--modes",
         type=str,
@@ -600,6 +612,9 @@ def main() -> None:
     if not selected_modes:
         selected_modes = list(ALL_MODES)
 
+    pm = ProgressManager(args.progress, gui_session_meta={"resume": args.resume, "progress": args.progress})
+    overall_bar = pm.task(total=len(selected_modes), description="Capacity modes", kind="overall") if args.progress != "none" else None
+
     cfg = _load_cfg()
     data_dir = project_root / "results" / "data"
 
@@ -610,11 +625,15 @@ def main() -> None:
         try:
             existing_df = pd.read_csv(out_csv)
             for _, row in existing_df.iterrows():
+                nm_val = row.get("Nm", float("nan"))
+                for alt_nm_col in ("Nm_per_symbol", "pipeline_Nm_per_symbol", "pipeline.Nm_per_symbol"):
+                    if (pd.isna(nm_val) or not math.isfinite(float(nm_val))) and alt_nm_col in row:
+                        nm_val = row.get(alt_nm_col, nm_val)
                 existing_keys.add(
                     (
                         str(row.get("mode", "")).strip(),
                         float(row.get("distance_um", float("nan"))),
-                        float(row.get("Nm", float("nan"))),
+                        float(nm_val),
                         bool(row.get("use_ctrl", True)),
                     )
                 )
@@ -681,12 +700,15 @@ def main() -> None:
             combos.append((float(nm_fallback), float(distance_fallback), ctrl_fallback))
 
         combos = combos[:10]
+        mode_bar = pm.task(total=len(combos), description=f"{mode} capacity", kind="sweep") if args.progress != "none" else None
 
         for point_idx, (nm_value, distance_value, ctrl_value) in enumerate(combos, start=1):
             use_ctrl = desired_ctrl if ctrl_value is None else bool(ctrl_value)
             key = (mode, float(distance_value), float(nm_value), bool(use_ctrl))
             if args.resume and key in existing_keys:
                 print(f"[resume] Skipping {mode} distance={distance_value} Nm={nm_value} use_ctrl={use_ctrl} (cached)")
+                if mode_bar:
+                    mode_bar.update(1)
                 continue
             print(f"[info] {mode}: point {point_idx:02d} distance={distance_value:.1f} um, Nm={nm_value:.3g}, use_ctrl={use_ctrl}")
 
@@ -714,6 +736,12 @@ def main() -> None:
                 "I_soft_bits": I_soft,
                 "point_index": point_idx,
             })
+            if mode_bar:
+                mode_bar.update(1)
+        if mode_bar:
+            mode_bar.close()
+        if overall_bar:
+            overall_bar.update(1)
 
     df_out = pd.DataFrame(records)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -728,6 +756,7 @@ def main() -> None:
 
     _plot_capacity_dashboard(df_out, selected_modes)
     _write_capacity_table(df_out, selected_modes)
+    pm.stop()
 
     print("[done] Capacity analysis complete.")
 

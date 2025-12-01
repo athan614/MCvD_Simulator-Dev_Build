@@ -6,8 +6,17 @@ from pathlib import Path
 import argparse
 import numpy as np
 import pandas as pd
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
+import sys
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
 
@@ -16,7 +25,6 @@ try:
 except Exception:  # pragma: no cover - fallback for older trees
     from src.detection import ber_mosk_analytic, sep_csk_mary  # type: ignore[misc]
 
-project_root = Path(__file__).resolve().parents[1]
 data_dir = project_root / "results" / "data"
 fig_dir = project_root / "results" / "figures"
 fig_dir.mkdir(parents=True, exist_ok=True)

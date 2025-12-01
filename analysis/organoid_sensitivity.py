@@ -14,18 +14,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 from numbers import Real
 
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
 import math
+from tqdm import tqdm
 
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
+from analysis.log_utils import setup_tee_logging
+from analysis.ui_progress import ProgressManager
 from analysis.run_final_analysis import (
     calibrate_thresholds_cached,
     _apply_thresholds_into_cfg,
@@ -103,6 +115,26 @@ def _load_existing(path: Path, key_cols: Sequence[str]) -> Tuple[pd.DataFrame, s
         except Exception:
             continue
     return df, keys
+
+
+class _NoopBar:
+    def __init__(self) -> None:
+        self._completed = 0
+    def update(self, n: int = 1, description: Optional[str] = None) -> None:
+        self._completed += n
+    def close(self) -> None:
+        pass
+    def set_description(self, text: str) -> None:
+        pass
+
+
+def _make_progress(pm: Optional[ProgressManager], total: int, desc: str, kind: str = "sweep", parent: Any = None):
+    if pm is not None:
+        return pm.task(total=total, description=desc, kind=kind, parent=parent)
+    try:
+        return tqdm(total=total, desc=desc, leave=False)
+    except Exception:
+        return _NoopBar()
 
 
 def _load_base_config(path: Path) -> Dict[str, Any]:
@@ -219,7 +251,8 @@ def _aggregate_run(results: List[Dict[str, Any]]) -> Dict[str, float]:
 def run_monte_carlo(cfg: Dict[str, Any],
                     seeds: Sequence[int],
                     sequence_length: int,
-                    recalibrate: bool) -> Dict[str, float]:
+                    recalibrate: bool,
+                    progress: Optional[Any] = None) -> Dict[str, float]:
     thresholds = _get_thresholds_for_cfg(cfg, seeds, recalibrate)
     results: List[Dict[str, Any]] = []
     for seed in seeds:
@@ -231,6 +264,11 @@ def run_monte_carlo(cfg: Dict[str, Any],
         cfg_seed['disable_progress'] = True
         res = run_sequence(cfg_seed)
         results.append(res)
+        if progress is not None:
+            try:
+                progress.update(1)
+            except Exception:
+                pass
     return _aggregate_run(results)
 
 
@@ -301,16 +339,21 @@ def psd_to_dataframe(psd: Dict[str, Any], sweep_label: str, sweep_value: float) 
 
 def plot_ser_vs_nm(df: pd.DataFrame, sweep_label: str, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(4.0, 3.0))
-    for value, group in df.groupby(sweep_label):
-        group_sorted = group.sort_values("Nm_per_symbol")
-        ax.errorbar(
-            group_sorted["Nm_per_symbol"],
-            group_sorted["ser_mean"],
-            yerr=group_sorted["ser_sem"],
-            marker="o",
-            linewidth=1.2,
-            label=f"{sweep_label}={value:g}",
-        )
+    ctrl_groups = df.groupby("use_ctrl") if "use_ctrl" in df.columns else [(None, df)]
+    for uc, df_ctrl in ctrl_groups:
+        for value, group in df_ctrl.groupby(sweep_label):
+            group_sorted = group.sort_values("Nm_per_symbol")
+            label = f"{sweep_label}={value:g}"
+            if uc is not None:
+                label += f" ({'CTRL on' if uc else 'CTRL off'})"
+            ax.errorbar(
+                group_sorted["Nm_per_symbol"],
+                group_sorted["ser_mean"],
+                yerr=group_sorted["ser_sem"],
+                marker="o",
+                linewidth=1.2,
+                label=label,
+            )
     ax.set_xlabel("Nm per symbol")
     ax.set_ylabel("SER")
     ax.set_yscale("log")
@@ -323,11 +366,18 @@ def plot_ser_vs_nm(df: pd.DataFrame, sweep_label: str, out_path: Path) -> None:
 
 def plot_metric_vs_param(df: pd.DataFrame, param: str, metric: str, ylabel: str, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(3.6, 2.8))
-    df_sorted = df.sort_values(param)
-    ax.plot(df_sorted[param], df_sorted[metric], marker="o", linewidth=1.2)
+    ctrl_groups: List[Tuple[Any, pd.DataFrame]] = list(df.groupby("use_ctrl")) if "use_ctrl" in df.columns else [(None, df)]
+    for uc, group in ctrl_groups:
+        df_sorted = group.sort_values(param)
+        label = None
+        if uc is not None:
+            label = "CTRL on" if uc else "CTRL off"
+        ax.plot(df_sorted[param], df_sorted[metric], marker="o", linewidth=1.2, label=label)
     ax.set_xlabel(param)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
+    if any(g is not None for g, _ in ctrl_groups):
+        ax.legend()
     _ensure_dir(out_path)
     fig.savefig(out_path, dpi=400, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -336,13 +386,19 @@ def plot_metric_vs_param(df: pd.DataFrame, param: str, metric: str, ylabel: str,
 def plot_psd(df: pd.DataFrame, sweep_label: str, spectra_filter: Sequence[str], out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(4.0, 3.2))
     spectra = set(spectra_filter)
-    for value, group in df.groupby(sweep_label):
+    group_cols = [sweep_label] + (["use_ctrl"] if "use_ctrl" in df.columns else [])
+    for keys, group in df.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        label_prefix = f"{sweep_label}={keys[0]:g}"
+        if len(keys) > 1:
+            label_prefix += f" ({'CTRL on' if keys[1] else 'CTRL off'})"
         for spectrum, spec_group in group[group["spectrum"].isin(spectra)].groupby("spectrum"):
             spec_sorted = spec_group.sort_values("frequency_hz")
             ax.loglog(
                 spec_sorted["frequency_hz"],
                 spec_sorted["power_a2_per_hz"],
-                label=f"{sweep_label}={value:g} | {spectrum}",
+                label=f"{label_prefix} | {spectrum}",
                 linewidth=1.2,
             )
     ax.set_xlabel("Frequency (Hz)")
@@ -358,44 +414,63 @@ def run_alpha_sweep(
     base_cfg: Dict[str, Any],
     seeds: Sequence[int],
     args: argparse.Namespace,
+    ctrl_states: Sequence[bool],
     existing_ser: Optional[pd.DataFrame] = None,
     existing_psd: Optional[pd.DataFrame] = None,
     resume: bool = False,
+    pm: Optional[ProgressManager] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     nm_values = args.nm_grid if args.nm_grid else base_cfg.get("Nm_range", {}).get("MoSK", [200, 350, 650, 1100, 1750])
     rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
     done_ser: set[tuple] = set()
-    done_psd: set[float] = set()
+    done_psd: set[tuple] = set()
     if resume and existing_ser is not None:
-        done_ser = {(float(r["alpha_H"]), float(r["Nm_per_symbol"])) for _, r in existing_ser.iterrows() if "alpha_H" in r and "Nm_per_symbol" in r}
+        done_ser = {(float(r["alpha_H"]), float(r["Nm_per_symbol"]), bool(r.get("use_ctrl", True))) for _, r in existing_ser.iterrows() if "alpha_H" in r and "Nm_per_symbol" in r}
     if resume and existing_psd is not None:
-        done_psd = {float(r["alpha_H"]) for _, r in existing_psd.iterrows() if "alpha_H" in r}
+        done_psd = {(float(r["alpha_H"]), bool(r.get("use_ctrl", True))) for _, r in existing_psd.iterrows() if "alpha_H" in r}
         psd_frames.append(existing_psd)
 
+    progress = _make_progress(pm, total=len(args.alpha_values) * len(ctrl_states) * len(nm_values), desc="Organoid alpha")
     for alpha in args.alpha_values:
-        for nm in nm_values:
-            key = (float(alpha), float(nm))
-            if resume and key in done_ser:
-                continue
-            cfg = deepcopy(base_cfg)
-            cfg['noise']['alpha_H'] = float(alpha)
-            cfg['pipeline']['Nm_per_symbol'] = int(nm)
-            agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
-            agg.update({"alpha_H": float(alpha), "Nm_per_symbol": int(nm)})
-            rows.append(agg)
+        for use_ctrl in ctrl_states:
+            for nm in nm_values:
+                seed_bar = None
+                if args.progress != "none":
+                    desc = f"alpha={alpha:g}, Nm={nm:g}, {'CTRL' if use_ctrl else 'NoCTRL'}"
+                    seed_bar = _make_progress(pm, total=len(seeds), desc=desc, kind="worker")
+                key = (float(alpha), float(nm), bool(use_ctrl))
+                if resume and key in done_ser:
+                    progress.update(1)
+                    if seed_bar:
+                        seed_bar.close()
+                    continue
+                cfg = deepcopy(base_cfg)
+                cfg['pipeline']['use_control_channel'] = bool(use_ctrl)
+                cfg['noise']['alpha_H'] = float(alpha)
+                cfg['pipeline']['Nm_per_symbol'] = int(nm)
+                agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate, progress=seed_bar)
+                agg.update({"alpha_H": float(alpha), "Nm_per_symbol": int(nm), "use_ctrl": bool(use_ctrl)})
+                rows.append(agg)
+                progress.update(1)
+                if seed_bar:
+                    seed_bar.close()
 
-        if resume and float(alpha) in done_psd:
-            continue
-        psd_cfg = deepcopy(base_cfg)
-        psd_cfg['noise']['alpha_H'] = float(alpha)
-        psd_cfg['pipeline']['Nm_per_symbol'] = int(nm_values[0]) if nm_values else base_cfg['pipeline'].get('Nm_per_symbol', 1000)
-        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
-        if psd:
-            psd_frames.append(psd_to_dataframe(psd, "alpha_H", float(alpha)))
+            if resume and (float(alpha), bool(use_ctrl)) in done_psd:
+                continue
+            psd_cfg = deepcopy(base_cfg)
+            psd_cfg['pipeline']['use_control_channel'] = bool(use_ctrl)
+            psd_cfg['noise']['alpha_H'] = float(alpha)
+            psd_cfg['pipeline']['Nm_per_symbol'] = int(nm_values[0]) if nm_values else base_cfg['pipeline'].get('Nm_per_symbol', 1000)
+            psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
+            if psd:
+                frame = psd_to_dataframe(psd, "alpha_H", float(alpha))
+                frame["use_ctrl"] = bool(use_ctrl)
+                psd_frames.append(frame)
+    progress.close()
 
     df_ser = pd.DataFrame(rows)
-    df_ser = df_ser.drop_duplicates(subset=["alpha_H", "Nm_per_symbol"]) if not df_ser.empty else df_ser
+    df_ser = df_ser.drop_duplicates(subset=["alpha_H", "Nm_per_symbol", "use_ctrl"]) if not df_ser.empty else df_ser
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
     return df_ser, df_psd
 
@@ -404,18 +479,20 @@ def run_bias_sweep(
     base_cfg: Dict[str, Any],
     seeds: Sequence[int],
     args: argparse.Namespace,
+    ctrl_states: Sequence[bool],
     existing_ser: Optional[pd.DataFrame] = None,
     existing_psd: Optional[pd.DataFrame] = None,
     resume: bool = False,
+    pm: Optional[ProgressManager] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
-    done_ser: set[float] = set()
-    done_psd: set[float] = set()
+    done_ser: set[tuple] = set()
+    done_psd: set[tuple] = set()
     if resume and existing_ser is not None:
-        done_ser = {float(r["I_dc_A"]) for _, r in existing_ser.iterrows() if "I_dc_A" in r}
+        done_ser = {(float(r["I_dc_A"]), bool(r.get("use_ctrl", True))) for _, r in existing_ser.iterrows() if "I_dc_A" in r}
     if resume and existing_psd is not None:
-        done_psd = {float(r["I_dc_A"]) for _, r in existing_psd.iterrows() if "I_dc_A" in r}
+        done_psd = {(float(r["I_dc_A"]), bool(r.get("use_ctrl", True))) for _, r in existing_psd.iterrows() if "I_dc_A" in r}
         psd_frames.append(existing_psd)
 
     oect_cfg = base_cfg.get('oect', {})
@@ -428,48 +505,60 @@ def run_bias_sweep(
 
     gm_mode = getattr(args, "bias_gm_scaling", "sqrt")
 
+    progress = _make_progress(pm, total=len(args.bias_values) * len(ctrl_states), desc="Organoid bias")
     for bias in args.bias_values:
-        cfg = deepcopy(base_cfg)
         bias_val = float(bias)
-        if resume and bias_val in done_ser:
-            continue
-        cfg['oect']['I_dc_A'] = bias_val
+        for use_ctrl in ctrl_states:
+            seed_bar = None
+            if args.progress != "none":
+                desc = f"I_dc={bias_val:.2e}, {'CTRL' if use_ctrl else 'NoCTRL'}"
+                seed_bar = _make_progress(pm, total=len(seeds), desc=desc, kind="worker")
+            cfg = deepcopy(base_cfg)
+            if resume and (bias_val, use_ctrl) in done_ser:
+                progress.update(1)
+                if seed_bar:
+                    seed_bar.close()
+                continue
+            cfg['oect']['I_dc_A'] = bias_val
+            cfg['pipeline']['use_control_channel'] = bool(use_ctrl)
 
-        gm_scale = 1.0
-        if gm_mode != "none" and math.isfinite(bias_val) and bias_val > 0.0:
-            ratio = max(bias_val, 1.0e-18) / base_i_dc
-            if gm_mode == "linear":
-                gm_scale = ratio
-            else:
-                gm_scale = math.sqrt(ratio)
-        gm_scaled = base_gm * gm_scale
-        cfg['oect']['gm_S'] = gm_scaled
+            gm_scale = 1.0
+            if gm_mode != "none" and math.isfinite(bias_val) and bias_val > 0.0:
+                ratio = max(bias_val, 1.0e-18) / base_i_dc
+                if gm_mode == "linear":
+                    gm_scale = ratio
+                else:
+                    gm_scale = math.sqrt(ratio)
+            gm_scaled = base_gm * gm_scale
+            cfg['oect']['gm_S'] = gm_scaled
 
-        cfg['pipeline']['Nm_per_symbol'] = args.bias_nm
-        agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
-        agg.update({
-            "I_dc_A": bias_val,
-            "gm_S": gm_scaled,
-            "gm_scale": gm_scale,
-        })
-        rows.append(agg)
+            cfg['pipeline']['Nm_per_symbol'] = args.bias_nm
+            agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate, progress=seed_bar)
+            agg.update({
+                "I_dc_A": bias_val,
+                "gm_S": gm_scaled,
+                "gm_scale": gm_scale,
+                "use_ctrl": bool(use_ctrl),
+            })
+            rows.append(agg)
 
-        if resume and bias_val in done_psd:
-            continue
-        psd_cfg = deepcopy(base_cfg)
-        psd_cfg['oect']['I_dc_A'] = bias_val
-        psd_cfg['oect']['gm_S'] = gm_scaled
-        psd_cfg['pipeline']['Nm_per_symbol'] = args.bias_nm
-        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
-        if psd:
-            frame = psd_to_dataframe(psd, "I_dc_A", float(bias))
-            frame["gm_S"] = gm_scaled
-            frame["gm_scale"] = gm_scale
-            psd_frames.append(frame)
+            if not (resume and (bias_val, use_ctrl) in done_psd):
+                psd_cfg = deepcopy(cfg)
+                psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
+                if psd:
+                    frame = psd_to_dataframe(psd, "I_dc_A", float(bias))
+                    frame["gm_S"] = gm_scaled
+                    frame["gm_scale"] = gm_scale
+                    frame["use_ctrl"] = bool(use_ctrl)
+                    psd_frames.append(frame)
+            progress.update(1)
+            if seed_bar:
+                seed_bar.close()
+    progress.close()
 
     df_bias = pd.DataFrame(rows)
     if not df_bias.empty:
-        df_bias = df_bias.drop_duplicates(subset=["I_dc_A"])
+        df_bias = df_bias.drop_duplicates(subset=["I_dc_A", "use_ctrl"])
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
     return df_bias, df_psd
 
@@ -478,46 +567,63 @@ def run_qeff_sweep(
     base_cfg: Dict[str, Any],
     seeds: Sequence[int],
     args: argparse.Namespace,
+    ctrl_states: Sequence[bool],
     existing_ser: Optional[pd.DataFrame] = None,
     existing_psd: Optional[pd.DataFrame] = None,
     resume: bool = False,
+    pm: Optional[ProgressManager] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_ser.to_dict("records")) if resume and existing_ser is not None else []
     psd_frames: List[pd.DataFrame] = []
-    done_ser: set[float] = set()
-    done_psd: set[float] = set()
+    done_ser: set[tuple] = set()
+    done_psd: set[tuple] = set()
     if resume and existing_ser is not None:
-        done_ser = {float(r["q_eff_scale"]) for _, r in existing_ser.iterrows() if "q_eff_scale" in r}
+        done_ser = {(float(r["q_eff_scale"]), bool(r.get("use_ctrl", True))) for _, r in existing_ser.iterrows() if "q_eff_scale" in r}
     if resume and existing_psd is not None:
-        done_psd = {float(r["q_eff_scale"]) for _, r in existing_psd.iterrows() if "q_eff_scale" in r}
+        done_psd = {(float(r["q_eff_scale"]), bool(r.get("use_ctrl", True))) for _, r in existing_psd.iterrows() if "q_eff_scale" in r}
         psd_frames.append(existing_psd)
 
     base_q_da = float(base_cfg['neurotransmitters']['DA']['q_eff_e'])
     base_q_sero = float(base_cfg['neurotransmitters']['SERO']['q_eff_e'])
 
+    progress = _make_progress(pm, total=len(args.qeff_scales) * len(ctrl_states), desc="Organoid q_eff")
     for scale in args.qeff_scales:
-        cfg = deepcopy(base_cfg)
-        if resume and float(scale) in done_ser:
-            continue
-        cfg['neurotransmitters']['DA']['q_eff_e'] = base_q_da * float(scale)
-        cfg['neurotransmitters']['SERO']['q_eff_e'] = base_q_sero * float(scale)
-        cfg['pipeline']['Nm_per_symbol'] = args.qeff_nm
+        for use_ctrl in ctrl_states:
+            seed_bar = None
+            if args.progress != "none":
+                desc = f"q_eff={scale:g}, {'CTRL' if use_ctrl else 'NoCTRL'}"
+                seed_bar = _make_progress(pm, total=len(seeds), desc=desc, kind="worker")
+            cfg = deepcopy(base_cfg)
+            if resume and (float(scale), use_ctrl) in done_ser:
+                progress.update(1)
+                if seed_bar:
+                    seed_bar.close()
+                continue
+            cfg['pipeline']['use_control_channel'] = bool(use_ctrl)
+            cfg['neurotransmitters']['DA']['q_eff_e'] = base_q_da * float(scale)
+            cfg['neurotransmitters']['SERO']['q_eff_e'] = base_q_sero * float(scale)
+            cfg['pipeline']['Nm_per_symbol'] = args.qeff_nm
 
-        agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate)
-        agg.update({"q_eff_scale": float(scale)})
-        rows.append(agg)
+            agg = run_monte_carlo(cfg, seeds, args.sequence_length, recalibrate=args.recalibrate, progress=seed_bar)
+            agg.update({"q_eff_scale": float(scale), "use_ctrl": bool(use_ctrl)})
+            rows.append(agg)
 
-        if resume and float(scale) in done_psd:
-            continue
-        psd_cfg = deepcopy(cfg)
-        psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
-        if psd:
-            psd_frames.append(psd_to_dataframe(psd, "q_eff_scale", float(scale)))
+            if not (resume and (float(scale), use_ctrl) in done_psd):
+                psd_cfg = deepcopy(cfg)
+                psd = capture_noise_psd(psd_cfg, seeds, recalibrate=args.recalibrate)
+                if psd:
+                    frame = psd_to_dataframe(psd, "q_eff_scale", float(scale))
+                    frame["use_ctrl"] = bool(use_ctrl)
+                    psd_frames.append(frame)
+            progress.update(1)
+            if seed_bar:
+                seed_bar.close()
 
     df_qeff = pd.DataFrame(rows)
     if not df_qeff.empty:
-        df_qeff = df_qeff.drop_duplicates(subset=["q_eff_scale"])
+        df_qeff = df_qeff.drop_duplicates(subset=["q_eff_scale", "use_ctrl"])
     df_psd = pd.concat(psd_frames, ignore_index=True) if psd_frames else pd.DataFrame()
+    progress.close()
     return df_qeff, df_psd
 
 
@@ -558,6 +664,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nm-grid", type=int, nargs="+", default=None, help="Optional Nm values for alpha sweep.")
     parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory for outputs.")
     parser.add_argument(
+        "--progress",
+        choices=["gui", "rich", "tqdm", "none"],
+        default="tqdm",
+        help="Progress backend (gui, rich, tqdm, none).",
+    )
+    parser.add_argument(
+        "--logdir",
+        type=Path,
+        default=project_root / "results" / "logs",
+        help="Directory for log files.",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable file logging.",
+    )
+    parser.add_argument(
+        "--fsync-logs",
+        action="store_true",
+        help="Force fsync on each write.",
+    )
+    parser.add_argument(
         "--recalibrate",
         action="store_true",
         help="Force threshold recalibration (ignore cached JSON files).",
@@ -567,13 +695,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip sweep points already present in the output CSVs.",
     )
+    parser.add_argument(
+        "--dual-ctrl",
+        dest="dual_ctrl",
+        action="store_true",
+        default=True,
+        help="Run sweeps with CTRL on and off (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-dual-ctrl",
+        dest="dual_ctrl",
+        action="store_false",
+        help="Disable dual CTRL runs (CTRL-on only).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not args.no_log:
+        setup_tee_logging(Path(args.logdir), prefix="organoid_sensitivity", fsync=args.fsync_logs)
+    else:
+        print("[log] File logging disabled by --no-log")
+    pm = ProgressManager(args.progress, gui_session_meta={"resume": args.resume, "progress": args.progress})
     base_cfg = _load_base_config(args.config)
     seeds = [base_cfg['pipeline'].get('random_seed', 2025) + i for i in range(args.seeds)]
+    base_ctrl = bool(base_cfg["pipeline"].get("use_control_channel", True))
+    ctrl_states: List[bool] = [True, False] if args.dual_ctrl else [base_ctrl]
 
     out_data = args.output_root / "data"
     out_fig = args.output_root / "figures"
@@ -589,21 +737,23 @@ def main() -> None:
     bias_existing, bias_psd_existing = (pd.DataFrame(), pd.DataFrame())
     qeff_existing, qeff_psd_existing = (pd.DataFrame(), pd.DataFrame())
     if args.resume:
-        alpha_existing, _ = _load_existing(alpha_csv, ["alpha_H", "Nm_per_symbol"])
-        alpha_psd_existing, _ = _load_existing(alpha_psd_csv, ["alpha_H"])
-        bias_existing, _ = _load_existing(bias_csv, ["I_dc_A"])
-        bias_psd_existing, _ = _load_existing(bias_psd_csv, ["I_dc_A"])
-        qeff_existing, _ = _load_existing(qeff_csv, ["q_eff_scale"])
-        qeff_psd_existing, _ = _load_existing(qeff_psd_csv, ["q_eff_scale"])
+        alpha_existing, _ = _load_existing(alpha_csv, ["alpha_H", "Nm_per_symbol", "use_ctrl"])
+        alpha_psd_existing, _ = _load_existing(alpha_psd_csv, ["alpha_H", "use_ctrl"])
+        bias_existing, _ = _load_existing(bias_csv, ["I_dc_A", "use_ctrl"])
+        bias_psd_existing, _ = _load_existing(bias_psd_csv, ["I_dc_A", "use_ctrl"])
+        qeff_existing, _ = _load_existing(qeff_csv, ["q_eff_scale", "use_ctrl"])
+        qeff_psd_existing, _ = _load_existing(qeff_psd_csv, ["q_eff_scale", "use_ctrl"])
 
     # --- Alpha (1/f noise) sweep ---
     df_alpha, df_alpha_psd = run_alpha_sweep(
         base_cfg,
         seeds,
         args,
+        ctrl_states,
         existing_ser=alpha_existing,
         existing_psd=alpha_psd_existing,
         resume=args.resume,
+        pm=pm,
     )
     _ensure_dir(alpha_csv)
     df_alpha.to_csv(alpha_csv, index=False)
@@ -621,9 +771,11 @@ def main() -> None:
         base_cfg,
         seeds,
         args,
+        ctrl_states,
         existing_ser=bias_existing,
         existing_psd=bias_psd_existing,
         resume=args.resume,
+        pm=pm,
     )
     _ensure_dir(bias_csv)
     df_bias.to_csv(bias_csv, index=False)
@@ -641,9 +793,11 @@ def main() -> None:
         base_cfg,
         seeds,
         args,
+        ctrl_states,
         existing_ser=qeff_existing,
         existing_psd=qeff_psd_existing,
         resume=args.resume,
+        pm=pm,
     )
     _ensure_dir(qeff_csv)
     df_qeff.to_csv(qeff_csv, index=False)
@@ -662,6 +816,7 @@ def main() -> None:
         "qeff_points": len(df_qeff),
     }
     print(json.dumps(summary, indent=2))
+    pm.stop()
 
 
 if __name__ == "__main__":

@@ -12,12 +12,20 @@ import argparse
 import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import sys
 
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 data_dir = project_root / "results" / "data"
 fig_dir = project_root / "results" / "figures"
 

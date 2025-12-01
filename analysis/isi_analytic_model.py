@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -19,6 +23,7 @@ project_root = Path(__file__).resolve().parents[1]
 sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
+from analysis.ui_progress import ProgressManager
 from analysis.run_final_analysis import preprocess_config_full, calculate_dynamic_symbol_period
 from src.pipeline import calculate_proper_noise_sigma, _resolve_decision_window
 from src.mc_channel.isi_analytic import window_coefficients, gaussian_ser_binary, predicted_stats_mosk
@@ -37,7 +42,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare analytic ISI model with simulation results.")
     parser.add_argument("--points", type=int, default=11, help="Number of guard factor samples (default: 11).")
     parser.add_argument("--force", action="store_true", help="Ignore existing CSV and recompute.")
-    parser.add_argument("--progress", default="none", help="Placeholder for run_master compatibility.")
+    parser.add_argument(
+        "--progress",
+        choices=["gui", "rich", "tqdm", "none"],
+        default="tqdm",
+        help="Progress backend (gui, rich, tqdm, none).",
+    )
     return parser.parse_args()
 
 
@@ -70,12 +80,38 @@ def _pick_anchor(cfg: Dict[str, Any]) -> tuple[float, float]:
     return distance, nm_hint
 
 
+class _NoopBar:
+    def __init__(self) -> None:
+        self._completed = 0
+    def update(self, n: int = 1, description: Optional[str] = None) -> None:
+        self._completed += n
+    def close(self) -> None:
+        pass
+    def set_description(self, text: str) -> None:
+        pass
+
+
+def _make_progress(pm: Optional[ProgressManager], total: int, desc: str):
+    if pm is not None:
+        return pm.task(total=total, description=desc, kind="sweep")
+    try:
+        from tqdm import tqdm  # type: ignore
+        return tqdm(total=total, desc=desc, leave=False)
+    except Exception:
+        return _NoopBar()
+
+
 def main() -> None:
     args = _parse_args()
     if args.points <= 1:
         raise ValueError("--points must be greater than 1")
 
+    pm = ProgressManager(args.progress, gui_session_meta={"progress": args.progress, "resume": False})
     cfg = _load_cfg()
+    # Force analytic model to MoSK single-ended regardless of default config
+    cfg.setdefault("pipeline", {})
+    cfg["pipeline"]["modulation"] = "MoSK"
+    cfg["pipeline"]["use_control_channel"] = False
     distance_um, nm_hint = _pick_anchor(cfg)
     nm_hint = float(nm_hint if math.isfinite(nm_hint) and nm_hint > 0 else cfg["pipeline"].get("Nm_per_symbol", 1e4))
 
@@ -83,6 +119,7 @@ def main() -> None:
     nm_multipliers = (0.5, 1.0, 2.0)
     analytic_rows: list[dict[str, float]] = []
 
+    progress = _make_progress(pm if args.progress != "none" else None, total=len(guard_vals) * len(nm_multipliers), desc="ISI analytic sweep")
     for gf in guard_vals:
         for nm_scale in nm_multipliers:
             cfg_g = copy.deepcopy(cfg)
@@ -118,6 +155,8 @@ def main() -> None:
                 "symbol_period_s": Ts,
                 "decision_window_s": win,
             })
+            progress.update(1)
+    progress.close()
 
     df_analytic = pd.DataFrame(analytic_rows)
     out_csv = project_root / "results" / "data" / "isi_analytic_model.csv"
@@ -170,6 +209,7 @@ def main() -> None:
     os.replace(tmp_png, out_png)
     print(f"[saved] {out_png}")
     print("[done] ISI analytic model built.")
+    pm.stop()
 
 
 if __name__ == "__main__":

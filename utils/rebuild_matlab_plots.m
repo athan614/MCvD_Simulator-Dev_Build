@@ -6,9 +6,12 @@ function rebuild_matlab_plots(varargin)
 %   publication-style figures into results/figures/matlab.
 %
 %   Usage:
-%       rebuild_matlab_plots();                       % default paths
-%       rebuild_matlab_plots('OutputDir', '...');     % custom figure root
-%       rebuild_matlab_plots('DataDir', '...');       % custom CSV root
+%       rebuild_matlab_plots();                           % default paths
+%       rebuild_matlab_plots('OutputDir', '...');         % custom figure root
+%       rebuild_matlab_plots('DataDir', '...');           % custom CSV root
+%       rebuild_matlab_plots('Variant', 'alt');           % use *_alt CSVs (matches Python --variant)
+%       rebuild_matlab_plots('Ctrl', 'on');               % filter to CTRL (or 'off' / 'any')
+%       rebuild_matlab_plots('DeviceDomain', 'charge');   % choose FoM metric (current|charge|auto)
 %
 %   Missing datasets are skipped gracefully and reported in the console.
 
@@ -31,6 +34,19 @@ end
 logf('Project root: %s', project_root);
 logf('Data dir    : %s', args.DataDir);
 logf('Output dir  : %s', args.OutputDir);
+if isempty(args.VariantSuffix)
+    logf('Variant     : (none)');
+else
+    logf('Variant     : %s', args.VariantSuffix(2:end));
+end
+if isempty(args.CtrlFilter)
+    logf('CTRL filter : any');
+elseif args.CtrlFilter
+    logf('CTRL filter : on');
+else
+    logf('CTRL filter : off');
+end
+logf('Device FoM  : %s domain', args.DeviceDomain);
 
 % Core modality summaries
 safe_call(@() plot_ser_vs_nm(args), 'SER vs Nm');
@@ -63,8 +79,17 @@ function args = parse_inputs(varargin)
 parser = inputParser;
 parser.addParameter('DataDir', '', @(s) ischar(s) || isstring(s));
 parser.addParameter('OutputDir', '', @(s) ischar(s) || isstring(s));
+parser.addParameter('Variant', '', @(s) ischar(s) || isstring(s));
+parser.addParameter('Ctrl', 'any', @(s) ischar(s) || isstring(s) || islogical(s));
+parser.addParameter('DeviceDomain', 'auto', @(s) any(strcmpi(string(s), ["auto", "current", "charge"])));
 parser.parse(varargin{:});
 args = parser.Results;
+args.VariantSuffix = '';
+if ~isempty(args.Variant)
+    args.VariantSuffix = ['_', char(string(args.Variant))];
+end
+args.CtrlFilter = normalize_ctrl_filter(args.Ctrl);
+args.DeviceDomain = char(lower(string(args.DeviceDomain)));
 end
 
 % -------------------------------------------------------------------------
@@ -91,17 +116,18 @@ ax1 = nexttile; hold(ax1, 'on');
 % Panel (a): SER curves per mode (CTRL states split if present)
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('ser_vs_nm_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('ser_vs_nm_%s', lower(mode)));
     if isempty(tbl)
         continue;
     end
-    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if isempty(nmcol) || ~ismember('ser', tbl.Properties.VariableNames)
         continue;
     end
     use_ctrl = get_use_ctrl(tbl);
     style = styles.(mode);
-    if ~isempty(use_ctrl)
+    has_ctrl_split = ~isempty(use_ctrl) && numel(unique(use_ctrl(~isnan(use_ctrl)))) > 1;
+    if has_ctrl_split
         uvals = unique(use_ctrl(~isnan(use_ctrl)));
         for ui = 1:numel(uvals)
             ctrl_val = uvals(ui);
@@ -109,7 +135,8 @@ for k = 1:numel(modes)
             nm = as_numeric(tbl.(nmcol));
             ser = as_numeric(tbl.ser);
             nm = nm(mask); ser = ser(mask);
-            [nm, ser] = clean_pair(nm, ser);
+            [err_lo, err_hi] = ser_errorbars(tbl, mask);
+            [nm, ser, err_lo, err_hi] = clean_pair_errors(nm, ser, err_lo, err_hi);
             if isempty(nm)
                 continue;
             end
@@ -117,20 +144,39 @@ for k = 1:numel(modes)
             if ~ctrl_val
                 ls = '--';
             end
-            lbl = sprintf('%s%s', mode, ternary(ctrl_val, '', ' (no CTRL)'));
+            combiner_suffix = '';
+            if strcmp(mode, 'CSK') && ismember('combiner', tbl.Properties.VariableNames)
+                combos = unique(string(tbl.combiner(mask)));
+                combos = combos(strlength(combos) > 0);
+                if numel(combos) == 1
+                    combiner_suffix = sprintf(' (%s)', char(combos(1)));
+                elseif numel(combos) > 1
+                    combiner_suffix = ' (mixed)';
+                end
+            end
+            lbl = sprintf('%s%s%s', mode, ternary(ctrl_val, '', ' (no CTRL)'), combiner_suffix);
             loglog(ax1, nm, ser, 'LineWidth', 1.5, 'Color', style.Color, ...
                 'Marker', style.Marker, 'MarkerSize', 6, 'LineStyle', ls, ...
                 'DisplayName', lbl);
+            if ~isempty(err_lo)
+                errorbar(ax1, nm, ser, err_lo, err_hi, 'LineStyle', 'none', ...
+                    'Color', style.Color, 'CapSize', 2, 'HandleVisibility', 'off', 'LineWidth', 0.8);
+            end
         end
     else
         nm = as_numeric(tbl.(nmcol));
         ser = as_numeric(tbl.ser);
-        [nm, ser] = clean_pair(nm, ser);
+        [err_lo, err_hi] = ser_errorbars(tbl, []);
+        [nm, ser, err_lo, err_hi] = clean_pair_errors(nm, ser, err_lo, err_hi);
         if isempty(nm)
             continue;
         end
         loglog(ax1, nm, ser, 'LineWidth', 1.5, 'Color', style.Color, ...
             'Marker', style.Marker, 'MarkerSize', 6, 'DisplayName', mode);
+        if ~isempty(err_lo)
+            errorbar(ax1, nm, ser, err_lo, err_hi, 'LineStyle', 'none', ...
+                'Color', style.Color, 'CapSize', 2, 'HandleVisibility', 'off', 'LineWidth', 0.8);
+        end
     end
 end
 grid(ax1, 'on');
@@ -143,9 +189,9 @@ legend(ax1, 'Location', 'southwest');
 
 % Panel (b): Hybrid error components
 ax2 = nexttile; hold(ax2, 'on');
-tbl_h = load_mode_csv(args.DataDir, 'ser_vs_nm_hybrid');
+tbl_h = load_mode_csv(args, 'ser_vs_nm_hybrid');
 if ~isempty(tbl_h)
-    nmcol = first_column(tbl_h, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(tbl_h, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if ~isempty(nmcol) && all(ismember({'ser', 'mosk_ser', 'csk_ser'}, tbl_h.Properties.VariableNames))
         nm = as_numeric(tbl_h.(nmcol));
         total = as_numeric(tbl_h.ser);
@@ -184,18 +230,38 @@ fig = figure('Visible', 'off');
 ax = axes(fig); hold(ax, 'on');
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('lod_vs_distance_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('lod_vs_distance_%s', lower(mode)));
     if isempty(tbl) || ~all(ismember({'distance_um', 'lod_nm'}, tbl.Properties.VariableNames))
         continue;
     end
-    d = as_numeric(tbl.distance_um);
-    lod = as_numeric(tbl.lod_nm);
-    [d, lod] = clean_pair(d, lod);
-    if isempty(d)
-        continue;
+    use_ctrl = get_use_ctrl(tbl);
+    ctrl_values = unique(use_ctrl(~isnan(use_ctrl)));
+    if ~isempty(ctrl_values) && numel(ctrl_values) > 1
+        for ui = 1:numel(ctrl_values)
+            ctrl_val = ctrl_values(ui);
+            mask = use_ctrl == ctrl_val;
+            d = as_numeric(tbl.distance_um);
+            lod = as_numeric(tbl.lod_nm);
+            d = d(mask); lod = lod(mask);
+            [d, lod] = clean_pair(d, lod);
+            if isempty(d)
+                continue;
+            end
+            ls = ternary(ctrl_val, '-', '--');
+            lbl = sprintf('%s %s', mode, ternary(ctrl_val, '(CTRL)', '(no CTRL)'));
+            semilogy(ax, d, lod, 'o-', 'Color', styles{k}, 'LineWidth', 1.5, ...
+                'DisplayName', lbl, 'LineStyle', ls);
+        end
+    else
+        d = as_numeric(tbl.distance_um);
+        lod = as_numeric(tbl.lod_nm);
+        [d, lod] = clean_pair(d, lod);
+        if isempty(d)
+            continue;
+        end
+        semilogy(ax, d, lod, 'o-', 'Color', styles{k}, 'LineWidth', 1.5, ...
+            'DisplayName', mode);
     end
-    semilogy(ax, d, lod, 'o-', 'Color', styles{k}, 'LineWidth', 1.5, ...
-        'DisplayName', mode);
 end
 grid(ax, 'on'); set(ax, 'YScale', 'log');
 xlabel(ax, 'Distance (\mum)');
@@ -210,7 +276,11 @@ end
 % -------------------------------------------------------------------------
 function plot_nt_pairs(args)
 % Plot all CSK NT pair SER curves found in results/data/ser_vs_nm_csk_*.csv
-files = dir(fullfile(args.DataDir, 'ser_vs_nm_csk_*.csv'));
+pattern = sprintf('ser_vs_nm_csk_*%s.csv', args.VariantSuffix);
+files = dir(fullfile(args.DataDir, pattern));
+if isempty(files)
+    files = dir(fullfile(args.DataDir, 'ser_vs_nm_csk_*.csv'));
+end
 if isempty(files)
     logf('... NT pair plot skipped (no ser_vs_nm_csk_*.csv)');
     return;
@@ -223,11 +293,11 @@ idx = 1;
 for k = 1:numel(files)
     name = files(k).name;
     % Skip baseline variants handled elsewhere
-    if contains(name, 'single') || contains(name, 'dual')
+    if contains(name, 'single') || contains(name, 'dual') || contains(name, '__ctrl') || contains(name, '__noctrl')
         continue;
     end
     tbl = load_table(fullfile(args.DataDir, name));
-    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if isempty(tbl) || isempty(nmcol) || ~ismember('ser', tbl.Properties.VariableNames)
         continue;
     end
@@ -272,12 +342,15 @@ lod_variants = struct( ...
 % SER baseline plot
 fig1 = figure('Visible', 'off'); ax1 = axes(fig1); hold(ax1, 'on');
 for key = fieldnames(ser_variants)'
-    csv_path = fullfile(args.DataDir, ['ser_vs_nm_csk_', key{1}, '.csv']);
+    csv_path = fullfile(args.DataDir, ['ser_vs_nm_csk_', key{1}, args.VariantSuffix, '.csv']);
+    if ~isfile(csv_path)
+        csv_path = fullfile(args.DataDir, ['ser_vs_nm_csk_', key{1}, '.csv']);
+    end
     if ~isfile(csv_path)
         continue;
     end
     tbl = load_table(csv_path);
-    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if isempty(nmcol) || ~ismember('ser', tbl.Properties.VariableNames)
         continue;
     end
@@ -303,7 +376,10 @@ end
 % LoD baseline plot
 fig2 = figure('Visible', 'off'); ax2 = axes(fig2); hold(ax2, 'on');
 for key = fieldnames(lod_variants)'
-    csv_path = fullfile(args.DataDir, ['lod_vs_distance_csk_', key{1}, '.csv']);
+    csv_path = fullfile(args.DataDir, ['lod_vs_distance_csk_', key{1}, args.VariantSuffix, '.csv']);
+    if ~isfile(csv_path)
+        csv_path = fullfile(args.DataDir, ['lod_vs_distance_csk_', key{1}, '.csv']);
+    end
     if ~isfile(csv_path)
         continue;
     end
@@ -337,42 +413,62 @@ fig = figure('Visible', 'off');
 tiledlayout(1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 ax1 = nexttile; hold(ax1, 'on');
 ax2 = nexttile; hold(ax2, 'on');
+metric_used = '';
 
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('device_fom_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('device_fom_%s', lower(mode)));
     if isempty(tbl) || ~ismember('param_type', tbl.Properties.VariableNames) || ~ismember('param_value', tbl.Properties.VariableNames)
         continue;
     end
-    gm_mask = strcmp(tbl.param_type, 'gm_S');
-    c_mask = strcmp(tbl.param_type, 'C_tot_F');
-    if ismember('delta_over_sigma_I', tbl.Properties.VariableNames)
-        metric = 'delta_over_sigma_I';
-    elseif ismember('delta_over_sigma_Q', tbl.Properties.VariableNames)
-        metric = 'delta_over_sigma_Q';
+    metric = '';
+    if strcmp(args.DeviceDomain, 'current')
+        if ismember('delta_over_sigma_I', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_I';
+        elseif ismember('delta_over_sigma_Q', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_Q';
+        end
+    elseif strcmp(args.DeviceDomain, 'charge')
+        if ismember('delta_over_sigma_Q', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_Q';
+        elseif ismember('delta_over_sigma_I', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_I';
+        end
     else
+        if ismember('delta_over_sigma_I', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_I';
+        elseif ismember('delta_over_sigma_Q', tbl.Properties.VariableNames)
+            metric = 'delta_over_sigma_Q';
+        end
+    end
+    if isempty(metric)
         continue;
     end
-    if any(gm_mask)
-        gm = as_numeric(tbl.param_value(gm_mask)) * 1e3; % S -> mS
-        val = as_numeric(tbl.(metric)(gm_mask));
-        [gm, val] = clean_pair(gm, val);
-        if ~isempty(gm)
-            plot(ax1, gm, val, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
-        end
+    if isempty(metric_used)
+        metric_used = metric;
     end
-    if any(c_mask)
-        c = as_numeric(tbl.param_value(c_mask)) * 1e9; % F -> nF
-        val = as_numeric(tbl.(metric)(c_mask));
-        [c, val] = clean_pair(c, val);
-        if ~isempty(c)
-            plot(ax2, c, val, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
-        end
+    gm_series = median_series(tbl, 'gm_S', metric);
+    c_series = median_series(tbl, 'C_tot_F', metric);
+    if ~isempty(gm_series)
+        plot(ax1, gm_series.x * 1e3, gm_series.y, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
+    end
+    if ~isempty(c_series)
+        plot(ax2, c_series.x * 1e9, c_series.y, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
     end
 end
 
-format_subplot(ax1, 'g_m (mS)', 'Delta/sigma (device)', 'Device FoM vs g_m');
-format_subplot(ax2, 'C_{tot} (nF)', 'Delta/sigma (device)', 'Device FoM vs C_{tot}');
+metric_label = 'Delta/sigma (device)';
+if strcmp(metric_used, 'delta_over_sigma_Q')
+    metric_label = '\DeltaQ/\sigma_Q (device)';
+elseif strcmp(metric_used, 'delta_over_sigma_I')
+    metric_label = '\DeltaI/\sigma_I (device)';
+elseif strcmp(args.DeviceDomain, 'charge')
+    metric_label = '\DeltaQ/\sigma_Q (device)';
+elseif strcmp(args.DeviceDomain, 'current')
+    metric_label = '\DeltaI/\sigma_I (device)';
+end
+format_subplot(ax1, 'g_m (mS)', metric_label, 'Device FoM vs g_m');
+format_subplot(ax2, 'C_{tot} (nF)', metric_label, 'Device FoM vs C_{tot}');
 out_path = fullfile(args.OutputDir, 'fig_device_fom_matlab.png');
 save_figure(fig, out_path);
 logf('[ok] Device FoM figure -> %s', out_path);
@@ -388,19 +484,40 @@ ax2 = nexttile; hold(ax2, 'on');
 
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('guard_frontier_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('guard_frontier_%s', lower(mode)));
     if isempty(tbl) || ~all(ismember({'distance_um', 'best_guard_factor', 'max_irt_bps'}, tbl.Properties.VariableNames))
         continue;
     end
-    d = as_numeric(tbl.distance_um);
-    gf = as_numeric(tbl.best_guard_factor);
-    irt = as_numeric(tbl.max_irt_bps);
-    [d, gf, irt] = clean_triple(d, gf, irt);
-    if isempty(d)
-        continue;
+    use_ctrl = get_use_ctrl(tbl);
+    ctrl_values = unique(use_ctrl(~isnan(use_ctrl)));
+    if ~isempty(ctrl_values) && numel(ctrl_values) > 1
+        for ui = 1:numel(ctrl_values)
+            ctrl_val = ctrl_values(ui);
+            mask = use_ctrl == ctrl_val;
+            d = as_numeric(tbl.distance_um);
+            gf = as_numeric(tbl.best_guard_factor);
+            irt = as_numeric(tbl.max_irt_bps);
+            d = d(mask); gf = gf(mask); irt = irt(mask);
+            [d, gf, irt] = clean_triple(d, gf, irt);
+            if isempty(d)
+                continue;
+            end
+            ls = ternary(ctrl_val, '-', '--');
+            lbl = sprintf('%s %s', mode, ternary(ctrl_val, '(CTRL)', '(no CTRL)'));
+            plot(ax1, d, gf, 'o-', 'LineWidth', 1.3, 'DisplayName', lbl, 'LineStyle', ls);
+            plot(ax2, d, irt, 'o-', 'LineWidth', 1.3, 'DisplayName', lbl, 'LineStyle', ls);
+        end
+    else
+        d = as_numeric(tbl.distance_um);
+        gf = as_numeric(tbl.best_guard_factor);
+        irt = as_numeric(tbl.max_irt_bps);
+        [d, gf, irt] = clean_triple(d, gf, irt);
+        if isempty(d)
+            continue;
+        end
+        plot(ax1, d, gf, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
+        plot(ax2, d, irt, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
     end
-    plot(ax1, d, gf, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
-    plot(ax2, d, irt, 'o-', 'LineWidth', 1.3, 'DisplayName', mode);
 end
 format_subplot(ax1, 'Distance (\mum)', 'Best guard factor (fraction Ts)', 'Guard-factor frontier');
 ylim(ax1, [0, 1.05]);
@@ -418,7 +535,7 @@ fig = figure('Visible', 'off');
 ax = axes(fig); hold(ax, 'on');
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('isi_tradeoff_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('isi_tradeoff_%s', lower(mode)));
     if isempty(tbl)
         continue;
     end
@@ -475,11 +592,11 @@ ax2 = nexttile; hold(ax2, 'on');
 
 for k = 1:numel(modes)
     mode = modes{k};
-    tbl = load_mode_csv(args.DataDir, sprintf('ser_vs_nm_%s', lower(mode)));
+    tbl = load_mode_csv(args, sprintf('ser_vs_nm_%s', lower(mode)));
     if isempty(tbl)
         continue;
     end
-    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     q_col = first_column(tbl, {'delta_Q_diff', 'delta_over_sigma_Q'});
     i_col = first_column(tbl, {'delta_I_diff', 'delta_over_sigma_I'});
     if isempty(nmcol)
@@ -517,11 +634,11 @@ end
 
 % -------------------------------------------------------------------------
 function plot_hybrid_benchmark(args)
-ser_tbl = load_mode_csv(args.DataDir, 'ser_vs_nm_hybrid');
-lod_tbl = load_mode_csv(args.DataDir, 'lod_vs_distance_hybrid');
-isi_tbl = load_mode_csv(args.DataDir, 'isi_tradeoff_hybrid');
-hds_grid = load_table_if_exists(fullfile(args.DataDir, 'hybrid_hds_grid.csv'));
-isi_grid = load_table_if_exists(fullfile(args.DataDir, 'isi_grid_hybrid.csv'));
+ser_tbl = load_mode_csv(args, 'ser_vs_nm_hybrid');
+lod_tbl = load_mode_csv(args, 'lod_vs_distance_hybrid');
+isi_tbl = load_mode_csv(args, 'isi_tradeoff_hybrid');
+hds_grid = load_optional_csv(args, 'hybrid_hds_grid');
+isi_grid = load_optional_csv(args, 'isi_grid_hybrid');
 
 fig = figure('Visible', 'off');
 tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
@@ -530,7 +647,7 @@ tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 axA = nexttile; hold(axA, 'on');
 nmcol = '';
 if ~isempty(hds_grid)
-    nmcol = first_column(hds_grid, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(hds_grid, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
 end
 if ~isempty(hds_grid) && ~isempty(nmcol) && ismember('distance_um', hds_grid.Properties.VariableNames) ...
         && ismember('ser', hds_grid.Properties.VariableNames)
@@ -543,7 +660,7 @@ if ~isempty(hds_grid) && ~isempty(nmcol) && ismember('distance_um', hds_grid.Pro
         title(axA, '(A) Hybrid decision surface (SER)');
     end
 elseif ~isempty(ser_tbl)
-    nmcol = first_column(ser_tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(ser_tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if ~isempty(nmcol) && all(ismember({'ser', 'mosk_ser', 'csk_ser'}, ser_tbl.Properties.VariableNames))
         nm = as_numeric(ser_tbl.(nmcol));
         [nm, total, mosk, csk] = clean_quad(nm, as_numeric(ser_tbl.ser), ...
@@ -612,7 +729,7 @@ end
 % Panel D: Hybrid SER overview
 axD = nexttile; hold(axD, 'on');
 if ~isempty(ser_tbl)
-    nmcol = first_column(ser_tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'Nm_per_symbol', 'Nm'});
+    nmcol = first_column(ser_tbl, {'pipeline_Nm_per_symbol', 'pipeline.Nm_per_symbol', 'pipeline_nm_per_symbol', 'pipeline.nm_per_symbol', 'Nm_per_symbol', 'nm_per_symbol', 'Nm', 'nm'});
     if ~isempty(nmcol) && ismember('ser', ser_tbl.Properties.VariableNames)
         nm = as_numeric(ser_tbl.(nmcol));
         ser = as_numeric(ser_tbl.ser);
@@ -636,7 +753,11 @@ end
 
 % -------------------------------------------------------------------------
 function plot_snr_vs_ts(args)
-files = dir(fullfile(args.DataDir, 'snr_vs_ts_*.csv'));
+pattern = sprintf('snr_vs_ts_*%s.csv', args.VariantSuffix);
+files = dir(fullfile(args.DataDir, pattern));
+if isempty(files)
+    files = dir(fullfile(args.DataDir, 'snr_vs_ts_*.csv'));
+end
 if isempty(files)
     logf('... No snr_vs_ts_* CSVs found');
     return;
@@ -671,7 +792,11 @@ end
 
 % -------------------------------------------------------------------------
 function plot_sensitivity(args)
-files = dir(fullfile(args.DataDir, 'sensitivity_*.csv'));
+pattern = sprintf('sensitivity_*%s.csv', args.VariantSuffix);
+files = dir(fullfile(args.DataDir, pattern));
+if isempty(files)
+    files = dir(fullfile(args.DataDir, 'sensitivity_*.csv'));
+end
 if isempty(files)
     logf('... Sensitivity plots skipped (no sensitivity_*.csv)');
     return;
@@ -709,7 +834,11 @@ end
 
 % -------------------------------------------------------------------------
 function plot_organoid(args)
-files = dir(fullfile(args.DataDir, 'organoid_*_sensitivity*.csv'));
+pattern = sprintf('organoid_*_sensitivity*%s.csv', args.VariantSuffix);
+files = dir(fullfile(args.DataDir, pattern));
+if isempty(files)
+    files = dir(fullfile(args.DataDir, 'organoid_*_sensitivity*.csv'));
+end
 if isempty(files)
     logf('... Organoid plots skipped (no organoid_* CSVs)');
     return;
@@ -746,7 +875,14 @@ end
 
 % -------------------------------------------------------------------------
 function plot_capacity(args)
-files = dir(fullfile(args.DataDir, 'capacity_bounds*.csv'));
+if isempty(args.VariantSuffix)
+    files = dir(fullfile(args.DataDir, 'capacity_bounds*.csv'));
+else
+    files = dir(fullfile(args.DataDir, sprintf('capacity_bounds*%s*.csv', args.VariantSuffix)));
+    if isempty(files)
+        files = dir(fullfile(args.DataDir, 'capacity_bounds*.csv'));
+    end
+end
 if isempty(files)
     logf('... Capacity plot skipped (no capacity_bounds*.csv)');
     return;
@@ -786,19 +922,89 @@ logf('[ok] Capacity figure -> %s', out_path);
 end
 
 % ============================ Helper utilities ============================
-function tbl = load_mode_csv(data_dir, base)
-% Prefer canonical name; fall back to first wildcard match.
-canonical = fullfile(data_dir, [base, '.csv']);
-if isfile(canonical)
-    tbl = load_table(canonical);
+function ctrl_filter = normalize_ctrl_filter(ctrl)
+ctrl_filter = [];
+if islogical(ctrl)
+    ctrl_filter = logical(ctrl(1));
     return;
 end
-files = dir(fullfile(data_dir, [base, '*.csv']));
-if isempty(files)
-    tbl = table();
-    return;
+token = lower(strtrim(string(ctrl)));
+if any(strcmp(token, ["on", "ctrl", "true", "yes", "1", "with", "wctrl"]))
+    ctrl_filter = true;
+elseif any(strcmp(token, ["off", "noctrl", "false", "none", "0", "offctrl", "without"]))
+    ctrl_filter = false;
 end
-tbl = load_table(fullfile(data_dir, files(1).name));
+end
+
+function tbl = load_mode_csv(args, base)
+data_dir = args.DataDir;
+suffix = '';
+if isfield(args, 'VariantSuffix')
+    suffix = args.VariantSuffix;
+end
+ctrl_filter = [];
+if isfield(args, 'CtrlFilter')
+    ctrl_filter = args.CtrlFilter;
+end
+
+candidates = {};
+if ~isempty(ctrl_filter)
+    token = ternary(ctrl_filter, 'ctrl', 'noctrl');
+    candidates{end+1} = fullfile(data_dir, sprintf('%s__%s%s.csv', base, token, suffix));
+    candidates{end+1} = fullfile(data_dir, sprintf('%s__%s.csv', base, token));
+end
+candidates{end+1} = fullfile(data_dir, sprintf('%s%s.csv', base, suffix));
+candidates{end+1} = fullfile(data_dir, [base, '.csv']);
+if isempty(ctrl_filter)
+    for token = {'ctrl', 'noctrl'}
+        candidates{end+1} = fullfile(data_dir, sprintf('%s__%s%s.csv', base, token{1}, suffix));
+        candidates{end+1} = fullfile(data_dir, sprintf('%s__%s.csv', base, token{1}));
+    end
+end
+% Legacy fallbacks
+candidates{end+1} = fullfile(data_dir, sprintf('%s%s_uniform.csv', base, suffix));
+candidates{end+1} = fullfile(data_dir, sprintf('%s_uniform.csv', base));
+candidates{end+1} = fullfile(data_dir, sprintf('%s%s_zero.csv', base, suffix));
+candidates{end+1} = fullfile(data_dir, sprintf('%s_zero.csv', base));
+candidates = unique(candidates, 'stable');
+
+tbl = table();
+for i = 1:numel(candidates)
+    path = candidates{i};
+    if isfile(path)
+        tbl = load_table(path);
+        if ~isempty(tbl)
+            break;
+        end
+    end
+end
+if isempty(tbl)
+    files = dir(fullfile(data_dir, sprintf('%s%s*.csv', base, suffix)));
+    if isempty(files)
+        files = dir(fullfile(data_dir, [base, '*.csv']));
+    end
+    if ~isempty(files)
+        tbl = load_table(fullfile(data_dir, files(1).name));
+    end
+end
+if ~isempty(tbl) && ~isempty(ctrl_filter) && ismember('use_ctrl', tbl.Properties.VariableNames)
+    ctrl_vals = as_numeric(tbl.use_ctrl);
+    tbl = tbl(ctrl_vals == ctrl_filter, :);
+end
+end
+
+function tbl = load_optional_csv(args, stem)
+candidates = unique({fullfile(args.DataDir, [stem, args.VariantSuffix, '.csv']), ...
+              fullfile(args.DataDir, [stem, '.csv'])}, 'stable');
+tbl = table();
+for i = 1:numel(candidates)
+    if isfile(candidates{i})
+        tbl = load_table(candidates{i});
+        if ~isempty(tbl)
+            return;
+        end
+    end
+end
 end
 
 function tbl = load_table_if_exists(path)
@@ -858,8 +1064,14 @@ elseif iscell(x)
     for k = 1:numel(x)
         v(k) = str2double(string(x{k}));
     end
+elseif isstring(x) || ischar(x)
+    v = str2double(string(x));
 else
-    v = double(x);
+    try
+        v = double(x);
+    catch
+        v = nan(size(x));
+    end
 end
 end
 
@@ -871,11 +1083,101 @@ else
 end
 end
 
+function [err_low, err_high] = ser_errorbars(tbl, mask)
+err_low = [];
+err_high = [];
+if nargin < 2 || isempty(mask)
+    mask = true(height(tbl), 1);
+end
+if ~ismember('ser', tbl.Properties.VariableNames)
+    return;
+end
+ser_vals = as_numeric(tbl.ser);
+if numel(ser_vals) ~= numel(mask)
+    return;
+end
+ser_vals = ser_vals(mask);
+if ismember('ser_ci_low', tbl.Properties.VariableNames) && ismember('ser_ci_high', tbl.Properties.VariableNames)
+    lo = as_numeric(tbl.ser_ci_low); lo = lo(mask);
+    hi = as_numeric(tbl.ser_ci_high); hi = hi(mask);
+    err_low = ser_vals - lo;
+    err_high = hi - ser_vals;
+elseif ismember('symbols_evaluated', tbl.Properties.VariableNames)
+    n = as_numeric(tbl.symbols_evaluated); n = n(mask);
+    k = ser_vals .* n;
+    [ci_low, ci_high] = wilson_ci(k, n, 1.96);
+    err_low = ser_vals - ci_low;
+    err_high = ci_high - ser_vals;
+end
+if isempty(err_low) || isempty(err_high)
+    err_low = [];
+    err_high = [];
+    return;
+end
+err_low(err_low < 0) = 0;
+err_high(err_high < 0) = 0;
+end
+
+function [low, high] = wilson_ci(k, n, z)
+if nargin < 3
+    z = 1.96;
+end
+k = as_numeric(k);
+n = as_numeric(n);
+p = zeros(size(k));
+valid = n > 0 & isfinite(k) & isfinite(n);
+p(valid) = k(valid) ./ n(valid);
+n_safe = n;
+n_safe(~valid) = nan;
+den = 1 + (z.^2) ./ n_safe;
+center = (p + (z.^2) ./ (2 .* n_safe)) ./ den;
+half = z .* sqrt((p .* (1 - p) ./ n_safe) + (z.^2) ./ (4 .* n_safe.^2)) ./ den;
+low = center - half;
+high = center + half;
+low(~valid) = nan;
+high(~valid) = nan;
+end
+
 function [x, y] = clean_pair(x, y)
 mask = isfinite(x) & isfinite(y);
 x = x(mask); y = y(mask);
 [x, order] = sort(x);
 y = y(order);
+end
+
+function [x, y, e1, e2] = clean_pair_errors(x, y, e1, e2)
+if nargin < 3
+    e1 = [];
+end
+if nargin < 4
+    e2 = [];
+end
+mask = isfinite(x) & isfinite(y);
+if ~isempty(e1) && numel(e1) == numel(x)
+    mask = mask & isfinite(e1);
+end
+if ~isempty(e2) && numel(e2) == numel(x)
+    mask = mask & isfinite(e2);
+end
+x = x(mask); y = y(mask);
+if ~isempty(e1) && numel(e1) == numel(mask)
+    e1 = e1(mask);
+else
+    e1 = [];
+end
+if ~isempty(e2) && numel(e2) == numel(mask)
+    e2 = e2(mask);
+else
+    e2 = [];
+end
+[x, order] = sort(x);
+y = y(order);
+if ~isempty(e1)
+    e1 = e1(order);
+end
+if ~isempty(e2)
+    e2 = e2(order);
+end
 end
 
 function [x, y, z] = clean_triple(x, y, z)
@@ -890,6 +1192,29 @@ mask = isfinite(a) & isfinite(b) & isfinite(c) & isfinite(d);
 a = a(mask); b = b(mask); c = c(mask); d = d(mask);
 [a, order] = sort(a);
 b = b(order); c = c(order); d = d(order);
+end
+
+function series = median_series(tbl, param_type, value_col)
+series = [];
+if isempty(tbl) || ~ismember(value_col, tbl.Properties.VariableNames)
+    return;
+end
+mask = ismember(tbl.param_type, {param_type});
+if ~any(mask)
+    return;
+end
+x = as_numeric(tbl.param_value(mask));
+y = as_numeric(tbl.(value_col)(mask));
+valid = isfinite(x) & isfinite(y);
+x = x(valid); y = y(valid);
+if isempty(x)
+    return;
+end
+[unique_x, ~, idx] = unique(x);
+med = accumarray(idx, y, [], @(vals) median(vals, 'omitnan'));
+[unique_x, order] = sort(unique_x);
+med = med(order);
+series = struct('x', unique_x, 'y', med);
 end
 
 function out = ternary(cond, trueVal, falseVal)

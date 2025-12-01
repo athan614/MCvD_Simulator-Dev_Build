@@ -189,3 +189,35 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--watchdog-secs` | int | `1800` | Soft timeout for seed completion before retry hint (default: 1800s/30min; pass-through) |
 | `-preset, --preset` | choice | `None` | Apply preset configurations (ieee: publication-grade, verify: fast sanity, production: long-run batch) Choices: `ieee, verify, production`. |
 
+## `analysis/sensitivity_study.py`
+
+| Flag(s) | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--target-ser` | float | `0.01` | Target SER for LoD search during sweeps. |
+| `--seeds` | int | `4` | Number of seeds per LoD/metric point. |
+| `--force` | flag | `false` | Recompute even if cached CSVs exist. |
+| `--resume` | flag | `false` | Skip rows already present in the CSV. |
+| `--progress` | choice | `none` | Placeholder for run_master compatibility. |
+| `--freeze-calibration` | flag | `false` | Reuse baseline thresholds/noise during sweeps. |
+| `--detector-mode` | choice | `None` | Optional detector override (raw, zscore, whitened); None = use config. |
+| `--metric` | choice | `snr` | Metric for panels (lod, snr, ser). |
+| `--dual-ctrl, --no-dual-ctrl` | flag | `true` | Run each sweep with CTRL on and off (default on; use --no-dual-ctrl to run CTRL-on only). |
+
+## `analysis/organoid_sensitivity.py`
+
+| Flag(s) | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | path | `config/default.yaml` | Configuration YAML. |
+| `--sequence-length` | int | `400` | Symbols per Monte-Carlo run. |
+| `--seeds` | int | `6` | Number of random seeds per sweep point. |
+| `--alpha-values` | list | `[3e-4 ... 5.6e-3]` | 1/f noise (Hooge) values for alpha sweep. |
+| `--bias-values` | list | `[4e-5 ... 5.5e-4]` | Drain current targets for bias sweep. |
+| `--bias-nm` | int | `2000` | Nm per symbol for bias sweep. |
+| `--bias-gm-scaling` | choice | `sqrt` | gm scaling vs I_dc: none, sqrt, linear. |
+| `--qeff-scales` | list | `[1.25 ... 0.3]` | q_eff scaling factors. |
+| `--qeff-nm` | int | `2000` | Nm per symbol for q_eff sweep. |
+| `--nm-grid` | list | `None` | Optional Nm values for alpha sweep. |
+| `--output-root` | path | `results` | Root directory for outputs. |
+| `--recalibrate` | flag | `false` | Force threshold recalibration. |
+| `--resume` | flag | `false` | Skip sweep points already present in CSVs. |
+| `--dual-ctrl, --no-dual-ctrl` | flag | `true` | Run sweeps with CTRL on and off (default on; use --no-dual-ctrl for CTRL-on only). |

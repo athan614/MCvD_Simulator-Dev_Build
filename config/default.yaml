@@ -120,11 +120,11 @@ pipeline:
   symbol_period_s: 20.0         # Ts from manuscript
   lod_nm_max: 1000000            # Maximum Nm for LoD search (was hardcoded 100k)
   min_symbol_period_s: 5.0      # Minimum symbol period (was hardcoded 20s)
-  distance_um: 50               # Changed from 100 to 50 as in code
-  Nm_per_symbol: 1e7          # molecules per burst (was 5.0e4)
+  distance_um: 45               # Sensitivity/anchor distance (was 50)
+  Nm_per_symbol: 5000          # molecules per burst (warm-start baseline; was 1e7)
   sequence_length: 1000         # symbols per Monte-Carlo run
   random_seed: 2025
-  modulation: "MoSK"            # Options: "MoSK", "CSK", "Hybrid"
+  modulation: "Hybrid"            # Options: "MoSK", "CSK", "Hybrid"
   enable_isi: True              # Master switch for the Inter-Symbol Interference model
   isi_memory: 5                 # Default memory (will be made dynamic in analysis script)
   guard_factor: 0.15             # 20% guard time (Reduced from 0.3)

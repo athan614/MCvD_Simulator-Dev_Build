@@ -5,13 +5,21 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict, Optional
+import sys
 
 import numpy as np
 import pandas as pd
 import yaml
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 
 project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 results_dir = project_root / "results"
 data_dir = results_dir / "data"
 fig_dir = results_dir / "figures"

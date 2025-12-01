@@ -44,6 +44,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1") 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+# Force headless-safe Matplotlib backend for batch subprocesses (prevents sporadic Tk crashes on Windows)
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 # Import TclError for GUI exception handling
 from typing import TYPE_CHECKING
@@ -63,8 +65,10 @@ else:
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
+CPU_BANNER_ENV = "MCVD_CPU_BANNER_SHOWN"
+
 from analysis.ui_progress import ProgressManager
-from analysis.log_utils import setup_tee_logging
+from analysis.log_utils import setup_tee_logging, tee_logging_active
 from analysis.maintenance_suite import (
     AVAILABLE_LIST_CATEGORIES,
     STAGE_REGISTRY,
@@ -588,6 +592,12 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         cmd.append("--store-calibration-stats")
 
     # Pass logging controls through to child...
+    if getattr(args, 'no_log', False):
+        cmd.append("--no-log")
+    else:
+        cmd.extend(["--logdir", str(getattr(args, 'logdir', project_root / "results" / "logs"))])
+        if getattr(args, 'fsync_logs', False):
+            cmd.append("--fsync-logs")
     return cmd
 
 def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, 
@@ -600,9 +610,22 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         use_ctrl: Whether to use CTRL
         concurrent_modes: Number of modes running concurrently (for worker allocation)
     """
+    def _child_progress_backend() -> str:
+        """
+        Pick a safe child progress backend to avoid flicker when multiple runs
+        share the same terminal (ablation_parallel or parallel_modes > 1).
+        Prefer GUI when explicitly requested; otherwise use inline summaries
+        in multi-run scenarios to avoid flicker.
+        """
+        if args.progress == "gui":
+            return "gui"
+        if getattr(args, "ablation_parallel", False) or (concurrent_modes and concurrent_modes > 1):
+            return "inline"
+        return args.progress
+
     # GUI limitation: only force fallback on macOS, where Tk must run in the main thread
-    child_progress = args.progress
-    if args.progress == "gui" and platform.system() == "Darwin" and args.ablation_parallel:
+    child_progress = _child_progress_backend()
+    if child_progress == "gui" and platform.system() == "Darwin" and args.ablation_parallel:
         child_progress = "rich"
         
     cmd = [
@@ -725,16 +748,31 @@ def _build_run_final_cmd_for_mode(args: argparse.Namespace, mode: str, use_ctrl:
         cmd.extend(["--ctrl-snr-min-gain-db", str(args.ctrl_snr_min_gain_db)])
 
     # Pass logging controls through to child...
+    if getattr(args, 'no_log', False):
+        cmd.append("--no-log")
+    else:
+        cmd.extend(["--logdir", str(getattr(args, 'logdir', project_root / "results" / "logs"))])
+        if getattr(args, 'fsync_logs', False):
+            cmd.append("--fsync-logs")
+
     return cmd
 
 def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, shared_workers: Optional[int] = None) -> List[str]:
     """Create command line arguments for a specific mode with shared pool support."""
+    def _child_progress_backend() -> str:
+        if args.progress == "gui":
+            return "gui"
+        if getattr(args, "ablation_parallel", False) or (shared_workers is not None and shared_workers > 0):
+            return "inline"
+        return args.progress
+
+    child_progress = _child_progress_backend()
     cmd = [
         sys.executable, "-u", "analysis/run_final_analysis.py",
         "--mode", mode,
         "--num-seeds", str(args.num_seeds),
         "--sequence-length", str(args.sequence_length),
-        "--progress", args.progress,
+        "--progress", child_progress,
         "--target-ci", str(args.target_ci),
         "--min-ci-seeds", str(args.min_ci_seeds),
         "--lod-screen-delta", str(args.lod_screen_delta),
@@ -791,6 +829,13 @@ def _clone_args_for_mode(args: argparse.Namespace, mode: str, use_ctrl: bool, sh
 
     if getattr(args, 'store_calibration_stats', False):
         cmd.append("--store-calibration-stats")
+
+    if getattr(args, 'no_log', False):
+        cmd.append("--no-log")
+    else:
+        cmd.extend(["--logdir", str(getattr(args, 'logdir', project_root / "results" / "logs"))])
+        if getattr(args, 'fsync_logs', False):
+            cmd.append("--fsync-logs")
 
     return cmd
 
@@ -1024,6 +1069,11 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
         help="Run maintenance actions then exit without executing the master workflow.",
     )
     p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompts for destructive maintenance actions.",
+    )
+    p.add_argument(
         "--clear-threshold-cache",
         nargs="*",
         metavar="MODE",
@@ -1103,6 +1153,11 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
         if not maintenance_performed:
             print("Maintenance-only flag provided but no maintenance actions were executed.")
         return
+
+    # Suppress CPU banner in child processes (print once at master if applicable)
+    if (args.extreme_mode or args.beast_mode) and not os.environ.get(CPU_BANNER_ENV):
+        os.environ[CPU_BANNER_ENV] = "1"
+        print("🔥 Extreme/beast mode enabled — P-core optimization banner suppressed in child runs.")
 
     try:
         stage_selection = _parse_stage_selection(getattr(args, "run_stages", "all"))
@@ -1248,7 +1303,10 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
 
     # Initialize master-level logging
     if not args.no_log:
-        setup_tee_logging(Path(args.logdir), prefix="run_master", fsync=args.fsync_logs)
+        if tee_logging_active():
+            print("[log] File logging already active; reusing existing tee")
+        else:
+            setup_tee_logging(Path(args.logdir), prefix="run_master", fsync=args.fsync_logs)
 
     # Handle reset before any state is read or steps run
     if args.reset:
@@ -1523,7 +1581,15 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                         return 130
                     time.sleep(0.1)  # Check every 100ms
                 
-                return proc.returncode
+                rc = proc.returncode
+                if rc not in (0, 130):
+                    # Surface failing exit codes so the master driver doesn't appear to "vanish"
+                    try:
+                        joined = " ".join(cmd)
+                    except Exception:
+                        joined = str(cmd)
+                    print(f"[error] Subprocess exited with code {rc}: {joined}")
+                return rc
                 
             except KeyboardInterrupt:
                 print("\n^C received — stopping child process...", flush=True)
@@ -2018,6 +2084,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                     ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
                     if args.resume and not args.reset:
                         ts_cmd.append("--resume")
+                    ts_cmd.extend(["--progress", args.progress])
                     rc = _run_tracked(ts_cmd)
                     if rc == 130:
                         _safe_close_progress(pm, overall, sub, "snr_ts")
@@ -2326,6 +2393,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                     organoid_cmd.append("--recalibrate")
                 if args.resume and not args.reset:
                     organoid_cmd.append("--resume")
+                organoid_cmd.extend(["--progress", args.progress])
                 rc = _run_tracked(organoid_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, key)

@@ -15,12 +15,17 @@ import sys
 import argparse
 from pathlib import Path
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 from typing import Dict, Optional, List, Tuple
 
 project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style  # Stage 9
 

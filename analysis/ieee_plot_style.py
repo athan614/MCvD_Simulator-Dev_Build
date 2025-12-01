@@ -7,9 +7,15 @@ Usage:
     apply_ieee_style()
 """
 from __future__ import annotations
+import sys
+from pathlib import Path
 import matplotlib as mpl
 from cycler import cycler
 from typing import Dict, Any
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 # Okabe–Ito color-blind friendly palette
 okabe_ito = [

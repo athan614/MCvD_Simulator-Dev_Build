@@ -38,6 +38,10 @@ from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import pandas as pd
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import yaml
 from matplotlib.axes import Axes

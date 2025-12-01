@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys, os
 from pathlib import Path
 import numpy as np
+import matplotlib as mpl
+mpl.use("Agg")  # headless-safe backend to avoid native UI crashes
 import matplotlib.pyplot as plt
 import yaml
 from typing import Any

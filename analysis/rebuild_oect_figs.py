@@ -17,6 +17,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.signal import welch  #type: ignore
 from typing import Any, Dict, cast

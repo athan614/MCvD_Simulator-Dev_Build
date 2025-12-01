@@ -7,13 +7,18 @@ after CTRL subtraction. Useful for reviewer questions about correlated noise.
 
 from pathlib import Path
 import numpy as np
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import sys
 import yaml
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 from analysis.ieee_plot_style import apply_ieee_style
 from analysis.noise_correlation import onsi_curve

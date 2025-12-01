@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from datetime import datetime
 from typing import TextIO
+import sys
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 
 TreePrinter = Callable[[str], None]
@@ -61,7 +66,7 @@ STAGE_REGISTRY: Dict[str, StageDefinition] = {
     "2": StageDefinition(
         id="2",
         name="LoD vs distance",
-        description="Stage 13 LoD grid search and validation.",
+        description="LoD grid search and validation.",
         csv_patterns=("results/data/lod_vs_distance_*.csv",),
         cache_patterns=(
             "results/cache/*/lod_state/**",
@@ -237,7 +242,20 @@ TREE_CATEGORIES: Dict[str, Tuple[str, int]] = {
 
 AVAILABLE_LIST_CATEGORIES = sorted(
     set(TREE_CATEGORIES.keys())
-    | {"thresholds", "lod", "ser", "device", "guard", "stages", "cache-summary", "overview"}
+    | {
+        "thresholds",
+        "lod",
+        "ser",
+        "device",
+        "guard",
+        "sensitivity",
+        "organoid",
+        "ts",
+        "capacity",
+        "stages",
+        "cache-summary",
+        "overview",
+    }
 )
 
 
@@ -462,6 +480,50 @@ def _list_cache_summary(project_root: Path, out: TreePrinter) -> None:
             _print(f"    - {sweep}", out)
 
 
+def _list_sensitivity(project_root: Path, out: TreePrinter) -> None:
+    data_root = project_root / "results" / "data"
+    files = sorted(data_root.glob("sensitivity_*.csv"))
+    _print("Sensitivity sweep datasets:", out)
+    if not files:
+        _print("  <none>", out)
+        return
+    for csv_path in files:
+        _print(f"  {csv_path.relative_to(project_root)}", out)
+
+
+def _list_organoid(project_root: Path, out: TreePrinter) -> None:
+    data_root = project_root / "results" / "data"
+    files = sorted(data_root.glob("organoid_*_sensitivity*.csv"))
+    _print("Organoid sensitivity datasets:", out)
+    if not files:
+        _print("  <none>", out)
+        return
+    for csv_path in files:
+        _print(f"  {csv_path.relative_to(project_root)}", out)
+
+
+def _list_ts(project_root: Path, out: TreePrinter) -> None:
+    data_root = project_root / "results" / "data"
+    files = sorted(data_root.glob("snr_vs_ts_*.csv"))
+    _print("Ts sweep datasets:", out)
+    if not files:
+        _print("  <none>", out)
+        return
+    for csv_path in files:
+        _print(f"  {csv_path.relative_to(project_root)}", out)
+
+
+def _list_capacity(project_root: Path, out: TreePrinter) -> None:
+    data_root = project_root / "results" / "data"
+    files = sorted(data_root.glob("capacity_bounds*.csv"))
+    _print("Capacity analysis datasets:", out)
+    if not files:
+        _print("  <none>", out)
+        return
+    for csv_path in files:
+        _print(f"  {csv_path.relative_to(project_root)}", out)
+
+
 def list_resources(project_root: Path, categories: Sequence[str], ctx: Optional[MaintenanceContext] = None, out: TreePrinter = print) -> None:
     if not categories:
         _print("No maintenance categories provided.", out)
@@ -483,6 +545,14 @@ def list_resources(project_root: Path, categories: Sequence[str], ctx: Optional[
             _list_device(project_root, out)
         elif cat in ("guard", "isi", "guard_frontier"):
             _list_guard(project_root, out)
+        elif cat in ("sensitivity", "sens"):
+            _list_sensitivity(project_root, out)
+        elif cat in ("organoid", "organoid_sensitivity"):
+            _list_organoid(project_root, out)
+        elif cat in ("ts", "snr_vs_ts"):
+            _list_ts(project_root, out)
+        elif cat in ("capacity", "capacity_analysis"):
+            _list_capacity(project_root, out)
         elif cat in ("stages", "stage"):
             list_stage_catalog(out)
         elif cat in ("cache-summary", "overview"):
@@ -491,6 +561,16 @@ def list_resources(project_root: Path, categories: Sequence[str], ctx: Optional[
             _print(f"[{cat}] Unknown category. Available: {', '.join(AVAILABLE_LIST_CATEGORIES)}", out)
         if ctx is not None:
             ctx.record(f"listed maintenance category {cat}")
+
+
+def _confirm_action(prompt: str, auto_confirm: bool) -> bool:
+    if auto_confirm:
+        return True
+    try:
+        resp = input(f"{prompt} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return resp in ("y", "yes")
 
 
 def _expand_patterns(project_root: Path, patterns: Sequence[str]) -> List[Path]:
@@ -767,6 +847,7 @@ def nuke_results(project_root: Path, ctx: MaintenanceContext, verbose: bool = Tr
 def execute_maintenance_flags(args, project_root: Path, out: TreePrinter = print) -> bool:
     """Interpret maintenance-related argparse flags."""
     list_categories = getattr(args, "list_maintenance", None)
+    auto_confirm = bool(getattr(args, "yes", False))
     actions_requested = any([
         getattr(args, "nuke_results", False),
         bool(list_categories),
@@ -806,8 +887,11 @@ def execute_maintenance_flags(args, project_root: Path, out: TreePrinter = print
     performed = False
 
     if getattr(args, "nuke_results", False):
-        nuke_results(project_root, ctx, verbose=True)
-        performed = True
+        if _confirm_action("This will delete the entire results/ directory. Continue?", auto_confirm):
+            nuke_results(project_root, ctx, verbose=True)
+            performed = True
+        else:
+            print("Skipped nuke_results (confirmation declined).")
 
     if list_categories:
         list_resources(project_root, list_categories, ctx=ctx, out=out)
@@ -848,8 +932,11 @@ def execute_maintenance_flags(args, project_root: Path, out: TreePrinter = print
 
     stage_tokens = getattr(args, "reset_stage", None)
     if stage_tokens:
-        reset_stage(project_root, stage_tokens, ctx, verbose=True)
-        performed = True
+        if _confirm_action("Resetting stage(s) will delete matching results/cache. Continue?", auto_confirm):
+            reset_stage(project_root, stage_tokens, ctx, verbose=True)
+            performed = True
+        else:
+            print("Skipped reset_stage (confirmation declined).")
 
     if performed:
         ctx.record("maintenance actions completed")

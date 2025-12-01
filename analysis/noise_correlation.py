@@ -8,6 +8,12 @@ CTRL subtraction and charge-domain QNSI sensitivity analysis.
 import math
 import numpy as np
 from typing import Tuple, Union
+from pathlib import Path
+import sys
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 
 def sigma_I_diff_vec(sigma_da: Union[float, np.ndarray], 

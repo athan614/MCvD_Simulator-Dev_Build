@@ -13,17 +13,27 @@ import copy
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+import sys
 
+import os
+import matplotlib as mpl
+if not os.environ.get("MPLBACKEND"):
+    mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
 
 project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 data_dir = project_root / "results" / "data"
 fig_dir = project_root / "results" / "figures"
 
 from analysis.ieee_plot_style import apply_ieee_style
+from analysis.ui_progress import ProgressManager
+from analysis.log_utils import setup_tee_logging
 from analysis.run_final_analysis import (
     preprocess_config_full,
     calculate_dynamic_symbol_period,
@@ -32,6 +42,27 @@ from analysis.run_final_analysis import (
     calculate_snr_from_stats,
 )
 from src.pipeline import _resolve_decision_window
+
+
+class _NoopBar:
+    def __init__(self) -> None:
+        self._completed = 0
+    def update(self, n: int = 1, description: Optional[str] = None) -> None:
+        self._completed += n
+    def close(self) -> None:
+        pass
+    def set_description(self, text: str) -> None:
+        pass
+
+
+def _make_progress(pm: Optional[ProgressManager], total: int, desc: str):
+    if pm is not None:
+        return pm.task(total=total, description=desc, kind="sweep")
+    try:
+        from tqdm import tqdm  # type: ignore
+        return tqdm(total=total, desc=desc, leave=False)
+    except Exception:
+        return _NoopBar()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -93,6 +124,27 @@ def _parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Skip Ts points already present in the output CSV.",
+    )
+    parser.add_argument(
+        "--progress",
+        choices=["gui", "rich", "tqdm", "none"],
+        default="tqdm",
+        help="Progress backend (gui, rich, tqdm, none).",
+    )
+    parser.add_argument(
+        "--logdir",
+        default=str(project_root / "results" / "logs"),
+        help="Directory for log files.",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable file logging.",
+    )
+    parser.add_argument(
+        "--fsync-logs",
+        action="store_true",
+        help="Force fsync on each write.",
     )
     return parser.parse_args()
 
@@ -256,6 +308,11 @@ def _plot_results(df: pd.DataFrame, mode: str, out_png: Path) -> None:
 
 def main() -> None:
     args = _parse_args()
+    pm = ProgressManager(args.progress, gui_session_meta={"mode": args.mode, "resume": args.resume})
+    if not args.no_log:
+        setup_tee_logging(Path(args.logdir), prefix="sweep_snr_vs_ts", fsync=args.fsync_logs)
+    else:
+        print("[log] File logging disabled by --no-log")
     cfg = _load_cfg()
     cfg["pipeline"]["modulation"] = args.mode
     seeds = list(range(args.seeds))
@@ -304,12 +361,15 @@ def main() -> None:
     elif not args.force and csv_path.exists():
         df_prev = pd.read_csv(csv_path)
         _plot_results(df_prev, args.mode, fig_path)
+        pm.stop()
         return
 
     rows: List[Dict[str, float]] = cast(List[Dict[str, float]], existing_rows)
+    progress = _make_progress(pm if args.progress != "none" else None, total=len(multipliers), desc=f"{args.mode} Ts sweep")
     for mult in multipliers:
         if args.resume and mult in done_multipliers:
             print(f"[resume] skip Ts multiplier {mult} (cached)")
+            progress.update(1)
             continue
         Ts = Ts_base * mult
         metrics = _collect_point(cfg, Ts, anchor_nm, seeds)
@@ -317,7 +377,8 @@ def main() -> None:
         metrics["distance_um"] = anchor_d
         metrics["mode"] = args.mode
         rows.append(metrics)
-
+        progress.update(1)
+    progress.close()
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.drop_duplicates(subset=["Ts_multiplier"])
@@ -328,6 +389,7 @@ def main() -> None:
     print(f"[saved] {csv_path}")
 
     _plot_results(df, args.mode, fig_path)
+    pm.stop()
 
 
 if __name__ == "__main__":
