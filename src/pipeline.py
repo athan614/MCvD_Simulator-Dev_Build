@@ -265,16 +265,26 @@ def calculate_proper_noise_sigma(
 
     # Enhanced: Mode-aware noise calculation (MoSK never applies CTRL subtraction)
     use_ctrl_flag = bool(pipeline_cfg.get('use_control_channel', True))
-    effective_rho = float(np.clip(noise_cfg.get('effective_correlation', rho_corr), -0.999, 0.999))  # Allow override with clamp
+
+    # Prefer measured post-CTRL correlation, fall back to config
+    rho_measured = pipeline_cfg.get('rho_cc_measured', None)
+    if rho_measured is None or not np.isfinite(rho_measured):
+        rho_post_cfg = noise_cfg.get('rho_between_channels_after_ctrl', noise_cfg.get('effective_correlation', rho_corr))
+        rho_post = float(np.clip(rho_post_cfg, -0.999, 0.999))
+    else:
+        rho_post = float(np.clip(rho_measured, -0.999, 0.999))
+
+    effective_rho = float(np.clip(noise_cfg.get('effective_correlation', rho_corr), -0.999, 0.999))  # backward-compat fallback
 
     # Mirror detector behaviour: when the control channel is active, apply the
     # differential noise rejection. Otherwise remain single-ended.
     use_ctrl_for_noise = use_ctrl_flag and modulation not in ('MOSK',)
 
     if use_ctrl_for_noise:
-        # Differential measurement: benefits from common-mode rejection
-        rejection = max(0.0, 1.0 - effective_rho)
-        thermal_var_effective = 2.0 * thermal_var_single  # thermal noise remains uncorrelated; no rejection
+        # Differential measurement: only correlated low-frequency noise is rejected.
+        # Thermal (white) noise remains uncorrelated and is NOT cancelled by CTRL.
+        rejection = max(0.0, 1.0 - rho_post)
+        thermal_var_effective = 2.0 * thermal_var_single  # no CTRL cancellation for thermal
         flicker_var_effective = 2.0 * flicker_var_single * rejection
         drift_var_effective = 2.0 * drift_var_single * rejection
     else:
@@ -290,7 +300,7 @@ def calculate_proper_noise_sigma(
     sigma = max(sigma_effective, 1e-15)
 
     rho_pre = float(np.clip(noise_cfg.get('rho_corr', rho_corr), -0.999, 0.999))
-    rho_for_diff = effective_rho if use_ctrl_for_noise else rho_pre
+    rho_for_diff = rho_post if use_ctrl_for_noise else rho_pre
     sigma_diff_charge = math.sqrt(max(
         2.0 * total_single_var - 2.0 * rho_for_diff * (sigma_single ** 2),
         0.0

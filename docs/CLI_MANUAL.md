@@ -62,7 +62,7 @@ This reference enumerates every command-line flag available in the scripted work
 | `--min-ci-seeds` | int | `8` | Minimum seeds required before adaptive CI stopping can trigger. |
 | `--min-decision-points` | int | `4` | Minimum time points for window guard (default: 4) |
 | `--mode` | choice | `None` | Force a single modulation mode; defaults to MoSK when neither --mode nor --modes is provided. Choices: `MoSK, CSK, Hybrid, ALL`. |
-| `--modes` | choice | `None` | Compatibility alias for orchestrators; accepts the same choices as --mode (use 'all' for every modulation). Choices: `MoSK, CSK, Hybrid, all`. |
+| `--modes` | list | `None` | Run multiple modes in one command (e.g., `--modes CSK Hybrid`); use `all`/`*` for every modulation. Choices: `MoSK, CSK, Hybrid, all`. |
 | `--nm-grid` | str | `""` | Comma-separated Nm values for SER sweeps (e.g., 200,500,1000,2000). If not provided, uses cfg['Nm_range'] from YAML. |
 | `--no-log` | flag | `false` | Disable file logging. |
 | `--noise-only-seeds` | int | `8` | Number of seeds for noise-only sweeps (default: 8). |
@@ -76,7 +76,7 @@ This reference enumerates every command-line flag available in the scripted work
 | `--progress` | choice | `tqdm` | Progress UI backend. Choices: `tqdm, rich, gui, none`. |
 | `--recalibrate` | flag | `false` | Rebuild detector thresholds even when cached JSON exists. |
 | `--resume` | flag | `false` | Resume: skip finished values and append results as we go. |
-| `--run-stages` | str | `all` | Compatibility shim for legacy orchestrators; stage gating is handled upstream. |
+| `--run-stages` | str | `all` | Comma/semicolon list of stages/aliases to run (1=SER/Nm+zero-noise, 2=LoD+SER/SNR vs distance, 3=Device FoM, 4=ISI/guard; 5-7 plots/tables via master). Use `all` or `*` for every stage; subsets run only the selected stages. |
 | `--sequence-length` | int | `1000` | Symbols simulated per seed. |
 | `--ser-refine` | flag | `false` | After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER. |
 | `--ser-refine-points` | int | `4` | How many log-spaced Nm points to add between the bracketing Nm pair (default: 4). |
@@ -151,7 +151,7 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--max-workers` | int | `None` | Override worker count in run_final_analysis. |
 | `--min-ci-seeds` | int | `6` | Minimum seeds before CI stopping can trigger (pass-through) |
 | `--min-decision-points` | int | `4` | Minimum time points for window guard (pass-through) |
-| `--modes` | choice | `all` | Modes to execute (use 'all' for MoSK+CSK+Hybrid). Choices: `MoSK, CSK, Hybrid, all`. |
+| `--modes` | list | `all` | Modes to execute (e.g., `--modes MoSK CSK`; use `all` for MoSK+CSK+Hybrid). Choices: `MoSK, CSK, Hybrid, all`. |
 | `--nm-grid` | str | `""` | Global Nm values for SER sweeps (pass-through to run_final_analysis). |
 | `--nm-grid-csk` | str | `""` | Nm grid override for CSK only. |
 | `--nm-grid-hybrid` | str | `""` | Nm grid override for Hybrid only. |
@@ -171,7 +171,7 @@ Flags below include master-specific controls and pass-through options forwarded 
 | `--reset` | choice | `None` | Reset simulator state. 'cache' removes caches/state only; 'all' clears results/* (applied when --reset is passed without a value). Choices: `cache, all`. |
 | `--reset-stage` | list | `None` | Reset entire stages/sweeps by number or alias (1:SER, 2:LoD, 3:Device FoM, 4:Guard/ISI, 5:Main figures, 6:Supplementary, 7:Tables, 8:Sensitivity, 9:Organoid, 10:Ts sweeps, 11:Capacity). |
 | `--resume` | flag | `false` | Resume completed steps. |
-| `--run-stages` | str | `all` | Comma-separated stage list (or 'all') to execute via run_final_analysis stages (default: all stages). |
+| `--run-stages` | str | `all` | Comma/semicolon list of stages/aliases to run (1=SER/Nm+zero-noise, 2=LoD+SER/SNR vs distance, 3=Device FoM, 4=ISI/guard; 5-7 plots/tables via master). Use `all` or `*` for every stage; subsets run only the selected stages. |
 | `--sequence-length` | int | `1000` | Symbols per seed forwarded to run_final_analysis. |
 | `--ser-refine` | flag | `false` | After coarse SER vs Nm sweep, auto-run a few Nm points that bracket the target SER. |
 | `--ser-refine-points` | int | `4` | How many log-spaced Nm points to add between the bracketing Nm pair (default: 4). |

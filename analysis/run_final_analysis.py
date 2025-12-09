@@ -48,6 +48,22 @@ def _env_lod_debug_enabled() -> bool:
 LOD_DEBUG_ENABLED: bool = _env_lod_debug_enabled()
 _LOD_DEBUG_PATH: Optional[Path] = None
 _LOD_DEBUG_LOCK = threading.Lock()
+_RUN_FINAL_STAGE_IDS: Set[int] = {1, 2, 3, 4}
+
+# Stage aliases (subset of maintenance_suite; only stages 1-4 are runnable here)
+_STAGE_ALIAS_MAP: Dict[str, int] = {
+    "ser": 1,
+    "ser_vs_nm": 1,
+    "nm": 1,
+    "lod": 2,
+    "lod_vs_distance": 2,
+    "device": 3,
+    "device_fom": 3,
+    "guard": 4,
+    "guard_frontier": 4,
+    "isi": 4,
+    "isi_tradeoff": 4,
+}
 
 
 def _warn_synthetic_noise(reason: str) -> None:
@@ -319,6 +335,35 @@ def _canonical_mode_name(mode: str) -> str:
         return "MoSK"
     key = mode.strip().upper()
     return MODE_NAME_ALIASES.get(key, mode.strip())
+
+
+# ============= CORRELATION POLICY HELPERS =============
+def _get_correlation_mode(cfg: Dict[str, Any]) -> str:
+    """Return configured correlation policy ('legacy' or 'measured')."""
+    return str(cfg.get('_correlation_mode', cfg.get('pipeline', {}).get('_correlation_mode', 'legacy'))).lower()
+
+
+def _apply_correlation_policy(cfg: Dict[str, Any], mode: str) -> None:
+    """
+    Apply correlation policy to cfg.
+    - 'legacy': force post-CTRL rho to the configured effective_correlation (stage 1/2 behavior).
+    - 'measured': use measured rho_cc_measured when available (default in patched code).
+    """
+    pipe = cfg.setdefault('pipeline', {})
+    noise = cfg.setdefault('noise', {})
+    mode = str(mode or 'legacy').lower()
+    cfg['_correlation_mode'] = mode
+    pipe['_correlation_mode'] = mode
+
+    if mode == 'legacy':
+        rho_legacy = float(noise.get('effective_correlation', noise.get('rho_correlated', 0.9)))
+        # Force post-CTRL correlation to the legacy value; keep pre-CTRL unchanged.
+        noise['rho_between_channels_after_ctrl'] = rho_legacy
+        pipe['rho_cc_measured'] = rho_legacy
+        pipe['_use_measured_rho'] = False
+    else:  # measured/default
+        pipe.pop('rho_cc_measured', None)
+        pipe['_use_measured_rho'] = True
 
 def _parse_distance_list(spec: str) -> List[int]:
     tokens: List[str] = []
@@ -799,6 +844,9 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
     except Exception:
         dw = cfg['pipeline'].get('symbol_period_s', None)
 
+    oect_token = _stable_cache_token(cfg.get('oect', {}))
+    corr_mode = _get_correlation_mode(cfg)
+
     key_params = [
         cfg['pipeline'].get('modulation'),
         cfg['pipeline'].get('Nm_per_symbol'),
@@ -815,6 +863,8 @@ def get_cache_key(cfg: Dict[str, Any]) -> str:
         _qeff_signs(cfg),  # NEW: signs guard
         cfg['pipeline'].get('csk_combiner', 'zscore'),
         cfg['pipeline'].get('csk_leakage_frac', 0.0),
+        oect_token,  # ensure device parameters are part of the cache identity
+        corr_mode,
     ]
     token = "::".join(_stable_cache_token(p) for p in key_params)
     return hashlib.sha1(token.encode('utf-8')).hexdigest()
@@ -849,13 +899,21 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     Ts = cfg['pipeline'].get('symbol_period_s', None)
     dist = cfg['pipeline'].get('distance_um', None)
     nm = cfg['pipeline'].get('Nm_per_symbol', None)
+    oect_cfg = cfg.get('oect', {})
     lvl = cfg['pipeline'].get('csk_level_scheme', 'uniform')
     profile = cfg['pipeline'].get('channel_profile', 'tri')
     tgt = cfg['pipeline'].get('csk_target_channel', '')
     M   = cfg['pipeline'].get('csk_levels', None)
     gf  = cfg['pipeline'].get('guard_factor', None)
+    corr_mode = _get_correlation_mode(cfg)
     # Decision window intended for calibration
     win = cfg.get('detection', {}).get('decision_window_s', Ts)
+
+    def _fmt_oect(val: Any) -> Optional[str]:
+        try:
+            return f"{float(val):.3g}"
+        except (TypeError, ValueError):
+            return None
 
     parts = [f"thresholds_{mode}", _nt_pair_label(cfg)]
     parts.append(f"pair{_nt_pair_fingerprint(cfg)}")
@@ -873,6 +931,22 @@ def _thresholds_filename(cfg: Dict[str, Any]) -> Path:
     lf = cfg['pipeline'].get('csk_leakage_frac', None)
     if cmb == 'leakage' and lf is not None:
         parts.append(f"leak{float(lf):.3g}")
+    parts.append(f"corr{corr_mode}")
+    gm_tok = _fmt_oect(oect_cfg.get('gm_S'))
+    if gm_tok:
+        parts.append(f"gm{gm_tok}")
+    c_tot_tok = _fmt_oect(oect_cfg.get('C_tot_F'))
+    if c_tot_tok:
+        parts.append(f"C{c_tot_tok}F")
+    r_ch_tok = _fmt_oect(oect_cfg.get('R_ch_Ohm'))
+    if r_ch_tok:
+        parts.append(f"Rch{r_ch_tok}")
+    i_dc_tok = _fmt_oect(oect_cfg.get('I_dc_A'))
+    if i_dc_tok:
+        parts.append(f"Idc{i_dc_tok}")
+    v_g_tok = _fmt_oect(oect_cfg.get('V_g_bias_V'))
+    if v_g_tok:
+        parts.append(f"Vg{v_g_tok}")
     ctrl = 'wctrl' if bool(cfg['pipeline'].get('use_control_channel', True)) else 'noctrl'
     parts.append(f"profile{profile}")
     parts.append(ctrl)
@@ -916,6 +990,37 @@ def run_sequence_wrapper(cfg: Dict[str, Any], seed: int, attach_isi_meta: bool =
         cfg['collect_isi_metrics'] = True
     
     return run_sequence(cfg)
+
+def _persist_threshold_payload(threshold_file: Path,
+                               thresholds: Dict[str, Any],
+                               meta_payload: Dict[str, Any],
+                               verbose: bool = False) -> None:
+    """
+    Atomically write threshold payload to disk (JSON-safe, keeps __meta__).
+    """
+    try:
+        threshold_file.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {}
+        for k, v in thresholds.items():
+            if isinstance(v, np.ndarray):
+                payload[k] = v.tolist()
+            elif isinstance(v, (np.integer, np.floating)):
+                payload[k] = float(v)
+            elif isinstance(v, list):
+                payload[k] = [float(x) if isinstance(x, (np.integer, np.floating)) else x for x in v]
+            else:
+                payload[k] = v
+        payload["__meta__"] = meta_payload
+        tmp_file = threshold_file.with_suffix('.tmp')
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_file, threshold_file)
+        if verbose:
+            print(f"💾 Saved thresholds to {threshold_file}")
+    except Exception as e:
+        if verbose:
+            print(f"⚠️ Failed to save thresholds: {e}")
+
 
 def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: bool = False,
                          save_to_file: bool = True, verbose: bool = False) -> Dict[str, Union[float, List[float], str]]:
@@ -1416,60 +1521,40 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
     }
     thresholds['__meta__'] = meta_payload
 
-    # ---------- persist to disk with rich __meta__ (atomic) ----------
-    if save_to_file:
-        try:
-            threshold_file.parent.mkdir(parents=True, exist_ok=True)
-
-            # JSON‑safe thresholds
-            payload: Dict[str, Any] = {}
-            for k, v in thresholds.items():
-                if isinstance(v, np.ndarray):
-                    payload[k] = v.tolist()
-                elif isinstance(v, (np.integer, np.floating)):
-                    payload[k] = float(v)
-                elif isinstance(v, list):
-                    payload[k] = [float(x) if isinstance(x, (np.integer, np.floating)) else x for x in v]
-                else:
-                    payload[k] = v
-
-            payload["__meta__"] = meta_payload
-
-            tmp_file = threshold_file.with_suffix('.tmp')
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
-            os.replace(tmp_file, threshold_file)
-
-            if verbose:
-                print(f"💾 Saved thresholds to {threshold_file}")
-        except Exception as e:
-            if verbose:
-                print(f"⚠️ Failed to save thresholds: {e}")
-
     # Per-point combiner - propagate measured correlation to runtime
     if mode.startswith("CSK") or mode == "Hybrid":
-        # Extract rho_cc_measured from calibration results
+        corr_mode = _get_correlation_mode(cfg)
+        use_measured = bool(cfg['pipeline'].get('_use_measured_rho', True)) and corr_mode != 'legacy'
+
+        # Extract rho_cc_measured from calibration results (when allowed)
         rho_cc_measured = np.nan
-        if mode.startswith("CSK"):
-            # For CSK, get it from the last calibration run
-            for level in range(cfg['pipeline'].get('csk_levels', 4)):
-                cal_result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
+        if use_measured:
+            if mode.startswith("CSK"):
+                # For CSK, get it from the last calibration run
+                for level in range(cfg['pipeline'].get('csk_levels', 4)):
+                    cal_result = run_calibration_symbols(cal_cfg, level, mode='CSK', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
+                    if cal_result and 'rho_cc_measured' in cal_result:
+                        measured_val = cal_result['rho_cc_measured']
+                        if np.isfinite(measured_val):
+                            rho_cc_measured = float(measured_val)
+                            break
+            elif mode == "Hybrid":
+                # For Hybrid, get it from any symbol run
+                cal_result = run_calibration_symbols(cal_cfg, 0, mode='Hybrid', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
                 if cal_result and 'rho_cc_measured' in cal_result:
                     measured_val = cal_result['rho_cc_measured']
                     if np.isfinite(measured_val):
                         rho_cc_measured = float(measured_val)
-                        break
-        elif mode == "Hybrid":
-            # For Hybrid, get it from any symbol run
-            cal_result = run_calibration_symbols(cal_cfg, 0, mode='Hybrid', num_symbols=int(cfg.get('_cal_symbols_per_seed', 100)))
-            if cal_result and 'rho_cc_measured' in cal_result:
-                measured_val = cal_result['rho_cc_measured']
-                if np.isfinite(measured_val):
-                    rho_cc_measured = float(measured_val)
         
-        # Propagate measured correlation to runtime
-        rho_cc = cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl', 0.5)
-        rho_used = float(rho_cc_measured) if (np.isfinite(rho_cc_measured)) else float(rho_cc)
+        # Propagate correlation to runtime
+        rho_cfg = cal_cfg.get('noise', {}).get('rho_between_channels_after_ctrl',
+                                               cal_cfg.get('noise', {}).get('effective_correlation', 0.9))
+        if use_measured and np.isfinite(rho_cc_measured):
+            rho_used = float(rho_cc_measured)
+        else:
+            rho_used = float(rho_cfg)
+            rho_cc_measured = rho_used  # keep thresholds consistent for legacy path
+
         thresholds['noise.rho_between_channels_after_ctrl'] = rho_used
         thresholds['rho_cc_measured'] = float(rho_cc_measured) if np.isfinite(rho_cc_measured) else float('nan')
         
@@ -1495,6 +1580,10 @@ def calibrate_thresholds(cfg: Dict[str, Any], seeds: List[int], recalibrate: boo
         thresholds['use_control_channel'] = bool(ctrl_use)
         thresholds['ctrl_auto_applied'] = bool(cfg.get('_ctrl_auto', False))
 
+    # ---------- persist to disk with rich __meta__ (atomic) ----------
+    if save_to_file:
+        _persist_threshold_payload(threshold_file, thresholds, meta_payload, verbose)
+
     if collect_trace and calibration_trace:
         thresholds['_calibration_trace'] = calibration_trace
 
@@ -1504,20 +1593,54 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
     """
     Memory + disk cached calibration. Persist JSON so multiple processes/runs reuse it.
     """
+    def _backfill_rho_thresholds(thresholds: Dict[str, Any],
+                                 cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+        """
+        Ensure cached thresholds carry a post-CTRL rho measurement so CTRL does not degrade SNR.
+        Returns (updated_thresholds, changed_flag).
+        """
+        try:
+            pipe = cfg.get('pipeline', {})
+            mode = str(pipe.get('modulation', ''))
+            use_ctrl = bool(pipe.get('use_control_channel', True))
+            if not use_ctrl or mode not in ('CSK', 'Hybrid'):
+                return thresholds, False
+
+            rho_cached = thresholds.get('rho_cc_measured', float('nan'))
+            rho_noise = thresholds.get('noise.rho_between_channels_after_ctrl')
+            if (isinstance(rho_noise, (int, float)) and math.isfinite(float(rho_noise))) or math.isfinite(rho_cached):
+                return thresholds, False
+
+            quick_cfg = deepcopy(cfg)
+            quick_cfg['pipeline']['random_seed'] = 0
+            quick_cfg['pipeline']['Nm_per_symbol'] = max(
+                1e-6, float(quick_cfg['pipeline'].get('Nm_per_symbol', 1e-6))
+            )
+            rho_quick = _measure_rho_for_seed(quick_cfg, mode)
+            if np.isfinite(rho_quick):
+                updated = dict(thresholds)
+                updated['rho_cc_measured'] = float(rho_quick)
+                updated['noise.rho_between_channels_after_ctrl'] = float(rho_quick)
+                return updated, True
+        except Exception:
+            pass
+        return thresholds, False
+
     cfg_clean = deepcopy(cfg)
     pipeline_clean = cfg_clean.setdefault('pipeline', {})
     pipeline_clean.pop('_frozen_noise', None)
     cfg_clean.pop('_prefer_distance_freeze', None)
     cfg_clean = _prepare_cfg_for_threshold_cache(cfg_clean)
     cfg = cfg_clean
+    corr_mode = _get_correlation_mode(cfg)
 
     cache_key = get_cache_key(cfg)
+    threshold_file = _thresholds_filename(cfg)
     
     # If recalibrating, clear both memory and disk cache
     if recalibrate:
         if cache_key in calibration_cache:
             del calibration_cache[cache_key]
-        threshold_file = _thresholds_filename(cfg)
         if threshold_file.exists():
             try:
                 threshold_file.unlink()
@@ -1558,10 +1681,34 @@ def calibrate_thresholds_cached(cfg: Dict[str, Any], seeds: List[int], recalibra
             )
             calibration_cache[cache_key] = cached_copy
             cached_result = cached_copy
+        if corr_mode != 'legacy':
+            cached_result, changed = _backfill_rho_thresholds(cached_result, cfg)
+            if changed:
+                meta_payload_raw = cached_result.get('__meta__')
+                meta_payload: Dict[str, Any] = meta_payload_raw if isinstance(meta_payload_raw, dict) else {}
+                _persist_threshold_payload(threshold_file, cached_result, meta_payload)
+                calibration_cache[cache_key] = cached_result
+        else:
+            # Force legacy rho into cached thresholds to avoid mixing policies
+            rho_legacy = float(cfg.get('noise', {}).get('effective_correlation', cfg.get('noise', {}).get('rho_correlated', 0.9)))
+            cached_result = dict(cached_result)
+            cached_result['rho_cc_measured'] = rho_legacy
+            cached_result['noise.rho_between_channels_after_ctrl'] = rho_legacy
+            calibration_cache[cache_key] = cached_result
         return cached_result
     
     # Compute thresholds (respecting the recalibrate flag)
     result = calibrate_thresholds(cfg, seeds, recalibrate=recalibrate, save_to_file=True, verbose=False)
+    if corr_mode != 'legacy':
+        result, changed = _backfill_rho_thresholds(result, cfg)
+        if changed:
+            meta_payload_raw_2 = result.get('__meta__')
+            meta_payload2: Dict[str, Any] = meta_payload_raw_2 if isinstance(meta_payload_raw_2, dict) else {}
+            _persist_threshold_payload(threshold_file, result, meta_payload2)
+    else:
+        rho_legacy = float(cfg.get('noise', {}).get('effective_correlation', cfg.get('noise', {}).get('rho_correlated', 0.9)))
+        result['rho_cc_measured'] = rho_legacy
+        result['noise.rho_between_channels_after_ctrl'] = rho_legacy
     
     # Bound cache size to prevent memory bloat
     if len(calibration_cache) >= MAX_CACHE_SIZE:
@@ -3181,19 +3328,45 @@ def _lod_state_save(mode: str, dist_um: float, use_ctrl: bool, state: Dict[str, 
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     os.replace(tmp, p)
 
+
+def _parse_stage_selection(spec: str) -> Set[int]:
+    """Parse stage selection tokens into a set of stage ids (supports aliases and all/*)."""
+    tokens = [token.strip() for token in str(spec or "").replace(";", ",").split(",") if token.strip()]
+    if not tokens:
+        return set(_RUN_FINAL_STAGE_IDS)
+    stages: Set[int] = set()
+    for token in tokens:
+        lower = token.lower()
+        if lower in ("all", "*"):
+            return set(_RUN_FINAL_STAGE_IDS)
+        if lower in _STAGE_ALIAS_MAP:
+            stages.add(_STAGE_ALIAS_MAP[lower])
+            continue
+        try:
+            stages.add(int(float(token)))
+        except ValueError as exc:
+            raise ValueError(f"Unrecognized stage token '{token}'") from exc
+    return stages
+
 # ============= ARGUMENTS =============
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run molecular communication analysis (crash-safe w/ resume)")
     # NEW: support both --mode and --modes (orchestrator calls --modes)
     parser.add_argument("--mode", choices=["MoSK", "CSK", "Hybrid", "ALL"], default=None)
-    parser.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default=None)
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["MoSK", "CSK", "Hybrid", "all", "ALL"],
+        default=None,
+        help="Run multiple modes in one command (e.g., --modes CSK Hybrid). Use 'all' for every mode.",
+    )
     parser.add_argument("--num-seeds", type=int, default=20)
     parser.add_argument("--sequence-length", type=int, default=1000)
     parser.add_argument(
         "--run-stages",
         type=str,
         default="all",
-        help="Compatibility shim for legacy orchestrators; stage gating is handled upstream.",
+        help="Comma/semicolon list of stages/aliases to run (1=SER/Nm+noise, 2=LoD+distance, 3=Device FoM, 4=ISI/guard). Use 'all' or '*' for every stage.",
     )
     parser.add_argument(
         "--merge-ablation-csvs",
@@ -3240,6 +3413,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--csk-level-scheme", choices=["uniform", "zero-based"], default="uniform",
                        help="CSK level mapping scheme")
     parser.add_argument("--resume", action="store_true", help="Resume: skip finished values and append results as we go")
+    parser.add_argument("--ablation", choices=["both", "on", "off"], default=None,
+                        help="Run CTRL ablations directly from run_final_analysis: both (default for master), on, or off.")
     parser.add_argument("--with-ctrl", dest="use_ctrl", action="store_true", help="Use CTRL differential subtraction")
     parser.add_argument("--no-ctrl", dest="use_ctrl", action="store_false", help="Disable CTRL subtraction (ablation)")
     parser.add_argument("--progress", choices=["tqdm", "rich", "gui", "none", "inline"], default="tqdm",
@@ -3475,6 +3650,9 @@ def parse_arguments() -> argparse.Namespace:
                        help="Minimum absolute correlation threshold for CTRL (default: 0.10)")
     parser.add_argument("--ctrl-snr-min-gain-db", type=float, default=0.0,
                        help="Minimum SNR gain in dB to keep CTRL enabled (default: 0.0)")
+    parser.add_argument("--correlation-mode", choices=["legacy", "measured"], default="measured",
+                        help="Correlation policy: 'legacy' forces post-CTRL rho to effective_correlation (stage 1/2 behavior); "
+                             "'measured' uses rho_cc_measured when available (default: measured).")
     
     args = parser.parse_args()
 
@@ -3511,11 +3689,60 @@ def parse_arguments() -> argparse.Namespace:
     if args.progress == "gui":
         args.inhibit_sleep = True
         
+    def _parse_modes_list(raw: Optional[Union[str, Sequence[str]]]) -> List[str]:
+        if raw is None:
+            return []
+        modes_flat: List[str] = []
+        seq = raw if isinstance(raw, (list, tuple)) else [str(raw)]
+        for token in seq:
+            for part in str(token).replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                modes_flat.append(part)
+        if not modes_flat:
+            return []
+        if any(m.lower() in ("all", "*") for m in modes_flat):
+            return ["MoSK", "CSK", "Hybrid"]
+        normalized = []
+        for m in modes_flat:
+            canon = _canonical_mode_name(m)
+            if canon not in ("MoSK", "CSK", "Hybrid"):
+                raise argparse.ArgumentTypeError(f"Unsupported mode '{m}' in --modes")
+            normalized.append(canon)
+        # preserve order but drop duplicates
+        seen = set()
+        ordered = []
+        for m in normalized:
+            if m not in seen:
+                seen.add(m)
+                ordered.append(m)
+        return ordered
+
     # Normalize: prefer --modes if provided
-    if args.modes is not None:
-        args.mode = "ALL" if args.modes.lower() == "all" else args.modes
+    try:
+        modes_list = _parse_modes_list(args.modes)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    args._modes_list = modes_list
+    if modes_list:
+        args.mode = None
     elif args.mode is None:
         args.mode = "MoSK"
+
+    # Stage selection (only 1-4 are runnable here)
+    try:
+        stage_selection = _parse_stage_selection(getattr(args, "run_stages", "all"))
+    except ValueError as exc:
+        parser.error(str(exc))
+    supported_stages = {stage for stage in stage_selection if stage in _RUN_FINAL_STAGE_IDS}
+    ignored_stages = sorted(stage_selection - supported_stages)
+    if ignored_stages:
+        print(f"⚠️  Ignoring unsupported stage(s) {', '.join(str(s) for s in ignored_stages)} in run_final_analysis (only 1-4).")
+    if not supported_stages:
+        print("⚠️  No stages selected (--run-stages). Nothing to do.")
+    args._run_stage_set = supported_stages
+    args.run_stages = ",".join(str(stage) for stage in sorted(stage_selection)) or "all"
     return args
 
 # ============= CALIBRATION SAMPLES (helper) =============
@@ -7850,6 +8077,8 @@ def _run_device_fom_sweeps(
     args: argparse.Namespace,
     pm: Optional[ProgressManager] = None,
     mode_key: Optional[Any] = None,
+    device_key: Optional[Any] = None,
+    device_bar: Optional[Any] = None,
 ) -> None:
     """Sweep OECT parameters to capture delta-over-sigma device figures of merit."""
     if not seeds:
@@ -7951,6 +8180,8 @@ def _run_device_fom_sweeps(
             df_gm['param_type'] = 'gm_S'
             df_gm['param_value'] = pd.to_numeric(df_gm['oect.gm_S'], errors='coerce')
             frames.append(df_gm)
+        if device_bar is not None:
+            device_bar.update(len(gm_values) * len(device_seeds))
     else:
         print("?? Device FoM gm sweep already up-to-date (resume)")
 
@@ -7978,6 +8209,8 @@ def _run_device_fom_sweeps(
             df_c['param_type'] = 'C_tot_F'
             df_c['param_value'] = pd.to_numeric(df_c['oect.C_tot_F'], errors='coerce')
             frames.append(df_c)
+        if device_bar is not None:
+            device_bar.update(len(c_values) * len(device_seeds))
     else:
         print("?? Device FoM C_tot sweep already up-to-date (resume)")
 
@@ -8539,6 +8772,9 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     cfg['_ctrl_auto'] = args.ctrl_auto
     cfg['_ctrl_auto_rho_min_abs'] = args.ctrl_rho_min_abs
     cfg['_ctrl_auto_min_gain_db'] = args.ctrl_snr_min_gain_db
+
+    # Correlation policy (legacy vs measured)
+    _apply_correlation_policy(cfg, args.correlation_mode)
     
     # Apply CTRL ablation control
     use_ctrl = args.use_ctrl
@@ -8554,6 +8790,15 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 ([f"--nt-pairs={args.nt_pairs}"] if args.nt_pairs else []) +
                 (["--recalibrate"] if args.recalibrate else [])
     }
+
+    stage_set = getattr(args, "_run_stage_set", set(_RUN_FINAL_STAGE_IDS)) or set()
+    run_stage_ser = 1 in stage_set
+    run_stage_lod = 2 in stage_set
+    run_stage_device = 3 in stage_set
+    run_stage_guard = 4 in stage_set
+    if not stage_set:
+        print("⚠️  No stages selected for this mode; skipping.")
+        return
     
     _install_signal_handlers()
     
@@ -8586,6 +8831,7 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{args.variant}" if getattr(args, 'variant', '') else ''
+    lod_results_path = data_dir / f"lod_vs_distance_{mode.lower()}{suffix}.csv"
 
     cfg['pipeline']['enable_isi'] = not args.disable_isi
     cfg['pipeline']['modulation'] = mode
@@ -8706,20 +8952,21 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     nm_values: List[Union[float, int]] = [cast(Union[float, int], int(v)) for v in raw_nm_values]
 
     guard_values = [round(x, 2) for x in np.linspace(0.0, 1.0, 10)]
-    ser_jobs = len(nm_values) * args.num_seeds
+    ser_jobs = (len(nm_values) * args.num_seeds) if run_stage_ser else 0
     lod_seed_cap = 10
-    lod_jobs = len(lod_distance_grid) * (lod_seed_cap * 8 + lod_seed_cap + 5)  # initial estimate only
+    lod_jobs = (len(lod_distance_grid) * (lod_seed_cap * 8 + lod_seed_cap + 5)) if run_stage_lod else 0  # initial estimate only
 
     distance_policy = getattr(args, "distance_sweep", "always")
     distances_available = bool(lod_distance_grid)
     do_distance_metrics = False
-    if distance_policy == "always":
-        do_distance_metrics = distances_available
-    elif distance_policy == "auto":
-        do_distance_metrics = distances_available
-    else:  # "never"
-        do_distance_metrics = False
-    dist_jobs = (len(lod_distance_grid) * args.num_seeds) if do_distance_metrics else 0
+    if run_stage_lod:
+        if distance_policy == "always":
+            do_distance_metrics = distances_available
+        elif distance_policy == "auto":
+            do_distance_metrics = distances_available
+        else:  # "never"
+            do_distance_metrics = False
+    dist_jobs = (len(lod_distance_grid) * args.num_seeds) if (do_distance_metrics and run_stage_lod) else 0
 
     do_isi = False
     if args.isi_sweep == "always":
@@ -8728,12 +8975,25 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
         do_isi = bool(cfg['pipeline'].get('enable_isi', False))
     else:
         do_isi = False
-    isi_jobs = (len(guard_values) * args.num_seeds) if do_isi else 0
+    if not run_stage_guard:
+        do_isi = False
+    isi_jobs = (len(guard_values) * args.num_seeds) if (do_isi and run_stage_guard) else 0
 
-    manual_total = 2  # SER + LoD
-    if do_distance_metrics:
+    # Device FoM progress estimate (stage 3)
+    device_seed_cap = min(args.num_seeds, 6)
+    device_sweep_values = 10 + 10  # gm grid + C_tot grid
+    device_jobs = (device_seed_cap * device_sweep_values) if run_stage_device else 0
+
+    manual_total = 0
+    if run_stage_ser:
         manual_total += 1
-    if do_isi:
+    if run_stage_lod:
+        manual_total += 1
+    if run_stage_lod and do_distance_metrics:
+        manual_total += 1
+    if run_stage_device:
+        manual_total += 1
+    if run_stage_guard and do_isi:
         manual_total += 1
 
     # Hierarchy
@@ -8753,27 +9013,29 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     ser_key: Optional[Tuple[str, str, str]] = None
     lod_key: Optional[Tuple[str, str, str]] = None
     dist_key: Optional[Tuple[str, str, str]] = None
+    device_key: Optional[Tuple[str, str, str]] = None
     isi_key: Optional[Tuple[str, str, str]] = None
     
     if hierarchy_supported:
         overall_key = ("overall", mode)
-        overall = pm.task(total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
+        overall = pm.task(total=ser_jobs + lod_jobs + dist_jobs + device_jobs + isi_jobs,
                          description=f"Overall ({mode})",
                          key=overall_key, kind="overall")
         
         mode_key = ("mode", mode)
-        mode_bar = pm.task(total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
+        mode_bar = pm.task(total=ser_jobs + lod_jobs + dist_jobs + device_jobs + isi_jobs,
                           description=f"{mode} Mode",
                           parent=overall_key, key=mode_key, kind="mode")
 
         ser_key = ("sweep", mode, "SER_vs_Nm")
         lod_key = ("sweep", mode, "LoD_vs_distance")
         dist_key = ("sweep", mode, "SER_SNR_vs_distance")
+        device_key = ("sweep", mode, "DeviceFoM")
         isi_key = ("sweep", mode, "ISI_vs_guard")
 
     # Always create the ser_bar with appropriate parent
 
-    if hierarchy_supported:
+    if hierarchy_supported and run_stage_ser and ser_jobs > 0:
         ser_bar = pm.task(total=ser_jobs, description="SER vs Nm",
                           parent=mode_key, key=("sweep", mode, "SER_vs_Nm"), kind="sweep")
     else:
@@ -8785,757 +9047,790 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
     else:
         dist_bar = None
 
+    if hierarchy_supported and run_stage_device and device_jobs > 0:
+        device_bar = pm.task(total=device_jobs, description="Device FoM sweeps",
+                             parent=mode_key, key=device_key, kind="sweep")
+    else:
+        device_bar = None
+
     use_ctrl_flag = bool(cfg['pipeline'].get('use_control_channel', True))
-    ser_csv, ser_csv_branch, ser_csv_other = _stage_csv_paths("ser", data_dir, mode, suffix, use_ctrl_flag)
-    ser_results_path = ser_csv if not args.ablation_parallel else ser_csv_branch
-    existing_ser_branch = _ensure_ablation_branch(
-        "ser", ser_csv, ser_csv_branch, use_ctrl_flag, bool(args.resume), _dedupe_ser_dataframe
-    )
-
-    # ---------- 1) SER vs Nm ----------
-    print("\n1. Running SER vs. Nm sweep...")
-
-    # initial calibration (kept; thresholds hoisted per Nm in run_sweep)
-    if mode in ['CSK', 'Hybrid']:
-        print(f"\n📊 Initial calibration for {mode} mode...")
-        cal_seeds = list(range(10))
-        # store to disk so subsequent processes reuse quickly
-        initial_thresholds = calibrate_thresholds(cfg, cal_seeds, recalibrate=False, save_to_file=True, verbose=args.debug_calibration)
-        print("✅ Calibration complete")
-        _apply_thresholds_into_cfg(cfg, initial_thresholds)
-
-    df_ser_nm = run_sweep(
-        cfg, seeds,
-        'pipeline.Nm_per_symbol', nm_values,
-        f"SER vs Nm ({mode})",
-        progress_mode=args.progress,
-        persist_csv=ser_csv_branch,
-        resume=args.resume,
-        debug_calibration=args.debug_calibration,
-        pm=pm,                                # always share one PM
-        sweep_key=ser_key if hierarchy_supported else None,
-        parent_key=mode_key if hierarchy_supported else None,  # 🛠️ CHANGE: parent_key -> mode_key
-        recalibrate=args.recalibrate  # 🛠️ ADD THIS LINE
-    )
-    # advance the aggregate mode bar by however many jobs actually ran
-    if ser_bar: ser_bar.close()
-
-    # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
-    ser_branch_frames = [df_ser_nm] if not df_ser_nm.empty else []
-    branch_combined = _update_branch_csv(
-        "ser",
-        ser_csv_branch,
-        ser_branch_frames,
-        use_ctrl_flag,
-        _dedupe_ser_dataframe,
-        existing_ser_branch
-    )
-    if not args.ablation_parallel:
-        _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
-
-    if args.ablation_parallel:
-        print(f"✅ SER vs Nm results saved to {ser_results_path} (branch; canonical merge deferred)")
+    if not run_stage_ser:
+        print("[stage] Stage 1 (SER vs Nm + zero-noise) disabled via --run-stages; skipping.")
+        df_ser_nm = pd.DataFrame()
+        force_lod_analytic = args.lod_analytic_noise or args.analytic_noise_all
     else:
-        print(f"✅ SER vs Nm results saved to {ser_results_path}")
-    
-    # Manual parent update for non-GUI backends  
-    if not hierarchy_supported:
-        # For rich/tqdm, create simple overall progress tracker
-        if overall_manual is None:
-            overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
-        overall_manual.update(1, description=f"{mode} - SER vs Nm completed")
-
-    # --- Auto-refine near target SER (adds a few Nm points between the bracket) ---
-    if args.ser_refine:
-        try:
-            # Always read the latest CSV on disk so resume/de-dupe is consistent
-            df_ser_all = pd.read_csv(ser_results_path) if ser_results_path.exists() else df_ser_nm
-
-            # Propose midpoints between the first bracket that crosses the target
-            refine_candidates = _auto_refine_nm_points_from_df(
-                df_ser_all,
-                target=float(args.ser_target),
-                extra_points=int(args.ser_refine_points)
-            )
-
-            # Filter out any Nm that are already present for THIS CTRL state
-            if refine_candidates:
-                desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-                done = load_completed_values(ser_results_path, 'pipeline_Nm_per_symbol', desired_ctrl)
-                refine_candidates = [n for n in refine_candidates if canonical_value_key(n) not in done]
-
-            if refine_candidates:
-                print(f"🔎 SER auto-refine around {args.ser_target:.2%}: {refine_candidates}")
-
-                # Run only those extra Nm points and append to the same CSV (resume-safe)
-                ser_refine_key = ("sweep", mode, "SER_refine")
-                df_refined = run_sweep(
-                    cfg, seeds,
-                    'pipeline.Nm_per_symbol',
-                    [float(n) for n in refine_candidates],
-                    f"SER refine near {args.ser_target:.2%} ({mode})",
-                    progress_mode=args.progress,
-                    persist_csv=ser_csv_branch,
-                    resume=args.resume,
-                    debug_calibration=args.debug_calibration,
-                    pm=pm,
-                    sweep_key=ser_refine_key if (args.progress == "gui") else None,
-                    parent_key=mode_key if (args.progress == "gui") else None,
-                    recalibrate=args.recalibrate
-                )
-
-                # Re-de-dupe the CSV so plots read a clean file
-                _update_branch_csv(
-                    "ser",
-                    ser_csv_branch,
-                    [df_refined],
-                    use_ctrl_flag,
-                    _dedupe_ser_dataframe
-                )
-                if not args.ablation_parallel:
-                    _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
-                    print(f"✅ SER auto-refine appended; CSV updated: {ser_csv}")
-                else:
-                    print(f"✅ SER auto-refine appended; branch updated: {ser_csv_branch.name}")
-            else:
-                print(f"ℹ️  SER auto-refine: no bracket found or all refine Nm already present.")
-        except Exception as e:
-            print(f"⚠️  SER auto-refine failed: {e}")
-
-    if not df_ser_nm.empty:
-        nm_col_print = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df_ser_nm.columns else 'pipeline.Nm_per_symbol'
-        cols_to_show = [c for c in [nm_col_print, 'ser', 'snr_db', 'use_ctrl'] if c in df_ser_nm.columns]
-        print(f"\nSER vs Nm Results (head) for {mode}:")
-        print(df_ser_nm[cols_to_show].head().to_string(index=False))
-
-    # After the standard CSK SER vs Nm sweep finishes and nm_values are known:
-    if mode == "CSK" and (args.nt_pairs or ""):
-        run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
-
-    # Standalone zero-signal noise characterization (optional stage)
-    force_lod_analytic = args.lod_analytic_noise or args.analytic_noise_all
-
-    if args.analytic_noise_all:
-        print("??  Skipping zero-signal noise sweep: analytic noise forced.")
-    else:
-        run_zero_signal_noise_analysis(
-            cfg=cfg,
-            mode=mode,
-            args=args,
-            nm_values=nm_values,
-            lod_distance_grid=lod_distance_grid,
-            seeds=seeds,
-            data_dir=data_dir,
-            suffix=suffix,
-            pm=pm,
-            hierarchy_supported=hierarchy_supported,
-            mode_key=mode_key,
+        ser_csv, ser_csv_branch, ser_csv_other = _stage_csv_paths("ser", data_dir, mode, suffix, use_ctrl_flag)
+        ser_results_path = ser_csv if not args.ablation_parallel else ser_csv_branch
+        existing_ser_branch = _ensure_ablation_branch(
+            "ser", ser_csv, ser_csv_branch, use_ctrl_flag, bool(args.resume), _dedupe_ser_dataframe
         )
 
-    # ---------- 2) LoD vs Distance ----------
-    print('\n2. Building LoD vs distance curve.')
-    d_run = [int(x) for x in lod_distance_grid]
-    lod_csv, lod_csv_branch, lod_csv_other = _stage_csv_paths("lod", data_dir, mode, suffix, use_ctrl)
-    lod_results_path = lod_csv if not args.ablation_parallel else lod_csv_branch
-    if force_lod_analytic:
-        cfg['_force_analytic_noise'] = True
-    flush_staged_rows(lod_csv_branch)
-    pm.set_status(mode=mode, sweep="LoD vs distance")
-    # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
-    pool = global_pool.get_pool(max_workers=maxw)
-    use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
-    existing_lod_branch = _ensure_ablation_branch(
-        "lod", lod_csv, lod_csv_branch, use_ctrl, bool(args.resume), _dedupe_lod_dataframe
-    )
+        # ---------- 1) SER vs Nm ----------
+        print("\n1. Running SER vs. Nm sweep...")
 
-    estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5
+        # initial calibration (kept; thresholds hoisted per Nm in run_sweep)
+        if mode in ['CSK', 'Hybrid']:
+            print(f"\n📊 Initial calibration for {mode} mode...")
+            cal_seeds = list(range(10))
+            # store to disk so subsequent processes reuse quickly
+            initial_thresholds = calibrate_thresholds(cfg, cal_seeds, recalibrate=False, save_to_file=True, verbose=args.debug_calibration)
+            print("✅ Calibration complete")
+            _apply_thresholds_into_cfg(cfg, initial_thresholds)
 
-    # --- NEW: find fully-completed distances for this CTRL state ---
-    done_distances: set[int] = set()
-    failed_distances: set[int] = set()
+        df_ser_nm = run_sweep(
+            cfg, seeds,
+            'pipeline.Nm_per_symbol', nm_values,
+            f"SER vs Nm ({mode})",
+            progress_mode=args.progress,
+            persist_csv=ser_csv_branch,
+            resume=args.resume,
+            debug_calibration=args.debug_calibration,
+            pm=pm,                                # always share one PM
+            sweep_key=ser_key if hierarchy_supported else None,
+            parent_key=mode_key if hierarchy_supported else None,
+            recalibrate=args.recalibrate
+        )
+        # advance the aggregate mode bar by however many jobs actually ran
+        if ser_bar: ser_bar.close()
 
-    df_prev: Optional[pd.DataFrame] = None
-    if args.resume:
-        df_prev = existing_lod_branch.copy()
-        if df_prev.empty and lod_csv_branch.exists():
+        # --- Finalize SER CSV (de‑dupe by (Nm, use_ctrl)) to support ablation overlays ---
+        ser_branch_frames = [df_ser_nm] if not df_ser_nm.empty else []
+        branch_combined = _update_branch_csv(
+            "ser",
+            ser_csv_branch,
+            ser_branch_frames,
+            use_ctrl_flag,
+            _dedupe_ser_dataframe,
+            existing_ser_branch
+        )
+        if not args.ablation_parallel:
+            _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
+
+        if args.ablation_parallel:
+            print(f"✅ SER vs Nm results saved to {ser_results_path} (branch; canonical merge deferred)")
+        else:
+            print(f"✅ SER vs Nm results saved to {ser_results_path}")
+        
+        # Manual parent update for non-GUI backends  
+        if not hierarchy_supported:
+            # For rich/tqdm, create simple overall progress tracker
+            if overall_manual is None:
+                overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
+            overall_manual.update(1, description=f"{mode} - SER vs Nm completed")
+
+        # --- Auto-refine near target SER (adds a few Nm points between the bracket) ---
+        if args.ser_refine:
             try:
-                df_prev = pd.read_csv(lod_csv_branch)
-            except Exception as e:
-                print(f"⚠️  Could not read per-ablation LoD CSV ({e}); will fall back to canonical if available.")
-                df_prev = pd.DataFrame()
-        if df_prev.empty and lod_csv.exists():
-            try:
-                df_prev = pd.read_csv(lod_csv)
-                if 'use_ctrl' in df_prev.columns:
-                    df_prev = df_prev[df_prev['use_ctrl'] == use_ctrl]
-                df_prev = _dedupe_lod_dataframe(cast(pd.DataFrame, df_prev))
-            except Exception as e:
-                print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
-                df_prev = pd.DataFrame()
+                # Always read the latest CSV on disk so resume/de-dupe is consistent
+                df_ser_all = pd.read_csv(ser_results_path) if ser_results_path.exists() else df_ser_nm
 
-        if not df_prev.empty and {'lod_nm', 'distance_um'}.issubset(df_prev.columns):
-            for _, row in df_prev.iterrows():
-                dist = int(row['distance_um'])
-                lod_nm = row.get('lod_nm', np.nan)
+                # Propose midpoints between the first bracket that crosses the target
+                refine_candidates = _auto_refine_nm_points_from_df(
+                    df_ser_all,
+                    target=float(args.ser_target),
+                    extra_points=int(args.ser_refine_points)
+                )
 
-                # Check if this distance succeeded or failed
-                if pd.notna(lod_nm) and float(lod_nm) > 0:
-                    ser_ok = True
-                    if 'ser_at_lod' in df_prev.columns:
-                        ser = row.get('ser_at_lod', np.nan)
-                        if pd.notna(ser):
-                            ser_ok = float(ser) <= 0.01
-                    if ser_ok:
-                        done_distances.add(dist)
+                # Filter out any Nm that are already present for THIS CTRL state
+                if refine_candidates:
+                    desired_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+                    done = load_completed_values(ser_results_path, 'pipeline_Nm_per_symbol', desired_ctrl)
+                    refine_candidates = [n for n in refine_candidates if canonical_value_key(n) not in done]
+
+                if refine_candidates:
+                    print(f"🔎 SER auto-refine around {args.ser_target:.2%}: {refine_candidates}")
+
+                    # Run only those extra Nm points and append to the same CSV (resume-safe)
+                    ser_refine_key = ("sweep", mode, "SER_refine")
+                    df_refined = run_sweep(
+                        cfg, seeds,
+                        'pipeline.Nm_per_symbol',
+                        [float(n) for n in refine_candidates],
+                        f"SER refine near {args.ser_target:.2%} ({mode})",
+                        progress_mode=args.progress,
+                        persist_csv=ser_csv_branch,
+                        resume=args.resume,
+                        debug_calibration=args.debug_calibration,
+                        pm=pm,
+                        sweep_key=ser_refine_key if (args.progress == "gui") else None,
+                        parent_key=mode_key if (args.progress == "gui") else None,
+                        recalibrate=args.recalibrate
+                    )
+
+                    # Re-de-dupe the CSV so plots read a clean file
+                    _update_branch_csv(
+                        "ser",
+                        ser_csv_branch,
+                        [df_refined],
+                        use_ctrl_flag,
+                        _dedupe_ser_dataframe
+                    )
+                    if not args.ablation_parallel:
+                        _merge_branch_csv(ser_csv, [ser_csv_branch, ser_csv_other], _dedupe_ser_dataframe)
+                        print(f"✅ SER auto-refine appended; CSV updated: {ser_csv}")
+                    else:
+                        print(f"✅ SER auto-refine appended; branch updated: {ser_csv_branch.name}")
+                else:
+                    print(f"ℹ️  SER auto-refine: no bracket found or all refine Nm already present.")
+            except Exception as e:
+                print(f"⚠️  SER auto-refine failed: {e}")
+
+        if not df_ser_nm.empty:
+            nm_col_print = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in df_ser_nm.columns else 'pipeline.Nm_per_symbol'
+            cols_to_show = [c for c in [nm_col_print, 'ser', 'snr_db', 'use_ctrl'] if c in df_ser_nm.columns]
+            print(f"\nSER vs Nm Results (head) for {mode}:")
+            print(df_ser_nm[cols_to_show].head().to_string(index=False))
+
+        # After the standard CSK SER vs Nm sweep finishes and nm_values are known:
+        if mode == "CSK" and (args.nt_pairs or ""):
+            run_csk_nt_pair_sweeps(args, cfg, seeds, nm_values)
+
+        # Standalone zero-signal noise characterization (optional stage)
+        force_lod_analytic = args.lod_analytic_noise or args.analytic_noise_all
+
+        if args.analytic_noise_all:
+            print("??  Skipping zero-signal noise sweep: analytic noise forced.")
+        else:
+            run_zero_signal_noise_analysis(
+                cfg=cfg,
+                mode=mode,
+                args=args,
+                nm_values=nm_values,
+                lod_distance_grid=lod_distance_grid,
+                seeds=seeds,
+                data_dir=data_dir,
+                suffix=suffix,
+                pm=pm,
+                hierarchy_supported=hierarchy_supported,
+                mode_key=mode_key,
+            )
+
+    df_lod: pd.DataFrame = pd.DataFrame()
+    if not run_stage_lod:
+        print("[stage] Stage 2 (LoD/distance metrics/HDS) disabled via --run-stages; skipping.")
+    else:
+        # ---------- 2) LoD vs Distance ----------
+        print('\n2. Building LoD vs distance curve.')
+        d_run = [int(x) for x in lod_distance_grid]
+        lod_csv, lod_csv_branch, lod_csv_other = _stage_csv_paths("lod", data_dir, mode, suffix, use_ctrl)
+        lod_results_path = lod_csv if not args.ablation_parallel else lod_csv_branch
+        if force_lod_analytic:
+            cfg['_force_analytic_noise'] = True
+        flush_staged_rows(lod_csv_branch)
+        pm.set_status(mode=mode, sweep="LoD vs distance")
+        # Use the same worker count chosen at mode start (honors --extreme-mode/--max-workers)
+        pool = global_pool.get_pool(max_workers=maxw)
+        use_ctrl = bool(cfg['pipeline'].get('use_control_channel', True))
+        existing_lod_branch = _ensure_ablation_branch(
+            "lod", lod_csv, lod_csv_branch, use_ctrl, bool(args.resume), _dedupe_lod_dataframe
+        )
+
+        estimated_per_distance = args.num_seeds * 8 + args.num_seeds + 5
+
+        # --- NEW: find fully-completed distances for this CTRL state ---
+        done_distances: set[int] = set()
+        failed_distances: set[int] = set()
+
+        df_prev: Optional[pd.DataFrame] = None
+        if args.resume:
+            df_prev = existing_lod_branch.copy()
+            if df_prev.empty and lod_csv_branch.exists():
+                try:
+                    df_prev = pd.read_csv(lod_csv_branch)
+                except Exception as e:
+                    print(f"⚠️  Could not read per-ablation LoD CSV ({e}); will fall back to canonical if available.")
+                    df_prev = pd.DataFrame()
+            if df_prev.empty and lod_csv.exists():
+                try:
+                    df_prev = pd.read_csv(lod_csv)
+                    if 'use_ctrl' in df_prev.columns:
+                        df_prev = df_prev[df_prev['use_ctrl'] == use_ctrl]
+                    df_prev = _dedupe_lod_dataframe(cast(pd.DataFrame, df_prev))
+                except Exception as e:
+                    print(f"⚠️  Could not read existing LoD CSV ({e}); will recompute all distances")
+                    df_prev = pd.DataFrame()
+
+            if not df_prev.empty and {'lod_nm', 'distance_um'}.issubset(df_prev.columns):
+                for _, row in df_prev.iterrows():
+                    dist = int(row['distance_um'])
+                    lod_nm = row.get('lod_nm', np.nan)
+
+                    # Check if this distance succeeded or failed
+                    if pd.notna(lod_nm) and float(lod_nm) > 0:
+                        ser_ok = True
+                        if 'ser_at_lod' in df_prev.columns:
+                            ser = row.get('ser_at_lod', np.nan)
+                            if pd.notna(ser):
+                                ser_ok = float(ser) <= 0.01
+                        if ser_ok:
+                            done_distances.add(dist)
+                        else:
+                            failed_distances.add(dist)
                     else:
                         failed_distances.add(dist)
-                else:
-                    failed_distances.add(dist)
 
-            if done_distances:
-                print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
-                      f"{sorted(done_distances)} um")
-            if failed_distances:
-                print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
-                      f"{sorted(failed_distances)} um")
-            if failed_distances and args.lod_skip_retry:
-                print(f"🔄  --lod-skip-retry: accepting failures for {sorted(failed_distances)} um.")
-                done_distances.update(failed_distances)
-                failed_distances.clear()
-        elif args.resume and not df_prev.empty:
-            print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
+                if done_distances:
+                    print(f"↩️  Resume: {len(done_distances)} LoD distance(s) already complete: "
+                          f"{sorted(done_distances)} um")
+                if failed_distances:
+                    print(f"🔄  Resume: {len(failed_distances)} LoD distance(s) need retry: "
+                          f"{sorted(failed_distances)} um")
+                if failed_distances and args.lod_skip_retry:
+                    print(f"🔄  --lod-skip-retry: accepting failures for {sorted(failed_distances)} um.")
+                    done_distances.update(failed_distances)
+                    failed_distances.clear()
+            elif args.resume and not df_prev.empty:
+                print("ℹ️  Existing LoD CSV has no 'lod_nm' column; will recompute all distances.")
 
-    lod_history_points: List[Dict[str, Any]] = []
-    _extend_history_with_lod_rows(lod_history_points, existing_lod_branch)
-    _extend_history_with_lod_rows(lod_history_points, df_prev)
-    lod_history_points.extend(_load_lod_history_cache(mode, use_ctrl, suffix))
+        lod_history_points: List[Dict[str, Any]] = []
+        _extend_history_with_lod_rows(lod_history_points, existing_lod_branch)
+        _extend_history_with_lod_rows(lod_history_points, df_prev)
+        lod_history_points.extend(_load_lod_history_cache(mode, use_ctrl, suffix))
 
-    # Worklist excludes done distances
-    d_run_work = [int(d) for d in d_run if int(d) not in done_distances]
+        # Worklist excludes done distances
+        d_run_work = [int(d) for d in d_run if int(d) not in done_distances]
 
-    lod_jobs = len(d_run) * estimated_per_distance
-    lod_key = ("sweep", mode, "LoD")
-    if hierarchy_supported:
-        lod_bar = pm.task(total=lod_jobs, description="LoD vs distance",
-                          parent=mode_key, key=lod_key, kind="sweep")
-        # Keep the overall headline consistent with the true LoD total
-        if hasattr(pm, "update_total") and overall is not None:
-            pm.update_total(key=("overall", mode), total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
-                            label=f"Overall ({mode})", kind="overall")
-    else:
-        lod_bar = None
-    
-    # --- NEW: Setup multiprocessing-safe progress queues ---
-    mgr = mp.Manager()
-    progress_queues = {}
-    drainers = {}
-
-    def _start_drain_thread(dist, bar, q):
-        stop = threading.Event()
-        def _drain():
-            while not stop.is_set():
-                try:
-                    inc = q.get(timeout=0.25)
-                    if inc is None:
-                        break
-                    if bar is not None:
-                        bar.update(int(inc))
-                except pyqueue.Empty:
-                    pass
-        t = threading.Thread(target=_drain, daemon=True)
-        t.start()
-        return t, stop
-
-    # Create individual distance progress bars FIRST with accurate totals
-    distance_bars = {} # binary search + data-rate + sigma sampling
-    dist_totals = {}  # NEW: track actual totals
-
-    for d_um in d_run:
-        dist_progress_key = ("dist", mode, "LoD", float(d_um))
+        lod_jobs = len(d_run) * estimated_per_distance
+        lod_key = ("sweep", mode, "LoD")
         if hierarchy_supported:
-            dist_bar = pm.task(total=estimated_per_distance,
-                            description=f"LoD @ {float(d_um):.0f}μm",
-                            parent=lod_key, key=dist_progress_key, kind="dist")
+            lod_bar = pm.task(total=lod_jobs, description="LoD vs distance",
+                              parent=mode_key, key=lod_key, kind="sweep")
+            # Keep the overall headline consistent with the true LoD total
+            if hasattr(pm, "update_total") and overall is not None:
+                pm.update_total(key=("overall", mode), total=ser_jobs + lod_jobs + dist_jobs + isi_jobs,
+                                label=f"Overall ({mode})", kind="overall")
         else:
-            dist_bar = None
-        distance_bars[int(d_um)] = dist_bar
-        dist_totals[int(d_um)] = estimated_per_distance
+            lod_bar = None
+    
+        # --- NEW: Setup multiprocessing-safe progress queues ---
+        mgr = mp.Manager()
+        progress_queues = {}
+        drainers = {}
 
-        if int(d_um) in done_distances:
-            # Prefill 100% and close; also bubble progress to parents
-            if dist_bar:
-                dist_bar.update(estimated_per_distance)
-                dist_bar.close()
-            # No queue/drainer for completed distances
-            continue
-
-        # Not done yet: set up queue & drainer
-        q = mgr.Queue(maxsize=1000)
-        progress_queues[int(d_um)] = q
-        t, stop_evt = _start_drain_thread(int(d_um), dist_bar, q)
-        drainers[int(d_um)] = (t, stop_evt)
-
-    # --- NEW: Create per-worker progress bars ---
-    worker_bars = {}
-    if hierarchy_supported:
-        for wid in range(maxw):
-            worker_bars[wid] = pm.worker_task(
-                worker_id=wid, 
-                total=estimated_per_distance, 
-                label=f"Worker {wid:02d}",
-                parent=lod_key
-            )
-
-    def _choose_seeds_for_distance(distance_um: float, all_seeds: List[int], lod_num_seeds_arg: Optional[Union[int, str]]) -> List[int]:
-        """Auto-tune LoD search seed count based on distance."""
-        if lod_num_seeds_arg is None:
-            return all_seeds
-
-        # Parse schedule if it's a string
-        if isinstance(lod_num_seeds_arg, str):
-            if ',' in lod_num_seeds_arg:
-                try:
-                    # Format: "min,max" or "<=100:6,<=150:8,>150:10"
-                    if lod_num_seeds_arg.count(',') == 1 and all(x.isdigit() for x in lod_num_seeds_arg.split(',')):
-                        # Simple min,max format
-                        min_seeds, max_seeds = map(int, lod_num_seeds_arg.split(','))
-                        # Linear interpolation by distance
-                        ratio = min(1.0, max(0.0, (distance_um - 25) / (200 - 25)))  # 25-200μm range
-                        seed_count = int(min_seeds + ratio * (max_seeds - min_seeds))
-                        return all_seeds[:seed_count]
-                    else:
-                        # Rich schedule format: "<=100:6,<=150:8,>150:10"
-                        for rule in lod_num_seeds_arg.split(','):
-                            if ':' in rule:
-                                condition, count_str = rule.split(':')
-                                count = int(count_str)  # Ensure it's an integer
-                                if condition.startswith('<='):
-                                    threshold = float(condition[2:])
-                                    if distance_um <= threshold:
-                                        return all_seeds[:count]
-                                elif condition.startswith('>='):
-                                    threshold = float(condition[2:])
-                                    if distance_um >= threshold:
-                                        return all_seeds[:count]
-                                elif condition.startswith('>'):
-                                    threshold = float(condition[1:])
-                                    if distance_um > threshold:
-                                        return all_seeds[:count]
-                                elif condition.startswith('<'):
-                                    threshold = float(condition[1:])
-                                    if distance_um < threshold:
-                                        return all_seeds[:count]
-                        # Fallback if no rule matches
-                        return all_seeds[:8]
-                except Exception:
-                    # Parse error - fallback to simple integer
-                    return all_seeds[:8]
-            else:
-                # Single number as string
-                try:
-                    return all_seeds[:int(lod_num_seeds_arg)]
-                except Exception:
-                    return all_seeds
-        else:
-            # Integer argument
-            return all_seeds[:lod_num_seeds_arg]
-
-    # Submit distance jobs with continuous top-up for maximum worker utilization
-    pending: Set[Future] = set()
-    fut2dist: Dict[Future, int] = {}
-    fut2wid: Dict[Future, int] = {}
-    next_idx = 0
-    last_lod_guess: Optional[int] = None
-    default_batch = maxw  # fill the pool by default
-    batch_size = max(1, int(getattr(args, "lod_distance_concurrency", default_batch)))
-    lod_results: List[Dict[str, Any]] = []
-    tmo = float(getattr(args, "lod_distance_timeout_s", 7200.0))
-
-    # Ensure we only process distances that have progress queues
-    d_run_work_with_queues = [d for d in d_run_work if d in progress_queues]
-
-    target_ser = 0.01
-
-    def _submit_one(dist: int, wid_hint: int) -> None:
-        """Submit one distance job to the pool."""
-        wid = wid_hint % max(1, maxw)
-        if hasattr(pm, "worker_update"):
-            pm.worker_update(wid, f"LoD | d={dist} um")
-        q = progress_queues[dist]
-        seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
-        args.full_seeds = seeds
-
-        nm_min_cfg = int(cfg['pipeline'].get('lod_nm_min', 50))
-        nm_max_cfg = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
-        hist_guess, hist_bracket = _predict_lod_from_history(float(dist), lod_history_points,
-                                                             target_ser, nm_min_cfg, nm_max_cfg)
-
-        warm_guess: Optional[int] = None
-        warm_bracket: Optional[Tuple[int, int]] = None
-        if hist_guess is not None:
-            warm_guess = int(max(nm_min_cfg, min(nm_max_cfg, round(hist_guess))))
-            bracket = hist_bracket or _default_bracket_from_guess(hist_guess, float(dist), nm_min_cfg, nm_max_cfg)
-            warm_bracket = (int(bracket[0]), int(bracket[1]))
-            print(f"    [warm] {dist}μm history fit → Nm≈{warm_guess} bracket {warm_bracket[0]}-{warm_bracket[1]}")
-        elif last_lod_guess:
-            warm_guess = int(last_lod_guess)
-            warm_bracket = _default_bracket_from_guess(warm_guess, float(dist), nm_min_cfg, nm_max_cfg)
-
-        if warm_bracket is not None:
-            lb, ub = warm_bracket
-            lb = max(nm_min_cfg, int(lb))
-            ub = min(nm_max_cfg, int(ub))
-            if lb >= ub:
-                lb, ub = _default_bracket_from_guess(warm_guess or nm_min_cfg, float(dist), nm_min_cfg, nm_max_cfg)
-            warm_bracket = (int(lb), int(ub))
-
-        enable_analytic = bool(getattr(args, "analytic_lod_bracket", False))
-        if not enable_analytic and hist_bracket and canonical_mode in ("MoSK", "CSK"):
-            enable_analytic = True
-
-        fut = pool.submit(
-            process_distance_for_lod, float(dist), cfg, seeds_for_lod, target_ser,
-            args.debug_calibration, q, args.resume, args,
-            warm_lod_guess=warm_guess,
-            warm_bracket=warm_bracket,
-            force_analytic_bracket=enable_analytic
-        )
-        pending.add(fut)
-        fut2dist[fut] = dist
-        fut2wid[fut] = wid
-
-    # Prime the pool with initial batch
-    while next_idx < len(d_run_work_with_queues) and len(pending) < batch_size:
-        _submit_one(int(d_run_work_with_queues[next_idx]), next_idx)
-        next_idx += 1
-
-    # Drain with continuous top-up
-    while pending:
-        try:
-            done_fut = next(as_completed(pending, timeout=tmo if (tmo and tmo > 0) else None))
-        except TimeoutError:
-            print(f"⚠️  LoD timeout in top-up scheduler (timeout={tmo}s), continuing...")
-            continue
-
-        pending.remove(done_fut)
-        dist = fut2dist.pop(done_fut)
-        wid = fut2wid.pop(done_fut, 0)
-
-        # === Reuse existing result-processing body ===
-        res = {}  # Initialize to prevent unbound variable
-        try:
-            res = done_fut.result(timeout=1.0)  # Already completed, so short timeout
-            # Store actual progress for accurate parent counting  
-            res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
-            
-            # NEW: Update warm-start guess if we got a valid LoD (feeds next submissions)
-            if res and not pd.isna(res.get('lod_nm', np.nan)):
-                last_lod_guess = int(res['lod_nm'])
-            trace_entries = res.get('lod_trace', [])
-            normalized_trace = _normalize_lod_trace_entries(
-                float(res.get('distance_um', dist)),
-                trace_entries if isinstance(trace_entries, list) else [],
-                target_ser)
-            if normalized_trace:
-                lod_history_points.extend(normalized_trace)
-                _append_lod_history_cache(mode, use_ctrl, suffix, normalized_trace)
-            res.pop('lod_trace', None)
-        except TimeoutError:
-            print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout={tmo}s), skipping")
-            res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
-        except Exception as ex:
-            print(f"💥 Distance processing failed for {dist}μm: {ex}")
-            res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
-        finally:
-            # Mark this worker as idle
-            if hasattr(pm, "worker_update"):
-                pm.worker_update(wid, "idle")
-            # NEW: increment worker bar by the actual work performed for that distance
-            actual_total = res.get('actual_progress', estimated_per_distance)
-            if hierarchy_supported and wid in worker_bars:
-                # Update worker bar total to match actual work done
-                pm.update_total(key=("worker", wid), total=actual_total,
-                                label=f"Worker {wid:02d}", kind="worker", parent=None)
-                worker_bars[wid].update(actual_total)
-            # NEW: stop the per-distance drainer cleanly
-            try:
-                q_cleanup = progress_queues.get(dist)
-                if q_cleanup is not None:
+        def _start_drain_thread(dist, bar, q):
+            stop = threading.Event()
+            def _drain():
+                while not stop.is_set():
                     try:
-                        q_cleanup.put_nowait(None)  # sentinel for drainer
-                    except Exception:
+                        inc = q.get(timeout=0.25)
+                        if inc is None:
+                            break
+                        if bar is not None:
+                            bar.update(int(inc))
+                    except pyqueue.Empty:
                         pass
-                t, stop_evt = drainers.get(dist, (None, None))
-                if stop_evt is not None:
-                    stop_evt.set()
-            except Exception:
-                pass
+            t = threading.Thread(target=_drain, daemon=True)
+            t.start()
+            return t, stop
 
-        # Append atomically per distance (only if we have a real result)
-        if res and len(res.keys()) > 0:
-            append_row_atomic(lod_csv_branch, res, list(res.keys()))
-        
-        lod_results.append(res)
-        
-        if res and not pd.isna(res.get('lod_nm', np.nan)):
-            print(f"  [{len(lod_results)}/{len(d_run_work_with_queues)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
-        else:
-            print(f"  ⚠️  [{len(lod_results)}/{len(d_run_work_with_queues)}] {dist}μm failed")
-        
-        # Update distance bar with actual progress before closing
-        if dist in distance_bars:
-            bar = distance_bars[dist]
-            actual_total = res.get('actual_progress', estimated_per_distance)
-            
-            # Create the correct dist_key for this specific distance
-            current_dist_key = ("dist", mode, "LoD", float(dist))
-            if hierarchy_supported and bar and hasattr(pm, "update_total"):
-                pm.update_total(key=current_dist_key, total=actual_total,
-                                label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
-                
-                # NEW: remember actual total
-                dist_totals[dist] = actual_total
-                
-                # NEW: update the parent LoD row with sum of actual totals
-                if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
-                    new_lod_total = sum(dist_totals.values())
-                    pm.update_total(key=lod_key, total=new_lod_total,
-                                    label="LoD vs distance", kind="sweep", parent=mode_key)
-                    
-                    # Also update overall total to reflect actual work
-                    if overall_key:
-                        # Calculate difference between estimated and actual LoD work
-                        original_lod_estimate = len(d_run_work_with_queues) * estimated_per_distance
-                        actual_lod_total = new_lod_total
-                        lod_diff = actual_lod_total - original_lod_estimate
-                        
-                        # Update overall total if there's a significant difference
-                        if abs(lod_diff) > 0:
-                            new_overall_total = ser_jobs + actual_lod_total + isi_jobs
-                            pm.update_total(key=overall_key, total=new_overall_total,
-                                            label=f"Overall ({mode})", kind="overall")
-            
-            if bar:
-                remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
-                if remaining > 0:
-                    bar.update(remaining)
-                bar.close()
+        # Create individual distance progress bars FIRST with accurate totals
+        distance_bars = {} # binary search + data-rate + sigma sampling
+        dist_totals = {}  # NEW: track actual totals
 
-        # Top up with next distance if available
-        if next_idx < len(d_run_work_with_queues):
+        for d_um in d_run:
+            dist_progress_key = ("dist", mode, "LoD", float(d_um))
+            if hierarchy_supported:
+                dist_bar = pm.task(total=estimated_per_distance,
+                                description=f"LoD @ {float(d_um):.0f}μm",
+                                parent=lod_key, key=dist_progress_key, kind="dist")
+            else:
+                dist_bar = None
+            distance_bars[int(d_um)] = dist_bar
+            dist_totals[int(d_um)] = estimated_per_distance
+
+            if int(d_um) in done_distances:
+                # Prefill 100% and close; also bubble progress to parents
+                if dist_bar:
+                    dist_bar.update(estimated_per_distance)
+                    dist_bar.close()
+                # No queue/drainer for completed distances
+                continue
+
+            # Not done yet: set up queue & drainer
+            q = mgr.Queue(maxsize=1000)
+            progress_queues[int(d_um)] = q
+            t, stop_evt = _start_drain_thread(int(d_um), dist_bar, q)
+            drainers[int(d_um)] = (t, stop_evt)
+
+        # --- NEW: Create per-worker progress bars ---
+        worker_bars = {}
+        if hierarchy_supported:
+            for wid in range(maxw):
+                worker_bars[wid] = pm.worker_task(
+                    worker_id=wid, 
+                    total=estimated_per_distance, 
+                    label=f"Worker {wid:02d}",
+                    parent=lod_key
+                )
+
+        def _choose_seeds_for_distance(distance_um: float, all_seeds: List[int], lod_num_seeds_arg: Optional[Union[int, str]]) -> List[int]:
+            """Auto-tune LoD search seed count based on distance."""
+            if lod_num_seeds_arg is None:
+                return all_seeds
+
+            # Parse schedule if it's a string
+            if isinstance(lod_num_seeds_arg, str):
+                if ',' in lod_num_seeds_arg:
+                    try:
+                        # Format: "min,max" or "<=100:6,<=150:8,>150:10"
+                        if lod_num_seeds_arg.count(',') == 1 and all(x.isdigit() for x in lod_num_seeds_arg.split(',')):
+                            # Simple min,max format
+                            min_seeds, max_seeds = map(int, lod_num_seeds_arg.split(','))
+                            # Linear interpolation by distance
+                            ratio = min(1.0, max(0.0, (distance_um - 25) / (200 - 25)))  # 25-200μm range
+                            seed_count = int(min_seeds + ratio * (max_seeds - min_seeds))
+                            return all_seeds[:seed_count]
+                        else:
+                            # Rich schedule format: "<=100:6,<=150:8,>150:10"
+                            for rule in lod_num_seeds_arg.split(','):
+                                if ':' in rule:
+                                    condition, count_str = rule.split(':')
+                                    count = int(count_str)  # Ensure it's an integer
+                                    if condition.startswith('<='):
+                                        threshold = float(condition[2:])
+                                        if distance_um <= threshold:
+                                            return all_seeds[:count]
+                                    elif condition.startswith('>='):
+                                        threshold = float(condition[2:])
+                                        if distance_um >= threshold:
+                                            return all_seeds[:count]
+                                    elif condition.startswith('>'):
+                                        threshold = float(condition[1:])
+                                        if distance_um > threshold:
+                                            return all_seeds[:count]
+                                    elif condition.startswith('<'):
+                                        threshold = float(condition[1:])
+                                        if distance_um < threshold:
+                                            return all_seeds[:count]
+                            # Fallback if no rule matches
+                            return all_seeds[:8]
+                    except Exception:
+                        # Parse error - fallback to simple integer
+                        return all_seeds[:8]
+                else:
+                    # Single number as string
+                    try:
+                        return all_seeds[:int(lod_num_seeds_arg)]
+                    except Exception:
+                        return all_seeds
+            else:
+                # Integer argument
+                return all_seeds[:lod_num_seeds_arg]
+
+        # Submit distance jobs with continuous top-up for maximum worker utilization
+        pending: Set[Future] = set()
+        fut2dist: Dict[Future, int] = {}
+        fut2wid: Dict[Future, int] = {}
+        next_idx = 0
+        last_lod_guess: Optional[int] = None
+        default_batch = maxw  # fill the pool by default
+        batch_size = max(1, int(getattr(args, "lod_distance_concurrency", default_batch)))
+        lod_results: List[Dict[str, Any]] = []
+        tmo = float(getattr(args, "lod_distance_timeout_s", 7200.0))
+
+        # Ensure we only process distances that have progress queues
+        d_run_work_with_queues = [d for d in d_run_work if d in progress_queues]
+
+        target_ser = 0.01
+
+        def _submit_one(dist: int, wid_hint: int) -> None:
+            """Submit one distance job to the pool."""
+            wid = wid_hint % max(1, maxw)
+            if hasattr(pm, "worker_update"):
+                pm.worker_update(wid, f"LoD | d={dist} um")
+            q = progress_queues[dist]
+            seeds_for_lod = _choose_seeds_for_distance(float(dist), seeds, args.lod_num_seeds)
+            args.full_seeds = seeds
+
+            nm_min_cfg = int(cfg['pipeline'].get('lod_nm_min', 50))
+            nm_max_cfg = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
+            hist_guess, hist_bracket = _predict_lod_from_history(float(dist), lod_history_points,
+                                                                 target_ser, nm_min_cfg, nm_max_cfg)
+
+            warm_guess: Optional[int] = None
+            warm_bracket: Optional[Tuple[int, int]] = None
+            if hist_guess is not None:
+                warm_guess = int(max(nm_min_cfg, min(nm_max_cfg, round(hist_guess))))
+                bracket = hist_bracket or _default_bracket_from_guess(hist_guess, float(dist), nm_min_cfg, nm_max_cfg)
+                warm_bracket = (int(bracket[0]), int(bracket[1]))
+                print(f"    [warm] {dist}μm history fit → Nm≈{warm_guess} bracket {warm_bracket[0]}-{warm_bracket[1]}")
+            elif last_lod_guess:
+                warm_guess = int(last_lod_guess)
+                warm_bracket = _default_bracket_from_guess(warm_guess, float(dist), nm_min_cfg, nm_max_cfg)
+
+            if warm_bracket is not None:
+                lb, ub = warm_bracket
+                lb = max(nm_min_cfg, int(lb))
+                ub = min(nm_max_cfg, int(ub))
+                if lb >= ub:
+                    lb, ub = _default_bracket_from_guess(warm_guess or nm_min_cfg, float(dist), nm_min_cfg, nm_max_cfg)
+                warm_bracket = (int(lb), int(ub))
+
+            enable_analytic = bool(getattr(args, "analytic_lod_bracket", False))
+            if not enable_analytic and hist_bracket and canonical_mode in ("MoSK", "CSK"):
+                enable_analytic = True
+
+            fut = pool.submit(
+                process_distance_for_lod, float(dist), cfg, seeds_for_lod, target_ser,
+                args.debug_calibration, q, args.resume, args,
+                warm_lod_guess=warm_guess,
+                warm_bracket=warm_bracket,
+                force_analytic_bracket=enable_analytic
+            )
+            pending.add(fut)
+            fut2dist[fut] = dist
+            fut2wid[fut] = wid
+
+        # Prime the pool with initial batch
+        while next_idx < len(d_run_work_with_queues) and len(pending) < batch_size:
             _submit_one(int(d_run_work_with_queues[next_idx]), next_idx)
             next_idx += 1
 
-    # Close remaining distance bars and stop any drainers just in case
-    for bar in distance_bars.values():
-        if bar:
-            bar.close()
-    for dist, (t, stop_evt) in drainers.items():
-        try:
-            if stop_evt is not None:
-                stop_evt.set()
-            cleanup_queue: Optional[Any] = progress_queues.get(dist)
-            if cleanup_queue is not None:
-                cleanup_queue.put_nowait(None)
-        except Exception:
-            pass
+        # Drain with continuous top-up
+        while pending:
+            try:
+                done_fut = next(as_completed(pending, timeout=tmo if (tmo and tmo > 0) else None))
+            except TimeoutError:
+                print(f"⚠️  LoD timeout in top-up scheduler (timeout={tmo}s), continuing...")
+                continue
 
-    # NEW: Close worker bars
-    if hierarchy_supported:
-        for bar in worker_bars.values():
+            pending.remove(done_fut)
+            dist = fut2dist.pop(done_fut)
+            wid = fut2wid.pop(done_fut, 0)
+
+            # === Reuse existing result-processing body ===
+            res = {}  # Initialize to prevent unbound variable
+            try:
+                res = done_fut.result(timeout=1.0)  # Already completed, so short timeout
+                # Store actual progress for accurate parent counting  
+                res['actual_progress'] = res.get('actual_progress', estimated_per_distance)
+            
+                # NEW: Update warm-start guess if we got a valid LoD (feeds next submissions)
+                if res and not pd.isna(res.get('lod_nm', np.nan)):
+                    last_lod_guess = int(res['lod_nm'])
+                trace_entries = res.get('lod_trace', [])
+                normalized_trace = _normalize_lod_trace_entries(
+                    float(res.get('distance_um', dist)),
+                    trace_entries if isinstance(trace_entries, list) else [],
+                    target_ser)
+                if normalized_trace:
+                    lod_history_points.extend(normalized_trace)
+                    _append_lod_history_cache(mode, use_ctrl, suffix, normalized_trace)
+                res.pop('lod_trace', None)
+            except TimeoutError:
+                print(f"⚠️  LoD timeout at {dist}μm (mode={mode}, use_ctrl={use_ctrl}, timeout={tmo}s), skipping")
+                res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
+            except Exception as ex:
+                print(f"💥 Distance processing failed for {dist}μm: {ex}")
+                res = {'distance_um': dist, 'lod_nm': float('nan'), 'ser_at_lod': float('nan')}
+            finally:
+                # Mark this worker as idle
+                if hasattr(pm, "worker_update"):
+                    pm.worker_update(wid, "idle")
+                # NEW: increment worker bar by the actual work performed for that distance
+                actual_total = res.get('actual_progress', estimated_per_distance)
+                if hierarchy_supported and wid in worker_bars:
+                    # Update worker bar total to match actual work done
+                    pm.update_total(key=("worker", wid), total=actual_total,
+                                    label=f"Worker {wid:02d}", kind="worker", parent=None)
+                    worker_bars[wid].update(actual_total)
+                # NEW: stop the per-distance drainer cleanly
+                try:
+                    q_cleanup = progress_queues.get(dist)
+                    if q_cleanup is not None:
+                        try:
+                            q_cleanup.put_nowait(None)  # sentinel for drainer
+                        except Exception:
+                            pass
+                    t, stop_evt = drainers.get(dist, (None, None))
+                    if stop_evt is not None:
+                        stop_evt.set()
+                except Exception:
+                    pass
+
+            # Append atomically per distance (only if we have a real result)
+            if res and len(res.keys()) > 0:
+                append_row_atomic(lod_csv_branch, res, list(res.keys()))
+        
+            lod_results.append(res)
+        
+            if res and not pd.isna(res.get('lod_nm', np.nan)):
+                print(f"  [{len(lod_results)}/{len(d_run_work_with_queues)}] {dist}μm done: LoD={res['lod_nm']:.0f} molecules")
+            else:
+                print(f"  ⚠️  [{len(lod_results)}/{len(d_run_work_with_queues)}] {dist}μm failed")
+        
+            # Update distance bar with actual progress before closing
+            if dist in distance_bars:
+                bar = distance_bars[dist]
+                actual_total = res.get('actual_progress', estimated_per_distance)
+            
+                # Create the correct dist_key for this specific distance
+                current_dist_key = ("dist", mode, "LoD", float(dist))
+                if hierarchy_supported and bar and hasattr(pm, "update_total"):
+                    pm.update_total(key=current_dist_key, total=actual_total,
+                                    label=f"LoD @ {dist:.0f}μm", kind="dist", parent=lod_key)
+                
+                    # NEW: remember actual total
+                    dist_totals[dist] = actual_total
+                
+                    # NEW: update the parent LoD row with sum of actual totals
+                    if hierarchy_supported and lod_bar and hasattr(pm, "update_total"):
+                        new_lod_total = sum(dist_totals.values())
+                        pm.update_total(key=lod_key, total=new_lod_total,
+                                        label="LoD vs distance", kind="sweep", parent=mode_key)
+                    
+                        # Also update overall total to reflect actual work
+                        if overall_key:
+                            # Calculate difference between estimated and actual LoD work
+                            original_lod_estimate = len(d_run_work_with_queues) * estimated_per_distance
+                            actual_lod_total = new_lod_total
+                            lod_diff = actual_lod_total - original_lod_estimate
+                        
+                            # Update overall total if there's a significant difference
+                            if abs(lod_diff) > 0:
+                                new_overall_total = ser_jobs + actual_lod_total + isi_jobs
+                                pm.update_total(key=overall_key, total=new_overall_total,
+                                                label=f"Overall ({mode})", kind="overall")
+            
+                if bar:
+                    remaining = max(0, actual_total - int(getattr(bar, "completed", 0)))
+                    if remaining > 0:
+                        bar.update(remaining)
+                    bar.close()
+
+            # Top up with next distance if available
+            if next_idx < len(d_run_work_with_queues):
+                _submit_one(int(d_run_work_with_queues[next_idx]), next_idx)
+                next_idx += 1
+
+        # Close remaining distance bars and stop any drainers just in case
+        for bar in distance_bars.values():
             if bar:
                 bar.close()
+        for dist, (t, stop_evt) in drainers.items():
+            try:
+                if stop_evt is not None:
+                    stop_evt.set()
+                cleanup_queue: Optional[Any] = progress_queues.get(dist)
+                if cleanup_queue is not None:
+                    cleanup_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        # NEW: Close worker bars
+        if hierarchy_supported:
+            for bar in worker_bars.values():
+                if bar:
+                    bar.close()
     
-    # NEW: Clean up the multiprocessing manager
-    try:
-        mgr.shutdown()
-    except Exception:
-        pass
-    # DO NOT stop pm here; continue to ISI sweep
+        # NEW: Clean up the multiprocessing manager
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
+        # DO NOT stop pm here; continue to ISI sweep
 
-    # Filter out empty LoD results to prevent DataFrame errors
-    real_lod_results = [r for r in lod_results if isinstance(r, dict) and 'distance_um' in r and not pd.isna(r.get('distance_um', np.nan))]
-    # More precise failed distance detection for NaN LoDs
-    failed_distances = set(sorted(
-        int(r['distance_um'])
-        for r in lod_results
-        if (isinstance(r, dict) and 'distance_um' in r and 
-            (('lod_nm' not in r) or pd.isna(r.get('lod_nm'))))
-    ))
+        # Filter out empty LoD results to prevent DataFrame errors
+        real_lod_results = [r for r in lod_results if isinstance(r, dict) and 'distance_um' in r and not pd.isna(r.get('distance_um', np.nan))]
+        # More precise failed distance detection for NaN LoDs
+        failed_distances = set(sorted(
+            int(r['distance_um'])
+            for r in lod_results
+            if (isinstance(r, dict) and 'distance_um' in r and 
+                (('lod_nm' not in r) or pd.isna(r.get('lod_nm'))))
+        ))
 
-    if failed_distances:
-        print(f"⚠️  No LoD found at distances: {failed_distances} um")
+        if failed_distances:
+            print(f"⚠️  No LoD found at distances: {failed_distances} um")
 
-    # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
-    df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
+        # Build DataFrame of newly computed LoD rows (may be empty if resume skipped everything)
+        df_lod_new = pd.DataFrame(real_lod_results) if real_lod_results else pd.DataFrame()
 
-    flush_staged_rows(lod_csv_branch)
-    lod_branch_combined = _update_branch_csv(
-        "lod",
-        lod_csv_branch,
-        [df_lod_new],
-        use_ctrl,
-        _dedupe_lod_dataframe,
-        existing_lod_branch
-    )
-    if not args.ablation_parallel:
-        _merge_branch_csv(lod_csv, [lod_csv_branch, lod_csv_other], _dedupe_lod_dataframe)
-    cfg.pop('_force_analytic_noise', None)
-
-    try:
-        df_lod_merged = pd.read_csv(lod_results_path) if lod_results_path.exists() else pd.DataFrame()
-    except Exception:
-        df_lod_merged = pd.DataFrame()
-
-    df_lod = lod_branch_combined if not lod_branch_combined.empty else pd.DataFrame()
-
-    merged_points = len(df_lod_merged) if not df_lod_merged.empty else 0
-    if not df_lod.empty:
-        if merged_points:
-            if args.ablation_parallel:
-                merged_note = f"; branch total {merged_points}"
-            else:
-                merged_note = f"; merged total {merged_points}"
-        else:
-            merged_note = ""
-        target_label = "branch" if args.ablation_parallel else "canonical"
-        print(f"\n✅ LoD vs distance saved to {lod_results_path} ({len(df_lod)} points{merged_note}; {target_label} {lod_results_path.name})")
-    else:
-        print(f"\n⚠️  No valid LoD data to save for use_ctrl={use_ctrl}")
-    
-    # Manual parent update for non-GUI backends
-    if not hierarchy_supported:
-        if overall_manual is None:
-            overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
-        overall_manual.update(1, description=f"{mode} - LoD vs Distance completed")
-
-    # Around line 3889 in run_final_analysis.py
-    if not df_lod.empty:
-        cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
-        print(f"\nLoD vs Distance (head) for {mode}:")
-        print(df_lod[cols_to_show].head().to_string(index=False))
-
-    if do_distance_metrics:
-        df_distance_metrics = _run_distance_metric_sweep(
-            cfg,
-            seeds,
-            mode,
-            lod_distance_grid,
-            data_dir,
-            suffix,
-            df_lod,
-            args,
-            pm,
-            use_ctrl_flag,
-            hierarchy_supported,
-            mode_key,
-            dist_key,
+        flush_staged_rows(lod_csv_branch)
+        lod_branch_combined = _update_branch_csv(
+            "lod",
+            lod_csv_branch,
+            [df_lod_new],
+            use_ctrl,
+            _dedupe_lod_dataframe,
+            existing_lod_branch
         )
-        if dist_bar:
-            dist_bar.close()
+        if not args.ablation_parallel:
+            _merge_branch_csv(lod_csv, [lod_csv_branch, lod_csv_other], _dedupe_lod_dataframe)
+        cfg.pop('_force_analytic_noise', None)
+
+        try:
+            df_lod_merged = pd.read_csv(lod_results_path) if lod_results_path.exists() else pd.DataFrame()
+        except Exception:
+            df_lod_merged = pd.DataFrame()
+
+        df_lod = lod_branch_combined if not lod_branch_combined.empty else pd.DataFrame()
+
+        merged_points = len(df_lod_merged) if not df_lod_merged.empty else 0
+        if not df_lod.empty:
+            if merged_points:
+                if args.ablation_parallel:
+                    merged_note = f"; branch total {merged_points}"
+                else:
+                    merged_note = f"; merged total {merged_points}"
+            else:
+                merged_note = ""
+            target_label = "branch" if args.ablation_parallel else "canonical"
+            print(f"\n✅ LoD vs distance saved to {lod_results_path} ({len(df_lod)} points{merged_note}; {target_label} {lod_results_path.name})")
+        else:
+            print(f"\n⚠️  No valid LoD data to save for use_ctrl={use_ctrl}")
+    
+        # Manual parent update for non-GUI backends
         if not hierarchy_supported:
             if overall_manual is None:
                 overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
-            overall_manual.update(1, description=f"{mode} - SER/SNR vs Distance completed")
-    else:
-        if distance_policy == "never":
-            print("\n2.5. SER/SNR vs distance sweep skipped (--distance-sweep=never).")
-        elif not lod_distance_grid:
-            print("\n2.5. SER/SNR vs distance sweep skipped: no distance grid available.")
+            overall_manual.update(1, description=f"{mode} - LoD vs Distance completed")
 
-    if mode == "Hybrid":
-        print("\n2′. Updating Hybrid HDS grid (Nm × distance)…")
-        grid_csv = data_dir / "hybrid_hds_grid.csv"
+        # Around line 3889 in run_final_analysis.py
+        if not df_lod.empty:
+            cols_to_show = [c for c in ['distance_um', 'lod_nm', 'ser_at_lod', 'use_ctrl'] if c in df_lod.columns]
+            print(f"\nLoD vs Distance (head) for {mode}:")
+            print(df_lod[cols_to_show].head().to_string(index=False))
 
-        hds_distances = [int(float(d)) for d in lod_distance_grid] or [25, 50, 100, 150, 200]
-        nm_min_default = int(cfg['pipeline'].get('lod_nm_min', 50))
-        nm_max_default = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
-        default_nm_list: Sequence[Union[int, float]] = nm_values if nm_values else [500, 1000, 1600, 2500, 4000, 6300, 10000]
-
-        cfg_hds_base = deepcopy(cfg)
-        lod_by_distance: Dict[int, Dict[str, Any]] = {}
-        for entry in lod_results:
-            if not isinstance(entry, dict):
-                continue
-            dist_val = entry.get('distance_um')
-            if dist_val is None:
-                continue
-            try:
-                dist_int = int(float(dist_val))
-            except Exception:
-                continue
-            lod_by_distance[dist_int] = entry
-
-        hds_pending: Set[Future] = set()
-        hds_futures: Dict[Future, int] = {}
-        hds_rows: List[pd.DataFrame] = []
-
-        for dist in sorted(set(hds_distances)):
-            lod_state = _lod_state_load(mode, float(dist), bool(cfg['pipeline'].get('use_control_channel', True)))
-            lod_entry = lod_by_distance.get(dist)
-            nm_candidates = _derive_hds_nm_values(lod_entry, lod_state, default_nm_list, nm_min_default, nm_max_default)
-            if not nm_candidates:
-                continue
-
-            future = pool.submit(
-                _compute_hds_distance,
-                float(dist),
-                cfg_hds_base,
-                nm_candidates,
+        if do_distance_metrics:
+            df_distance_metrics = _run_distance_metric_sweep(
+                cfg,
                 seeds,
-                args.progress,
-                args.resume,
-                args.debug_calibration,
-                # Use the same per-distance cache tag as LoD so Hybrid seeds fall back cleanly
-                # into the warmed state without fragmenting cache directories.
-                f"d{dist}um"
+                mode,
+                lod_distance_grid,
+                data_dir,
+                suffix,
+                df_lod,
+                args,
+                pm,
+                use_ctrl_flag,
+                hierarchy_supported,
+                mode_key,
+                dist_key,
             )
-            hds_pending.add(future)
-            hds_futures[future] = dist
-
-        for done_future in as_completed(list(hds_pending)):
-            dist = hds_futures.pop(done_future, -1)
-            if dist == -1:
-                continue
-            try:
-                df_result = done_future.result()
-            except Exception as hds_exc:
-                print(f"⚠️  HDS grid failed at distance {dist}: {hds_exc}")
-                continue
-            if isinstance(df_result, pd.DataFrame) and not df_result.empty:
-                hds_rows.append(df_result)
-        hds_pending.clear()
-
-        if hds_rows:
-            grid = pd.concat(hds_rows, ignore_index=True)
-            nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
-            subset_cols = ['distance_um', nm_key]
-            if 'use_ctrl' in grid.columns:
-                subset_cols.append('use_ctrl')
-            grid = grid.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
-            _atomic_write_csv(grid_csv, grid)
-            print(f"✅ HDS grid saved to {grid_csv} ({len(grid)} rows)")
+            if dist_bar:
+                dist_bar.close()
+            if not hierarchy_supported:
+                if overall_manual is None:
+                    overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
+                overall_manual.update(1, description=f"{mode} - SER/SNR vs Distance completed")
         else:
-            print("⚠️ HDS grid: no rows produced (skipping update).")
+            if distance_policy == "never":
+                print("\n2.5. SER/SNR vs distance sweep skipped (--distance-sweep=never).")
+            elif not lod_distance_grid:
+                print("\n2.5. SER/SNR vs distance sweep skipped: no distance grid available.")
 
-    try:
-        _run_device_fom_sweeps(
-            cfg,
-            seeds,
-            mode,
-            data_dir,
-            suffix,
-            df_lod,
-            args.resume,
-            args,
-            pm=pm,
-            mode_key=mode_key if hierarchy_supported else None,
-        )
-    except Exception as device_exc:
-        print(f"??  Device FoM sweep skipped: {device_exc}")
-    # ---------- 3) ISI trade-off (guard-factor sweep) ----------
-    if do_isi:
-        print("\n3. Running ISI trade-off sweep (guard factor)…")
+        if mode == "Hybrid":
+            print("\n2′. Updating Hybrid HDS grid (Nm × distance)…")
+            grid_csv = data_dir / "hybrid_hds_grid.csv"
+
+            hds_distances = [int(float(d)) for d in lod_distance_grid] or [25, 50, 100, 150, 200]
+            nm_min_default = int(cfg['pipeline'].get('lod_nm_min', 50))
+            nm_max_default = int(cfg.get('pipeline', {}).get('lod_nm_max', cfg.get('lod_max_nm', 1000000)))
+            default_nm_list: Sequence[Union[int, float]] = nm_values if nm_values else [500, 1000, 1600, 2500, 4000, 6300, 10000]
+
+            cfg_hds_base = deepcopy(cfg)
+            lod_by_distance: Dict[int, Dict[str, Any]] = {}
+            for entry in lod_results:
+                if not isinstance(entry, dict):
+                    continue
+                dist_val = entry.get('distance_um')
+                if dist_val is None:
+                    continue
+                try:
+                    dist_int = int(float(dist_val))
+                except Exception:
+                    continue
+                lod_by_distance[dist_int] = entry
+
+            hds_pending: Set[Future] = set()
+            hds_futures: Dict[Future, int] = {}
+            hds_rows: List[pd.DataFrame] = []
+
+            for dist in sorted(set(hds_distances)):
+                lod_state = _lod_state_load(mode, float(dist), bool(cfg['pipeline'].get('use_control_channel', True)))
+                lod_entry = lod_by_distance.get(dist)
+                nm_candidates = _derive_hds_nm_values(lod_entry, lod_state, default_nm_list, nm_min_default, nm_max_default)
+                if not nm_candidates:
+                    continue
+
+                future = pool.submit(
+                    _compute_hds_distance,
+                    float(dist),
+                    cfg_hds_base,
+                    nm_candidates,
+                    seeds,
+                    args.progress,
+                    args.resume,
+                    args.debug_calibration,
+                    # Use the same per-distance cache tag as LoD so Hybrid seeds fall back cleanly
+                    # into the warmed state without fragmenting cache directories.
+                    f"d{dist}um"
+                )
+                hds_pending.add(future)
+                hds_futures[future] = dist
+
+            for done_future in as_completed(list(hds_pending)):
+                dist = hds_futures.pop(done_future, -1)
+                if dist == -1:
+                    continue
+                try:
+                    df_result = done_future.result()
+                except Exception as hds_exc:
+                    print(f"⚠️  HDS grid failed at distance {dist}: {hds_exc}")
+                    continue
+                if isinstance(df_result, pd.DataFrame) and not df_result.empty:
+                    hds_rows.append(df_result)
+            hds_pending.clear()
+
+            if hds_rows:
+                grid = pd.concat(hds_rows, ignore_index=True)
+                nm_key = 'pipeline_Nm_per_symbol' if 'pipeline_Nm_per_symbol' in grid.columns else 'pipeline.Nm_per_symbol'
+                subset_cols = ['distance_um', nm_key]
+                if 'use_ctrl' in grid.columns:
+                    subset_cols.append('use_ctrl')
+                grid = grid.drop_duplicates(subset=subset_cols, keep='last').sort_values(subset_cols)
+                _atomic_write_csv(grid_csv, grid)
+                print(f"✅ HDS grid saved to {grid_csv} ({len(grid)} rows)")
+            else:
+                print("⚠️ HDS grid: no rows produced (skipping update).")
+
+    if not run_stage_device:
+        print("[stage] Stage 3 (Device FoM sweeps) disabled via --run-stages; skipping.")
+    else:
+        try:
+            _run_device_fom_sweeps(
+                cfg,
+                seeds,
+                mode,
+                data_dir,
+                suffix,
+                df_lod,
+                args.resume,
+                args,
+                pm=pm,
+                mode_key=mode_key if hierarchy_supported else None,
+                device_key=device_key if hierarchy_supported else None,
+                device_bar=device_bar if hierarchy_supported else None,
+            )
+        except Exception as device_exc:
+            print(f"??  Device FoM sweep skipped: {device_exc}")
+        if hierarchy_supported and 'device_bar' in locals() and device_bar is not None:
+            try:
+                device_bar.close()
+            except Exception:
+                pass
+        if not hierarchy_supported:
+            if overall_manual is None:
+                overall_manual = pm.task(total=manual_total, description=f"{mode} Progress")
+            overall_manual.update(1, description=f"{mode} - Device FoM completed")
+
+    if not run_stage_guard:
+        print("[stage] Stage 4 (ISI trade-off / guard frontier) disabled via --run-stages; skipping.")
+    else:
+        # ---------- 3) ISI trade-off (guard-factor sweep) ----------
+        if do_isi:
+            print("\n3. Running ISI trade-off sweep (guard factor)…")
         
         # --- pick an anchor for ISI sweep (after LoD) ---
         d_ref = None
@@ -9725,25 +10020,25 @@ def run_one_mode(args: argparse.Namespace, mode: str) -> None:
                 )
             else:
                 print(f"✓ ISI grid exists: {isi_grid_csv}")
-    else:
-        print(f"\n3. ISI trade-off sweep skipped by --isi-sweep={args.isi_sweep}.")
+        else:
+            print(f"\n3. ISI trade-off sweep skipped by --isi-sweep={args.isi_sweep}.")
 
-    try:
-        _run_guard_frontier(
-            cfg,
-            seeds,
-            mode,
-            data_dir,
-            suffix,
-            df_lod,
-            [float(d) for d in lod_distance_grid],
-            [float(g) for g in guard_values],
-            args,
-            pm=pm,
-            mode_key=mode_key if hierarchy_supported else None,
-        )
-    except Exception as guard_exc:
-        print(f"??  Guard frontier sweep skipped: {guard_exc}")
+        try:
+            _run_guard_frontier(
+                cfg,
+                seeds,
+                mode,
+                data_dir,
+                suffix,
+                df_lod,
+                [float(d) for d in lod_distance_grid],
+                [float(g) for g in guard_values],
+                args,
+                pm=pm,
+                mode_key=mode_key if hierarchy_supported else None,
+            )
+        except Exception as guard_exc:
+            print(f"??  Guard frontier sweep skipped: {guard_exc}")
     elapsed = time.time() - start_time
     print(f"\n{'='*60}\n✅ ANALYSIS COMPLETE ({mode})")
     print(f"   Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
@@ -9767,6 +10062,9 @@ def main() -> None:
         if not maintenance_performed:
             print("Maintenance-only flag provided but no maintenance actions were executed.")
         return
+    if not getattr(args, "_run_stage_set", set(_RUN_FINAL_STAGE_IDS)):
+        print("⚠️  No runnable stages selected; exiting.")
+        return
 
     global LOD_DEBUG_ENABLED
     if getattr(args, "lod_debug", False):
@@ -9779,7 +10077,9 @@ def main() -> None:
         LOD_DEBUG_ENABLED = False
     
     if args.merge_ablation_csvs:
-        if args.mode and args.mode != "ALL":
+        if getattr(args, "_modes_list", None):
+            merge_modes = list(args._modes_list)
+        elif args.mode and args.mode != "ALL":
             merge_modes = [args.mode]
         elif args.modes:
             merge_modes = ["MoSK", "CSK", "Hybrid"] if str(args.modes).lower() == "all" else [args.modes]
@@ -9799,12 +10099,30 @@ def main() -> None:
         print("⚠️  macOS Tkinter limitation → falling back to 'rich'.")
         args.progress = "rich"
     
-    # Setup logging with the tee approach
+    # Setup logging with a CTRL/mode-aware prefix to avoid collisions when ablations run in parallel
     if not args.no_log:
-        setup_tee_logging(Path(args.logdir), prefix="run_final_analysis", fsync=args.fsync_logs)
+        ctrl_tag = "wctrl" if args.use_ctrl else "noctrl"
+        mode_tokens: List[str] = []
+        if getattr(args, "_modes_list", None):
+            mode_tokens = [_canonical_mode_name(m).lower() for m in args._modes_list]
+        elif args.mode:
+            if args.mode == "ALL":
+                mode_tokens = ["all"]
+            else:
+                mode_tokens = [_canonical_mode_name(args.mode).lower()]
+        stage_set = getattr(args, "_run_stage_set", set(_RUN_FINAL_STAGE_IDS)) or set(_RUN_FINAL_STAGE_IDS)
+        stage_tag = ""
+        if stage_set and stage_set != set(_RUN_FINAL_STAGE_IDS):
+            stage_tag = "_s" + "-".join(str(s) for s in sorted(stage_set))
+        mode_tag = "_" + "-".join(mode_tokens) if mode_tokens else ""
+        log_prefix = f"run_final_analysis{mode_tag}_{ctrl_tag}{stage_tag}"
+        setup_tee_logging(Path(args.logdir), prefix=log_prefix, fsync=args.fsync_logs)
     
     # Determine which modes to run
-    modes = (["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode])
+    if getattr(args, "_modes_list", None):
+        modes = list(args._modes_list)
+    else:
+        modes = (["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode])
     
     # Initialize sleep inhibition context
     ctx = None
@@ -9816,18 +10134,51 @@ def main() -> None:
         if ctx:
             ctx.__enter__()
         
-        # Existing parallel/sequential execution logic
+        # Determine ablation plan for direct runs (master already orchestrates)
+        def _ablation_runs_for_mode(mode_name: str) -> List[bool]:
+            canon = _canonical_mode_name(mode_name)
+            # MoSK has no CTRL channel; always run without CTRL
+            if canon == "MoSK":
+                return [False]
+            ablation_flag = getattr(args, "ablation", None)
+            if ablation_flag == "both":
+                return [False, True]
+            if ablation_flag == "on":
+                return [True]
+            if ablation_flag == "off":
+                return [False]
+            # Default: honor --with-ctrl/--no-ctrl
+            return [bool(args.use_ctrl)]
+
+        # Existing parallel/sequential execution logic (per ablation)
         if args.parallel_modes > 1 and len(modes) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             n = min(args.parallel_modes, len(modes))
             print(f"🔀 Interleaving modes with {n} thread(s): {modes}")
             with ThreadPoolExecutor(max_workers=n) as tpool:
-                futs = [tpool.submit(run_one_mode, args, m) for m in modes]
+                futs = []
+                for m in modes:
+                    for use_ctrl in _ablation_runs_for_mode(m):
+                        if args.ablation_parallel and len(_ablation_runs_for_mode(m)) > 1:
+                            print("⚠️  --ablation-parallel is unsupported in run_final_analysis; running sequentially within this process.")
+                        run_args = deepcopy(args)
+                        run_args.use_ctrl = use_ctrl
+                        run_args.with_ctrl = use_ctrl
+                        run_args.no_ctrl = not use_ctrl
+                        futs.append(tpool.submit(run_one_mode, run_args, m))
                 for f in as_completed(futs):
                     f.result()
         else:
             for m in modes:
-                run_one_mode(args, m)
+                ablations = _ablation_runs_for_mode(m)
+                if args.ablation_parallel and len(ablations) > 1:
+                    print("⚠️  --ablation-parallel is unsupported in run_final_analysis; running CTRL states sequentially.")
+                for use_ctrl in ablations:
+                    run_args = deepcopy(args)
+                    run_args.use_ctrl = use_ctrl
+                    run_args.with_ctrl = use_ctrl
+                    run_args.no_ctrl = not use_ctrl
+                    run_one_mode(run_args, m)
                 
     except KeyboardInterrupt:
         print("\n🛑 Analysis interrupted")

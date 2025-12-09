@@ -34,7 +34,7 @@ import threading
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set, no_type_check
+from typing import Dict, List, Any, Optional, Set, Sequence, Union, no_type_check
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
@@ -194,6 +194,21 @@ _STAGE_ALIAS_MAP = {
     "tables": 7,
 }
 
+MODE_NAME_ALIASES: Dict[str, str] = {
+    "mosk": "MoSK",
+    "csk": "CSK",
+    "hybrid": "Hybrid",
+    "all": "ALL",
+    "*": "ALL",
+}
+
+def _canonical_mode_name(mode: str) -> str:
+    token = str(mode or "").strip()
+    alias = MODE_NAME_ALIASES.get(token.lower())
+    if alias:
+        return alias
+    return token
+
 
 def _parse_stage_selection(spec: str) -> Set[int]:
     tokens = [token.strip() for token in str(spec or "").replace(";", ",").split(",") if token.strip()]
@@ -212,6 +227,35 @@ def _parse_stage_selection(spec: str) -> Set[int]:
         except ValueError as exc:
             raise ValueError(f"Unrecognized stage token '{token}'") from exc
     return stages
+
+def _parse_modes_list(raw: Optional[Union[str, Sequence[str]]]) -> List[str]:
+    """Normalize --modes into a unique, ordered list (supports comma/semicolon delim and all/*)."""
+    if raw is None:
+        return []
+    modes_flat: List[str] = []
+    seq = raw if isinstance(raw, (list, tuple)) else [str(raw)]
+    for token in seq:
+        for part in str(token).replace(";", ",").split(","):
+            part = part.strip()
+            if part:
+                modes_flat.append(part)
+    if not modes_flat:
+        return []
+    if any(m.lower() in ("all", "*") for m in modes_flat):
+        return ["MoSK", "CSK", "Hybrid"]
+    normalized: List[str] = []
+    for m in modes_flat:
+        canon = _canonical_mode_name(m)
+        if canon not in ("MoSK", "CSK", "Hybrid"):
+            raise ValueError(f"Unsupported mode '{m}' in --modes")
+        normalized.append(canon)
+    seen = set()
+    ordered: List[str] = []
+    for m in normalized:
+        if m not in seen:
+            seen.add(m)
+            ordered.append(m)
+    return ordered
 
 STATE_FILE = project_root / "results" / "cache" / "run_master_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -346,10 +390,12 @@ def _build_guard_frontier_commands(plot_script: Path) -> List[List[str]]:
 
 def _get_run_fingerprint(args: argparse.Namespace) -> str:
     """Generate a fingerprint for the current run configuration."""
+    modes_fingerprint = "|".join(getattr(args, "_modes_list", []) or [getattr(args, "modes", "all")])
     key_params = [
-        args.modes,
+        modes_fingerprint,
         args.num_seeds,
         args.sequence_length,
+        args.run_stages,
         args.ablation,
         args.parallel_modes,
         getattr(args, 'preset', None),
@@ -455,9 +501,9 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
     if (args.progress == "gui" and platform.system() == "Darwin" and 
         ((args.parallel_modes and args.parallel_modes > 1) or args.ablation_parallel)):
         child_progress = "rich"
+    modes_list = getattr(args, "_modes_list", []) or ["MoSK", "CSK", "Hybrid"]
     cmd = [
         sys.executable, "-u", "analysis/run_final_analysis.py",
-        "--mode", "ALL" if args.modes.lower() == "all" else args.modes,
         "--num-seeds", str(args.num_seeds),
         "--sequence-length", str(args.sequence_length),
         "--progress", child_progress,
@@ -465,6 +511,12 @@ def _build_run_final_cmd(args: argparse.Namespace, use_ctrl: bool) -> List[str]:
         "--min-ci-seeds", str(args.min_ci_seeds),
         "--lod-screen-delta", str(args.lod_screen_delta),
     ]
+    if set(modes_list) == {"MoSK", "CSK", "Hybrid"} and len(modes_list) == 3:
+        cmd.extend(["--mode", "ALL"])
+    elif len(modes_list) == 1:
+        cmd.extend(["--mode", modes_list[0]])
+    else:
+        cmd.extend(["--modes", *modes_list])
     # Ablation flag
     cmd.append("--with-ctrl" if use_ctrl else "--no-ctrl")
     if getattr(args, 'channel_profile', 'tri') != 'tri':
@@ -878,7 +930,13 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     p.add_argument("--shared-pool", action="store_true", dest="shared_pool",
                 help="Run modes in shared process pool for maximum utilization")
     # Modes
-    p.add_argument("--modes", choices=["MoSK", "CSK", "Hybrid", "all"], default="all")
+    p.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["MoSK", "CSK", "Hybrid", "all", "ALL"],
+        default=None,
+        help="Run multiple modes (e.g., --modes CSK Hybrid); use all/* for every mode.",
+    )
     p.add_argument("--parallel-modes", type=int, default=1,
                    help="Run modes concurrently within each ablation run (e.g., 3 for all three)")
     # Quick-stage execution (Stage references mirror run_final_analysis)
@@ -1301,6 +1359,26 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
             print(f"   • Timeouts: per-distance {args.lod_distance_timeout_s}s, watchdog {args.watchdog_secs}s, non-LoD watchdog {args.nonlod_watchdog_secs}s, max Ts {args.max_symbol_duration_s}s")
             print(f"   • Flags: allow-ts-exceed={args.allow_ts_exceed}, ts-warn-only={args.ts_warn_only}, ser-refine={args.ser_refine}")
 
+    # Normalize modes (supports lists/all/*)
+    try:
+        modes_list = _parse_modes_list(args.modes)
+    except ValueError as exc:
+        print(f"[error] {exc}")
+        sys.exit(2)
+    if not modes_list:
+        if args.mode:
+            modes_list = ["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode]
+        else:
+            modes_list = ["MoSK", "CSK", "Hybrid"]
+    args._modes_list = modes_list
+    # Preserve string form for compatibility/help output
+    if set(modes_list) == {"MoSK", "CSK", "Hybrid"} and len(modes_list) == 3:
+        args.modes = "all"
+    elif len(modes_list) == 1:
+        args.modes = modes_list[0]
+    else:
+        args.modes = ",".join(modes_list)
+
     # Initialize master-level logging
     if not args.no_log:
         if tee_logging_active():
@@ -1382,12 +1460,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     else:
         ablation_runs = [True, False]  # BOTH (default)
 
-    if args.modes:
-        mode_list = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
-    elif args.mode:
-        mode_list = ["MoSK", "CSK", "Hybrid"] if args.mode == "ALL" else [args.mode]
-    else:
-        mode_list = ["MoSK", "CSK", "Hybrid"]
+    mode_list = list(getattr(args, "_modes_list", []) or ["MoSK", "CSK", "Hybrid"])
 
     # Enhanced session metadata for GUI header
     flag_list: List[str] = [
@@ -1436,7 +1509,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     flag_list.append("oect_psd")
 
     session_meta = {
-        "modes": (["MoSK","CSK","Hybrid"] if args.modes.lower()=="all" else [args.modes]),
+        "modes": mode_list,
         "progress": args.progress,
         "resume": bool(args.resume and not args.reset),
         "with_ctrl": None if len(ablation_runs) == 2 else bool(ablation_runs[0]),
@@ -1972,7 +2045,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
                             _safe_close_progress(pm, overall, sub, key)
                             sys.exit(rc)
 
-                    modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
+                    modes = list(mode_list)
                     profiles = [("single", "single_physical", False), ("dual", "dual_physical", False)]
                     for profile, variant, use_ctrl in profiles:
                         print(f"   -> {profile.title()} profile")
@@ -2079,8 +2152,7 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
 
         if "snr_ts" in sub:
             if not (args.resume and state.get("snr_ts", {}).get("done")):
-                snr_modes = ["MoSK", "CSK", "Hybrid"] if args.modes.lower() == "all" else [args.modes]
-                for mode in snr_modes:
+                for mode in mode_list:
                     ts_cmd = [sys.executable, "-u", "analysis/sweep_snr_vs_ts.py", "--mode", mode]
                     if args.resume and not args.reset:
                         ts_cmd.append("--resume")
@@ -2105,9 +2177,11 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
         if "snr_panels" in sub:
             if not (args.resume and state.get("snr_panels", {}).get("done")):
                 panel_cmd = [sys.executable, "-u", "analysis/plot_snr_panels.py"]
-                modes_arg = args.modes if hasattr(args, "modes") else getattr(args, "mode", "MoSK")
-                if modes_arg:
-                    panel_cmd.extend(["--modes", modes_arg])
+                if mode_list:
+                    if set(mode_list) == {"MoSK", "CSK", "Hybrid"} and len(mode_list) == 3:
+                        panel_cmd.extend(["--modes", "all"])
+                    else:
+                        panel_cmd.extend(["--modes", *mode_list])
                 rc = _run_tracked(panel_cmd)
                 if rc == 130:
                     _safe_close_progress(pm, overall, sub, "snr_panels")
